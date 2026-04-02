@@ -175,9 +175,11 @@ def pairwise_align(
         # ---- Augment M1: add dummy row/col only where needed ----
         if _has_dummy_tgt:
             mean_col = nx.mean(M1, axis=1)
+            mean_col = nx.reshape(mean_col, (-1, 1))
             M1 = nx.concatenate([M1, mean_col], axis=1)
         if _has_dummy_src:
             mean_row = nx.mean(M1, axis=0)
+            mean_row = nx.reshape(mean_row, (1, -1))
             M1 = nx.concatenate([M1, mean_row], axis=0)
         if _has_dummy_src and _has_dummy_tgt:
             M1[-1, -1] = 0.0
@@ -185,9 +187,11 @@ def pairwise_align(
         # ---- Augment M2: add dummy row/col only where needed ----
         if _has_dummy_tgt:
             mean_col = nx.mean(M2, axis=1)
+            mean_col = nx.reshape(mean_col, (-1, 1))
             M2 = nx.concatenate([M2, mean_col], axis=1)
         if _has_dummy_src:
             mean_row = nx.mean(M2, axis=0)
+            mean_row = nx.reshape(mean_row, (1, -1))
             M2 = nx.concatenate([M2, mean_row], axis=0)
         if _has_dummy_src and _has_dummy_tgt:
             M2[-1, -1] = 0.0
@@ -292,7 +296,7 @@ def neighborhood_distribution(slice, radius):
         target_indices = np.where(distances[i] <= radius)[0]
 
         for ind in target_indices:
-            cell_type_str_j = str(slice.obs['cell_type_annot'][ind])
+            cell_type_str_j = str(slice.obs['cell_type_annot'].iloc[ind])
             cells_within_radius[i][cell_type_to_index[cell_type_str_j]] += 1
 
     return np.array(cells_within_radius)
