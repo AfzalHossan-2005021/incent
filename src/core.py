@@ -376,6 +376,9 @@ def calculate_neighborhood_similarity(js_dist_neighborhood, pi):
     """
     Calculate neighborhood similarity cost for a given alignment mapping.
     
+    Uses element-wise multiplication: sum all weighted distances across the mapping.
+    Equivalent to INCENT.py's initial objective calculation for all dissimilarity types.
+    
     Args:
         js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions.
         pi: Alignment mapping matrix (either uniform G or optimal transport solution).
@@ -383,13 +386,7 @@ def calculate_neighborhood_similarity(js_dist_neighborhood, pi):
     Returns:
         neighborhood_similarity: Weighted neighborhood dissimilarity cost.
     """
-    max_indices = np.argmax(pi, axis=1)
-    neighborhood_error = np.zeros(max_indices.shape)
-    for i in range(len(max_indices)):
-        neighborhood_error[i] = pi[i][max_indices[i]] * js_dist_neighborhood[i][max_indices[i]]
-    
-    neighborhood_similarity = np.sum(neighborhood_error)
-    return neighborhood_similarity
+    return np.sum(js_dist_neighborhood * pi)
 
 
 def cell_type_matching(cell_type_mismatch, pi_mat):
@@ -416,6 +413,9 @@ def calculate_gene_expression_similarity(cosine_dist_gene_expr, pi):
     """
     Calculate gene expression similarity cost for a given alignment mapping.
     
+    Uses element-wise multiplication: sum of weighted gene expression distances.
+    Matches INCENT.py's calculation for both initial and final objectives.
+    
     Args:
         cosine_dist_gene_expr: Cosine distance matrix of gene expression profiles.
         pi: Alignment mapping matrix (either uniform G or optimal transport solution).
@@ -423,14 +423,17 @@ def calculate_gene_expression_similarity(cosine_dist_gene_expr, pi):
     Returns:
         gene_expression_similarity: Weighted gene expression dissimilarity cost.
     """
-    gene_expression_similarity = np.sum(cosine_dist_gene_expr * pi)
-    return gene_expression_similarity
+    return np.sum(cosine_dist_gene_expr * pi)
 
 
 def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=None, cosine_dist_gene_expr=None, 
                                cell_type_mismatch=None, sliceA=None, sliceB=None, use_rep=None, radius=100.0):
     """
     Calculate all similarity metrics for alignment quality assessment.
+    
+    **Note:** Neighborhood similarity uses element-wise multiplication (sum over all mapping entries).
+    This matches INCENT.py's initial objective calculation for all dissimilarity types (JSD/MSD/cosine).
+    For specialized metrics like INCENT.py's final JSD objective (argmax per row), compute separately.
     
     Args:
         final_pi: Final optimal transport alignment mapping (required).
