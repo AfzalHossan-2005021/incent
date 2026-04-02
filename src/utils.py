@@ -11,8 +11,38 @@ from ot.lp import emd
 from ot.optim import line_search_armijo
 from ot.utils import list_to_array, get_backend
 
+def to_backend(x, nx, data_type=None, reference=None):
+    """
+    Centralized function to manage CPU-GPU movement and type consistency.
+    """
+    # Force to numpy safely
+    if hasattr(x, 'cpu'):
+        x = x.detach().cpu()
+    if hasattr(x, 'numpy'):
+        x = x.numpy()
+    elif hasattr(x, "todense"):
+        x = x.todense()
+    
+    # Optional typing to numpy type
+    if data_type is not None:
+        x = np.asarray(x, dtype=data_type)
+    else:
+        x = np.asarray(x)
+        
+    x_nx = nx.from_numpy(x)
 
-def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, loss_fun='square_loss', alpha = 0.1, beta = 0.8, armijo=False, log=False,numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, use_gpu = False, **kwargs):
+    # Use reference tensor to match device/type if provided
+    # Otherwise set up PyTorch CUDA if backend is Torch and CUDA is available
+    if reference is not None: # Use POT type_as logic
+        x_nx = nx.zeros(x_nx.shape, type_as=reference) + x_nx
+    elif nx.__class__.__name__ == 'TorchBackend':
+        import torch
+        if torch.cuda.is_available():
+            x_nx = x_nx.cuda()
+
+    return x_nx
+
+def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, loss_fun='square_loss', alpha = 0.1, beta = 0.8, armijo=False, log=False,numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 

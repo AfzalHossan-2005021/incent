@@ -1,11 +1,14 @@
 from .core import (
     pairwise_align,
-    neighborhood_distribution,
-    cosine_distance
+    calculate_performance_metrics    
+)
+
+from .visualize import (
+    visualize_alignment
 )
 
 __all__ = [
     'pairwise_align',
-    'neighborhood_distribution',
-    'cosine_distance'
+    'calculate_performance_metrics',
+    'visualize_alignment'
 ]
