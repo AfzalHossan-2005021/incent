@@ -174,20 +174,20 @@ def pairwise_align(
         
         # ---- Augment M1: add dummy row/col only where needed ----
         if _has_dummy_tgt:
-            mean_col = nx.mean(M1, axis=1, keepdims=True)
+            mean_col = nx.mean(M1, axis=1)
             M1 = nx.concatenate([M1, mean_col], axis=1)
         if _has_dummy_src:
-            mean_row = nx.mean(M1, axis=0, keepdims=True)
+            mean_row = nx.mean(M1, axis=0)
             M1 = nx.concatenate([M1, mean_row], axis=0)
         if _has_dummy_src and _has_dummy_tgt:
             M1[-1, -1] = 0.0
 
         # ---- Augment M2: add dummy row/col only where needed ----
         if _has_dummy_tgt:
-            mean_col = nx.mean(M2, axis=1, keepdims=True)
+            mean_col = nx.mean(M2, axis=1)
             M2 = nx.concatenate([M2, mean_col], axis=1)
         if _has_dummy_src:
-            mean_row = nx.mean(M2, axis=0, keepdims=True)
+            mean_row = nx.mean(M2, axis=0)
             M2 = nx.concatenate([M2, mean_row], axis=0)
         if _has_dummy_src and _has_dummy_tgt:
             M2[-1, -1] = 0.0
@@ -300,16 +300,17 @@ def neighborhood_distribution(slice, radius):
 
 def calculate_spatial_distance(slice, spatial_key = 'spatial'):
     """
-    Calculate spatial distance between slice A and slice B.
-    
+    Calculate spatial distance between cells in a slice.
+
     Args:
-    slice: Slice for which to calculate spatial distance.
+        slice: Slice for which to calculate spatial distance.
+        spatial_key: Key for the spatial coordinates in the slice's obsm.
 
     Returns:
     D: Pairwise spatial distance matrix of the slice.
     """
     
-    print("Calculating spatial distance between slice A and slice B")
+    print("Calculating spatial distance between cells in the slice")
 
     coordinates = slice.obsm[spatial_key]
 
