@@ -1,8 +1,5 @@
-import os
 import ot
-import time
 import torch
-import datetime
 import numpy as np
 
 from tqdm import tqdm
@@ -240,32 +237,55 @@ def pairwise_align(
     return pi
 
 
-def neighborhood_distribution(slice, radius):
+def neighborhood_distribution(slice, radius, num_fourier_modes=2):
     """
-    This method is added by Anup Bhowmik
+    Calculate the neighborhood distribution for a given slice, incorporating 
+    rotation-invariant directional features via Fourier coefficient magnitudes.
+
     Args:
         slice: Slice to get niche distribution for.
-        pairwise_distances: Pairwise distances between cells of a slice.
         radius: Radius of the niche.
+        num_fourier_modes: Maximum Fourier mode to calculate. 0 is just counts.
 
     Returns:
-        niche_distribution: Niche distribution for the slice.
+        niche_distribution: Niche distribution for the slice. Features are concatenated 
+                            magnitudes of Fourier modes up to num_fourier_modes for each cell type.
     """
+    print("Calculating neighborhood distribution for the slice")
 
     unique_cell_types = np.array(list(slice.obs['cell_type_annot'].unique()))
-    cell_type_to_index = dict(zip(unique_cell_types, list(range(len(unique_cell_types)))))
-    cells_within_radius = np.zeros((slice.shape[0], len(unique_cell_types)), dtype=float)
+    num_types = len(unique_cell_types)
+    cell_type_to_index = dict(zip(unique_cell_types, list(range(num_types))))
+    
+    num_cells = slice.shape[0]
+    num_features = num_types * (num_fourier_modes + 1)
+    cells_within_radius = np.zeros((num_cells, num_features), dtype=float)
 
     source_coords = slice.obsm['spatial']
     distances = euclidean_distances(source_coords, source_coords)
 
-    for i in tqdm(range(slice.shape[0])):
-
+    for i in tqdm(range(num_cells)):
         target_indices = np.where(distances[i] <= radius)[0]
 
-        for ind in target_indices:
+        target_coords = source_coords[target_indices]
+        rel_coords = target_coords - source_coords[i]
+        
+        if num_fourier_modes > 0:
+            angles = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
+
+        complex_fourier = np.zeros((num_types, num_fourier_modes + 1), dtype=complex)
+
+        for idx, ind in enumerate(target_indices):
             cell_type_str_j = str(slice.obs['cell_type_annot'].iloc[ind])
-            cells_within_radius[i][cell_type_to_index[cell_type_str_j]] += 1
+            cell_type_idx = cell_type_to_index[cell_type_str_j]
+            
+            complex_fourier[cell_type_idx, 0] += 1
+            if num_fourier_modes > 0:
+                theta = angles[idx]
+                for m in range(1, num_fourier_modes + 1):
+                    complex_fourier[cell_type_idx, m] += np.exp(1j * m * theta)
+
+        cells_within_radius[i, :] = np.abs(complex_fourier).flatten()
 
     return np.array(cells_within_radius)
 

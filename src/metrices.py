@@ -4,6 +4,7 @@ import torch
 from .utils import select_backend
 from .core import calculate_neighborhood_dissimilarity, calculate_gene_expression_cosine_distance, calculate_cell_type_mismatch
 
+
 def calculate_neighborhood_similarity(js_dist_neighborhood, pi):
     """
     Calculate neighborhood similarity cost for a given alignment mapping.
@@ -99,7 +100,7 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
             raise ValueError("radius must be provided to calculate js_dist_neighborhood")
         
         # Calculate neighborhood dissimilarity using the provided slices and radius
-        use_gpu, nx = select_backend(use_gpu=use_gpu)
+        use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
         js_dist_neighborhood = calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx=nx, data_type=np.float32, eps=1e-6)
         
         # Convert to numpy if necessary
