@@ -1,5 +1,6 @@
 from .core import (
-    pairwise_align
+    pairwise_align,
+    hierarchical_pairwise_align
 )
 
 from .metrices import (
@@ -13,6 +14,7 @@ from .visualize import (
 
 __all__ = [
     'pairwise_align',
+    'hierarchical_pairwise_align',
     'calculate_performance_metrics',
     'calculate_forward_reverse_compactness',
     'visualize_alignment'

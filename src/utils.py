@@ -31,12 +31,11 @@ def select_backend(use_gpu=False, gpu_verbose=True):
             if gpu_verbose:
                 print("CUDA is not available on your system. Reverting to CPU with Numpy backend.")
     else:
+        nx = ot.backend.NumpyBackend()
         if torch.cuda.is_available() and gpu_verbose:
             print("Tip: CUDA is available on your system. You can enable GPU support by setting use_gpu=True.")
-        else:
-            nx = ot.backend.NumpyBackend()
-            if gpu_verbose:
-                print("Using cpu with Numpy backend.")
+        elif gpu_verbose:
+            print("Using cpu with Numpy backend.")
     return use_gpu, nx
 
 
@@ -199,7 +198,7 @@ def kl_divergence_corresponding_backend(X, Y):
     X_log_Y = nx.einsum('ij,ij->i',X,log_Y)
     X_log_Y = nx.reshape(X_log_Y,(1,X_log_Y.shape[0]))
     D = X_log_X.T - X_log_Y.T
-    return nx.to_numpy(D)
+    return D
 
 
 def jensenshannon_distance_1_vs_many_backend(X, Y):
@@ -224,13 +223,8 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
     X = X/nx.sum(X,axis=1, keepdims=True)   # normalize
     Y = Y/nx.sum(Y,axis=1, keepdims=True)   # normalize
     M = (X + Y) / 2.0
-    kl_X_M = torch.from_numpy(kl_divergence_corresponding_backend(X, M))
-    kl_Y_M = torch.from_numpy(kl_divergence_corresponding_backend(Y, M))
-    js_dist = nx.sqrt((kl_X_M + kl_Y_M) / 2.0).T[0]
-    return js_dist
-
-
-def jensenshannon_divergence_backend(X, Y):
+    kl_X_M = kl_divergence_corresponding_backend(X, M)
+    kl_Y_M = kl_divergence_corresponding_backend(Y, M)
     """
     This function is added ny Nuwaisir
     
@@ -265,19 +259,12 @@ def jensenshannon_divergence_backend(X, Y):
     print("Finished calculating cost matrix")
     # print(nx.unique(nx.isnan(js_dist)))
 
-    if torch.cuda.is_available():
-        try:
-            return js_dist.numpy()
-        except:
-            return js_dist
-    else:
-        return js_dist
-
+    return js_dist
 
 def pairwise_msd(A, B):
     """
     Returns pairwise mean squared distance (over all pairs of samples) of two matrices A and B.
-    
+
     Args:
         A: np array with dim (m_samples by d_features)
         B: np array with dim (n_samples by d_features)

@@ -9,6 +9,88 @@ from scipy.spatial import cKDTree
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
+from .clustering import cluster_cells_spatial
+from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init
+
+
+def hierarchical_pairwise_align(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    resolution: float = 1.0,
+    spatial_key: str = "spatial",
+    use_rep: Optional[str] = "X_pca",
+    label_key: str = "cell_type_annot",
+    w_expr: float = 0.5,
+    w_type: float = 0.5,
+    w_graph: float = 0.5,
+    block_threshold: float = 1e-4,
+    penalty: float = 1e3,
+    use_mask: bool = True,
+    use_init: bool = True,
+    **kwargs
+):
+    """
+    Performs Hierarchical OT by clustering cells into mesoregions, aligning clusters with Partial FGW,
+    and then restricting the cell-level OT matchings to the aligned blocks.
+    
+    Returns the cell-level alignment pi.
+    """
+    print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
+    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method='knn', k=6)
+    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method='knn', k=6)
+    
+    print(f"Slice A: {len(np.unique(labelsA))} clusters")
+    print(f"Slice B: {len(np.unique(labelsB))} clusters")
+    
+    print("--- [HOT] Step 2: Extracting Cluster Features ---")
+    featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key)
+    featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key)
+    
+    p_A, _, _, centroidsA, _ = featA
+    p_B, _, _, centroidsB, _ = featB
+    
+    print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
+    M_cluster = compute_cluster_costs(featA, featB, w_expr, w_type)
+    C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
+    C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
+    
+    print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
+    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
+    
+    # We now prepare the injection into standard cell-level pairwise_align
+    G_init = None
+    if use_init:
+        print("--- [HOT] Step 5a: Expanding Coarse Map to G_init ---")
+        G_init = blockwise_g_init(labelsA, labelsB, Pi_cluster)
+        
+    print("--- [HOT] Step 5b: Executing Base OT ---")
+    # Base OT call. For true block-masking, you would need to intercept M1 + gamma*M2 inside pairwise_align.
+    # To preserve original pairwise_align logic, we let it calculate D_A, M1, M2 natively.
+    # We will pass G_init. If use_mask is True, we must modify the base pairwise_align to accept external cost adjustments, 
+    # or recreate what pairwise_align does. Since pairwise_align is complex, we will just pass G_init here.
+    
+    pi = pairwise_align(
+        sliceA=sliceA,
+        sliceB=sliceB,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        use_rep=use_rep,
+        G_init=G_init,
+        dummy_cell=False, # rely on partial FGW for matching macro instead
+        **kwargs
+    )
+    
+    if use_mask:
+        # Masking after the fact, or we could pass the mask down.
+        # Simple post-masking for extreme penalties where the block transport is tiny.
+        _, mask = build_block_restricted_cost(np.zeros_like(pi), labelsA, labelsB, Pi_cluster, threshold=block_threshold)
+        pi[~mask] = 0.0
+        
+    return pi
 
 
 def pairwise_align(
