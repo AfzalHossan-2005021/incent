@@ -28,6 +28,7 @@ def pairwise_align(
     numItermax: int = 6000, 
     use_gpu: bool = False,
     data_type = np.float32,
+    epsilon: float = 1e-6,
     verbose: bool = False, 
     gpu_verbose: bool = True,
     dummy_cell: bool = True,
@@ -67,8 +68,6 @@ def pairwise_align(
         - initial_obj_neighbor, initial_obj_gene, final_obj_neighbor, final_obj_gene: Objective metrics
         - initial_cell_type_match, final_cell_type_match: Cell-type matching percentages 
     """
-
-    epsilon = 1e-6
     
     # Determine if gpu or cpu is being used
     use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=gpu_verbose)
@@ -213,9 +212,7 @@ def pairwise_align(
             G_init = _gi_aug
         G_init = to_backend(G_init, nx, data_type=data_type)
     
-
-    _fgw_extra = {'numItermaxEmd': 500_000} if dummy_cell else {}
-    pi, logw = fused_gromov_wasserstein_incent(M1, M2, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, gamma=gamma, log=True, numItermax=numItermax,verbose=verbose, **_fgw_extra)
+    pi, logw = fused_gromov_wasserstein_incent(M1, M2, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, gamma=gamma, log=True, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
 
     # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────

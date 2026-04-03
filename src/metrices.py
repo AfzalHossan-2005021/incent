@@ -133,14 +133,15 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
     results['final_cell_type_match'] = cell_type_matching(cell_type_mismatch, final_pi)
 
     # Display results in a formatted table
-    print("\n" + "="*75)
-    print("ALIGNMENT QUALITY METRICS")
-    print("="*75)
-    print(f"{'Metric':<40} {'Initial':<12} {'Final':<12} {'Improvement':<12}")
-    print("-"*75)
-    print(f"{'Neighborhood Dissimilarity (JSD)':<40} {results['initial_obj_neighbor']:<12.6f} {results['final_obj_neighbor']:<12.6f} {(results['initial_obj_neighbor'] - results['final_obj_neighbor']) / results['initial_obj_neighbor'] * 100:>10.2f}%")
-    print(f"{'Gene Expression Dissimilarity (Cosine)':<40} {results['initial_obj_gene']:<12.6f} {results['final_obj_gene']:<12.6f} {(results['initial_obj_gene'] - results['final_obj_gene']) / results['initial_obj_gene'] * 100:>10.2f}%")
-    print(f"{'Cell-type Correspondence (%)':<40} {results['initial_cell_type_match']*100:<12.2f} {results['final_cell_type_match']*100:<12.2f} {(results['final_cell_type_match'] - results['initial_cell_type_match']) / results['initial_cell_type_match'] * 100:>10.2f}%")
-    print("="*75 + "\n")
+    Title = "ALIGNMENT QUALITY METRICS"
+    print("\n" + "="*80)
+    print(" " * ((80 - len(Title)) // 2) + Title)
+    print("="*80)
+    print(f"{' Metric':<40} {'Initial':<12} {'Final':<12} {'Improvement':<12}")
+    print("-"*80)
+    print(f"{' Neighborhood Dissimilarity (JSD)':<40} {results['initial_obj_neighbor']:<12.6f} {results['final_obj_neighbor']:<12.6f} {(results['initial_obj_neighbor'] - results['final_obj_neighbor']) / results['initial_obj_neighbor'] * 100:>10.2f}%")
+    print(f"{' Gene Expression Dissimilarity (Cosine)':<40} {results['initial_obj_gene']:<12.6f} {results['final_obj_gene']:<12.6f} {(results['initial_obj_gene'] - results['final_obj_gene']) / results['initial_obj_gene'] * 100:>10.2f}%")
+    print(f"{' Cell-type Correspondence (%)':<40} {results['initial_cell_type_match']*100:<12.2f} {results['final_cell_type_match']*100:<12.2f} {(results['final_cell_type_match'] - results['initial_cell_type_match']) / results['initial_cell_type_match'] * 100:>10.2f}%")
+    print("="*80 + "\n")
 
     return results

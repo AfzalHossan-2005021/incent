@@ -75,7 +75,7 @@ def to_backend(x, nx, data_type=None, reference=None):
     return x_nx
 
 
-def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, loss_fun='square_loss', alpha = 0.1, beta = 0.8, armijo=False, log=False,numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, **kwargs):
+def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, G_init = None, loss_fun='square_loss', alpha = 0.1, gamma = 1.0, armijo=False, log=False, numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 
@@ -140,14 +140,6 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         # we are using this line search
         def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
-    
-    module_path = inspect.getfile(ot)
-
-    # Get the directory containing the module
-    module_directory = os.path.dirname(module_path)
-
-    # print(f"Module path: {module_path}")
-    # print(f"Module directory: {module_directory}")
 
     if log:
    
