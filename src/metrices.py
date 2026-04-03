@@ -99,7 +99,7 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
             raise ValueError("radius must be provided to calculate js_dist_neighborhood")
         
         # Calculate neighborhood dissimilarity using the provided slices and radius
-        nx, use_gpu = select_backend(use_gpu=use_gpu)
+        use_gpu, nx = select_backend(use_gpu=use_gpu)
         js_dist_neighborhood = calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx=nx, data_type=np.float32, eps=1e-6)
         
         # Convert to numpy if necessary
