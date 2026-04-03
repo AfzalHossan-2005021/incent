@@ -126,10 +126,10 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         return 2 * (nx.dot(C1, G) + nx.dot(G, C2)) + 2 * reg_compact * G
 
     if armijo:
-        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
             return line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
-        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=(1-alpha)*M, reg=alpha, nx=nx, **kwargs)
 
     if log:

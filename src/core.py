@@ -12,23 +12,24 @@ from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_arr
 
 
 def pairwise_align(
-    sliceA: AnnData, 
-    sliceB: AnnData, 
+    sliceA: AnnData,
+    sliceB: AnnData,
     alpha: float,
     beta: float,
     gamma: float,
     reg_compact: float = 0.0,
+    armijo: bool = True,
     radius: Optional[float] = None,
-    use_rep: Optional[str] = None, 
-    G_init = None, 
-    a_distribution = None, 
+    use_rep: Optional[str] = None,
+    G_init = None,
+    a_distribution = None,
     b_distribution = None,
-    numItermax: int = 6000, 
+    numItermax: int = 6000,
     use_gpu: bool = False,
     data_type = np.float32,
     epsilon: float = 1e-6,
     log: bool = False,
-    verbose: bool = False, 
+    verbose: bool = False,
     gpu_verbose: bool = True,
     dummy_cell: bool = True,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
@@ -226,7 +227,7 @@ def pairwise_align(
             G_init = _gi_aug
         G_init = to_backend(G_init, nx, data_type=data_type)
     
-    pi, logw = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, log=log, numItermax=numItermax, verbose=verbose, **kwargs)
+    pi, logw = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, log=log, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
 
     # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
