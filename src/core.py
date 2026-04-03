@@ -12,49 +12,6 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
 
 
-# ---------------------------------------------------------------------
-# Spatial scale & Helper Functions
-# ---------------------------------------------------------------------
-
-def estimate_characteristic_spacing(slice_obj, k=6, spatial_key="spatial"):
-    """
-    Robust local spacing estimate from the k-th nearest neighbor distance.
-    Used to normalize spatial distances and to set a data-driven neighborhood radius.
-    """
-    coords = np.asarray(slice_obj.obsm[spatial_key], dtype=np.float64)
-    n = coords.shape[0]
-    if n < 2:
-        return 1.0
-
-    k_eff = min(k + 1, n)  # +1 because the first neighbor is the point itself
-    tree = cKDTree(coords)
-    dists, _ = tree.query(coords, k=k_eff)
-
-    kth = dists[:, -1]
-    kth = kth[np.isfinite(kth) & (kth > 0)]
-    if kth.size == 0:
-        return 1.0
-
-    return float(np.median(kth))
-
-def _equal_area_shell_edges(radius, n_shells):
-    """Equal-area shells reduce the geometric bias of outer shells."""
-    return radius * np.sqrt(np.linspace(0.0, 1.0, n_shells + 1))
-
-
-def _distance_weights(dist, radius, mode="linear", sigma=None):
-    if mode is None or mode == "uniform":
-        return np.ones_like(dist, dtype=np.float64)
-    if mode == "linear":
-        return np.maximum(0.0, 1.0 - dist / radius)
-    if mode == "gaussian":
-        s = radius / 2.0 if sigma is None else float(sigma)
-        if s <= 0:
-            raise ValueError("`sigma` must be > 0 for gaussian weighting.")
-        return np.exp(-(dist ** 2) / (2.0 * s * s))
-    raise ValueError("distance_decay must be one of: None, 'uniform', 'linear', 'gaussian'.")
-
-
 def pairwise_align(
     sliceA: AnnData, 
     sliceB: AnnData, 
@@ -137,7 +94,22 @@ def pairwise_align(
 
 
     # ────────────────────── Calculate neighborhood dissimilarity ──────────────────────
-    js_dist_neighborhood = calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=data_type, eps=epsilon)
+    js_dist_neighborhood = calculate_neighborhood_dissimilarity(
+        sliceA,
+        sliceB,
+        radius=radius,                 # optional; if None multiscale radii are estimated
+        nx=nx,
+        data_type=data_type,
+        eps=epsilon,
+        radii=None,                    # or pass an explicit list, e.g. [20, 35, 50]
+        radius_k=6,
+        radius_multipliers=(2.5, 4.0, 6.0),
+        n_shells=3,
+        harmonics=(0, 1, 2),
+        harmonic_weights={1: 1.25, 2: 1.5},
+        distance_decay="linear",
+        include_self=False,
+    )
     M2 = to_backend(js_dist_neighborhood, nx, data_type=data_type)
 
 
@@ -281,108 +253,291 @@ def pairwise_align(
     return pi
 
 
-def neighborhood_distribution(slice, radius, n_shells=2, n_sectors=4, distance_decay='linear', include_self=False, cell_types=None):
+def estimate_characteristic_spacing(adata, k=6, spatial_key="spatial"):
     """
-    Calculate the neighborhood distribution using a Local Reference Frame (Density Dipole).
-    This descriptor is rotation-invariant, preserves relative angular positions (co-localization
-    vs repulsion), prevents empty bin edge-case explosions, and is strictly non-negative for JSD.
-
-    Args:
-        slice: Slice to get niche distribution for.
-        radius: Radius of the niche.
-        n_shells: Number of radial bins (distance layers).
-        n_sectors: Number of angular bins relative to the local principal axis.
-        distance_decay: 'linear', 'gaussian', or None. Weights closer cells more.
-        include_self: Whether to include the focal cell in its own neighborhood.
-        cell_types: Global array of cell types to ensure consistent feature columns.
-
-    Returns:
-        niche_distribution: Features for each cell containing local-frame binned neighbor weights.
+    Robust local spacing estimate: median distance to the k-th nearest neighbor.
+    Useful for choosing radii that scale with local cell density.
     """
-    print("Calculating local-reference neighborhood distribution...")
+    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    n = coords.shape[0]
+    if n < 2:
+        return 1.0
+
+    k_eff = min(k + 1, n)  # +1 because nearest neighbor includes self at distance 0
+    tree = cKDTree(coords)
+    dists, _ = tree.query(coords, k=k_eff)
+
+    kth = dists[:, -1]
+    kth = kth[np.isfinite(kth) & (kth > 0)]
+    if kth.size == 0:
+        return 1.0
+    return float(np.median(kth))
+
+
+def equal_area_shell_edges(radius, n_shells):
+    """
+    Equal-area shells reduce the trivial bias that outer shells cover more area.
+    """
+    return radius * np.sqrt(np.linspace(0.0, 1.0, n_shells + 1))
+
+
+def distance_weights(dist, radius, mode="linear", sigma=None):
+    """
+    Distance weighting for neighbors inside a radius.
+    """
+    if mode is None or mode == "uniform":
+        return np.ones_like(dist, dtype=np.float64)
+
+    if mode == "linear":
+        return np.maximum(0.0, 1.0 - dist / radius)
+
+    if mode == "gaussian":
+        s = radius / 2.0 if sigma is None else float(sigma)
+        if s <= 0:
+            raise ValueError("sigma must be > 0")
+        return np.exp(-(dist ** 2) / (2.0 * s * s))
+
+    raise ValueError("distance_decay must be one of: None, 'uniform', 'linear', 'gaussian'")
+
+
+def neighborhood_distribution_fourier(
+    adata,
+    radius,
+    cell_types=None,
+    n_shells=3,
+    shell_edges=None,
+    harmonics=(0, 1, 2),
+    harmonic_weights=None,
+    distance_decay="linear",
+    sigma=None,
+    include_self=False,
+    area_normalize=True,
+    add_empty_bin=True,
+    l1_normalize=True,
+    dtype=np.float32,
+    spatial_key="spatial",
+    label_key="cell_type_annot",
+    return_metadata=False,
+):
+    """
+    Rotation-invariant neighborhood descriptor.
+
+    For each focal cell, each cell type, and each radial shell:
+      m=0 -> abundance
+      m=1 -> one-sidedness
+      m=2 -> bilateral / opposite-half structure
+
+    Output is nonnegative and suitable for Jensen-Shannon after normalization.
+    """
+    if radius <= 0:
+        raise ValueError("radius must be > 0")
+
+    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    labels = adata.obs[label_key].astype(str).to_numpy()
 
     if cell_types is None:
-        unique_cell_types = np.array(sorted(list(slice.obs['cell_type_annot'].unique())))
+        cell_types = np.array(sorted(np.unique(labels)), dtype=str)
     else:
-        unique_cell_types = np.array(cell_types)
+        cell_types = np.array(cell_types, dtype=str)
 
-    num_types = len(unique_cell_types)
-    cell_type_to_index = dict(zip(unique_cell_types, list(range(num_types))))
-    
-    num_cells = slice.shape[0]
-    num_features = num_types * n_shells * n_sectors + 1  # +1 for empty neighborhood feature
-    cells_within_radius = np.zeros((num_cells, num_features), dtype=float)
+    label_to_idx = {ct: i for i, ct in enumerate(cell_types)}
+    missing = sorted(set(labels) - set(cell_types))
+    if missing:
+        raise ValueError(f"Labels missing from cell_types: {missing}")
 
-    source_coords = slice.obsm['spatial']
-    
-    # Use cKDTree for massive memory savings over O(N^2) dense matrix
-    tree = cKDTree(source_coords)
-    neighbor_lists = tree.query_ball_point(source_coords, r=radius)
-    
-    # Use Equal-area shells to prevent geometric bias of outer shells having too much mass
-    shell_edges = _equal_area_shell_edges(radius, n_shells)
-    angle_edges = np.linspace(0, 2 * np.pi, n_sectors + 1)
+    label_idx = np.array([label_to_idx[x] for x in labels], dtype=np.int32)
 
-    for i in tqdm(range(num_cells)):
-        target_indices = np.array(neighbor_lists[i], dtype=int)
-        
+    harmonics = tuple(sorted(set(int(h) for h in harmonics)))
+    if any(h < 0 for h in harmonics):
+        raise ValueError("harmonics must be non-negative integers")
+    if 0 not in harmonics:
+        harmonics = (0,) + harmonics
+
+    if harmonic_weights is None:
+        harmonic_weights = {}
+    else:
+        harmonic_weights = {int(k): float(v) for k, v in harmonic_weights.items()}
+
+    if shell_edges is None:
+        shell_edges = equal_area_shell_edges(radius, n_shells)
+    else:
+        shell_edges = np.asarray(shell_edges, dtype=np.float64)
+        if not np.isclose(shell_edges[0], 0.0):
+            raise ValueError("shell_edges must start at 0")
+        if not np.isclose(shell_edges[-1], radius):
+            raise ValueError("shell_edges must end at radius")
+        if np.any(np.diff(shell_edges) <= 0):
+            raise ValueError("shell_edges must be strictly increasing")
+
+    n_cells = coords.shape[0]
+    n_types = len(cell_types)
+    n_shells_eff = len(shell_edges) - 1
+    n_harm = len(harmonics)
+
+    shell_areas = np.pi * (shell_edges[1:] ** 2 - shell_edges[:-1] ** 2)
+
+    # group index = type * n_shells + shell
+    n_groups = n_types * n_shells_eff
+    group_shell_idx = np.tile(np.arange(n_shells_eff), n_types)
+    group_area = shell_areas[group_shell_idx]
+
+    tree = cKDTree(coords)
+    neighbor_lists = tree.query_ball_point(coords, r=radius)
+
+    n_core = n_groups * n_harm
+    n_total = n_core + (1 if add_empty_bin else 0)
+    features = np.zeros((n_cells, n_total), dtype=np.float64)
+
+    for i, nbr in enumerate(neighbor_lists):
+        nbr = np.asarray(nbr, dtype=np.int32)
+
         if not include_self:
-            target_indices = target_indices[target_indices != i]
+            nbr = nbr[nbr != i]
 
-        if len(target_indices) == 0:
-            cells_within_radius[i, -1] = 1.0  # Assign all mass to the "empty" feature bin
+        if nbr.size == 0:
+            if add_empty_bin:
+                features[i, -1] = 1.0
             continue
 
-        target_coords = source_coords[target_indices]
-        rel_coords = target_coords - source_coords[i]
-        
-        # Calculate distances exactly for this sparse neighborhood
-        target_dists = np.linalg.norm(rel_coords, axis=1)
-        
-        # 1. Calculate weights
-        weights = _distance_weights(target_dists, radius=radius, mode=distance_decay)
+        rel = coords[nbr] - coords[i]
+        dist = np.linalg.norm(rel, axis=1)
+        theta = np.arctan2(rel[:, 1], rel[:, 0])
 
-        # 2. Establish Local Principal Axis (Density Dipole)
-        angles = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
-        dipole_x = np.sum(weights * np.cos(angles))
-        dipole_y = np.sum(weights * np.sin(angles))
-        principal_angle = np.arctan2(dipole_y, dipole_x)  # "Local North"
-        
-        # 3. Align angles to Local Reference Frame
-        aligned_angles = (angles - principal_angle) % (2 * np.pi)
-        
-        # 4. Discretize into Shells and Sectors
-        rad_bins = np.digitize(target_dists, shell_edges[1:], right=True)
-        rad_bins = np.clip(rad_bins, 0, n_shells - 1)
-        
-        ang_bins = np.digitize(aligned_angles, angle_edges[:-1]) - 1
-        ang_bins = np.clip(ang_bins, 0, n_sectors - 1)
+        shell_idx = np.searchsorted(shell_edges[1:], dist, side="left")
+        valid = (shell_idx >= 0) & (shell_idx < n_shells_eff)
 
-        # Build feature histogram for this cell
-        local_feat = np.zeros((num_types, n_shells, n_sectors), dtype=float)
+        if not np.all(valid):
+            nbr = nbr[valid]
+            dist = dist[valid]
+            theta = theta[valid]
+            shell_idx = shell_idx[valid]
 
-        for idx, ind in enumerate(target_indices):
-            cell_type_str_j = str(slice.obs['cell_type_annot'].iloc[ind])
-            if cell_type_str_j not in cell_type_to_index:
-                continue
-                
-            cell_type_idx = cell_type_to_index[cell_type_str_j]
-            ww = weights[idx]
-            rb = rad_bins[idx]
-            ab = ang_bins[idx]
-            
-            local_feat[cell_type_idx, rb, ab] += ww
+        if nbr.size == 0:
+            if add_empty_bin:
+                features[i, -1] = 1.0
+            continue
 
-        cells_within_radius[i, :-1] = local_feat.flatten()
-        
-        # 5. Normalize to proper probability distribution for Jensen-Shannon Divergence
-        row_sum = np.sum(cells_within_radius[i, :-1])
-        if row_sum > 0:
-            cells_within_radius[i, :-1] /= row_sum
+        w = distance_weights(dist, radius=radius, mode=distance_decay, sigma=sigma)
+        group_idx = label_idx[nbr] * n_shells_eff + shell_idx
+
+        local = np.zeros((n_groups, n_harm), dtype=np.float64)
+
+        for h_pos, m in enumerate(harmonics):
+            if m == 0:
+                mag = np.bincount(group_idx, weights=w, minlength=n_groups).astype(np.float64)
+            else:
+                ang = m * theta
+                real = np.bincount(group_idx, weights=w * np.cos(ang), minlength=n_groups)
+                imag = np.bincount(group_idx, weights=w * np.sin(ang), minlength=n_groups)
+                mag = np.hypot(real, imag)
+
+            if area_normalize:
+                mag = mag / np.maximum(group_area, 1e-12)
+
+            mag *= harmonic_weights.get(m, 1.0)
+            local[:, h_pos] = mag
+
+        flat = local.reshape(-1)
+
+        if flat.sum() == 0:
+            if add_empty_bin:
+                features[i, -1] = 1.0
         else:
-            cells_within_radius[i, -1] = 1.0
+            if add_empty_bin:
+                features[i, :-1] = flat
+            else:
+                features[i] = flat
 
-    return np.array(cells_within_radius)
+    if l1_normalize:
+        row_sums = features.sum(axis=1, keepdims=True)
+        nz = row_sums[:, 0] > 0
+        features[nz] /= row_sums[nz]
+
+    features = features.astype(dtype, copy=False)
+
+    if not return_metadata:
+        return features
+
+    metadata = {
+        "cell_types": cell_types,
+        "shell_edges": shell_edges,
+        "harmonics": harmonics,
+        "feature_shape": (n_types, n_shells_eff, n_harm),
+    }
+    return features, metadata
+
+
+def default_radii_from_spacing(sliceA, sliceB, k=6, multipliers=(2.5, 4.0, 6.0), spatial_key="spatial"):
+    sA = estimate_characteristic_spacing(sliceA, k=k, spatial_key=spatial_key)
+    sB = estimate_characteristic_spacing(sliceB, k=k, spatial_key=spatial_key)
+    base = max(sA, sB)
+    return [m * base for m in multipliers]
+
+
+def neighborhood_distribution_multiscale(
+    adata,
+    radii,
+    cell_types=None,
+    n_shells=3,
+    harmonics=(0, 1, 2),
+    harmonic_weights=None,
+    distance_decay="linear",
+    sigma=None,
+    include_self=False,
+    area_normalize=True,
+    add_empty_bin_per_scale=False,
+    l1_normalize_within_scale=True,
+    final_l1_normalize=True,
+    dtype=np.float32,
+    spatial_key="spatial",
+    label_key="cell_type_annot",
+    return_metadata=False,
+):
+    """
+    Concatenate rotation-invariant descriptors across multiple radii.
+    """
+    radii = [float(r) for r in radii]
+    if any(r <= 0 for r in radii):
+        raise ValueError("all radii must be > 0")
+
+    blocks = []
+    meta_blocks = []
+
+    for r in radii:
+        feat, meta = neighborhood_distribution_fourier(
+            adata=adata,
+            radius=r,
+            cell_types=cell_types,
+            n_shells=n_shells,
+            harmonics=harmonics,
+            harmonic_weights=harmonic_weights,
+            distance_decay=distance_decay,
+            sigma=sigma,
+            include_self=include_self,
+            area_normalize=area_normalize,
+            add_empty_bin=add_empty_bin_per_scale,
+            l1_normalize=l1_normalize_within_scale,
+            dtype=np.float64,
+            spatial_key=spatial_key,
+            label_key=label_key,
+            return_metadata=True,
+        )
+        blocks.append(feat)
+        meta_blocks.append({"radius": r, **meta})
+
+    X = np.concatenate(blocks, axis=1)
+
+    if final_l1_normalize:
+        row_sums = X.sum(axis=1, keepdims=True)
+        nz = row_sums[:, 0] > 0
+        X[nz] /= row_sums[nz]
+
+    X = X.astype(dtype, copy=False)
+
+    if not return_metadata:
+        return X
+
+    return X, {"scales": meta_blocks}
 
 
 def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-8, norm_k=6):
@@ -474,40 +629,94 @@ def calculate_cell_type_mismatch(sliceA, sliceB):
     return cell_type_mismatch
 
 
-def calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=np.float32, eps=1e-8, radius_k=6, radius_scale=4.0):
+def calculate_neighborhood_dissimilarity(
+    sliceA,
+    sliceB,
+    radius=None,
+    nx=None,
+    data_type=np.float32,
+    eps=1e-8,
+    radii=None,
+    radius_k=6,
+    radius_multipliers=(2.5, 4.0, 6.0),
+    n_shells=3,
+    harmonics=(0, 1, 2),
+    harmonic_weights=None,
+    distance_decay="linear",
+    sigma=None,
+    include_self=False,
+    spatial_key="spatial",
+    label_key="cell_type_annot",
+):
     """
-    Calculate neighborhood dissimilarity between two slices based on Jensen-Shannon distance of neighborhood distributions.
-    Args:
-        sliceA: First slice.
-        sliceB: Second slice.
-        radius: Radius for neighborhood calculation. If None, it is estimated data-driven.
-        nx: Backend to use for calculations.
-        data_type: Data type for backend tensors.
-        eps: Small constant to avoid zero vectors.
-        radius_k: Neighbor count for characteristic scale calculation if radius is None.
-        radius_scale: Multiplier for characteristic scale.
-    Returns:
-        js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions between sliceA and sliceB.
+    Neighborhood dissimilarity using multiscale rotation-invariant descriptors
+    and proper re-normalization before Jensen-Shannon distance.
     """
-    # 1. Establish a global cell type vocabulary so A and B features align to the exact same columns
-    all_types = np.array(sorted(list(set(sliceA.obs['cell_type_annot'].unique()).union(set(sliceB.obs['cell_type_annot'].unique())))))
+    all_types = np.array(sorted(
+        set(sliceA.obs[label_key].astype(str)) |
+        set(sliceB.obs[label_key].astype(str))
+    ), dtype=str)
 
-    # 2. Data-Driven Radius Selection
-    if radius is None:
-        print("Radius not provided. Estimating an optimal data-driven radius from local spacing...")
-        scale_A = estimate_characteristic_spacing(sliceA, k=radius_k)
-        scale_B = estimate_characteristic_spacing(sliceB, k=radius_k)
-        
-        radius = float(radius_scale * max(scale_A, scale_B))
-        print(f"Data-Driven computed Radius: {radius:.4f} (based on local density spacing).")
+    if radii is None:
+        if radius is not None:
+            radii = [float(radius)]
+        else:
+            radii = default_radii_from_spacing(
+                sliceA,
+                sliceB,
+                k=radius_k,
+                multipliers=radius_multipliers,
+                spatial_key=spatial_key,
+            )
 
-    neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius=radius, cell_types=all_types) + eps
-    neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius=radius, cell_types=all_types) + eps
+    featA = neighborhood_distribution_multiscale(
+        sliceA,
+        radii=radii,
+        cell_types=all_types,
+        n_shells=n_shells,
+        harmonics=harmonics,
+        harmonic_weights=harmonic_weights,
+        distance_decay=distance_decay,
+        sigma=sigma,
+        include_self=include_self,
+        area_normalize=True,
+        add_empty_bin_per_scale=False,
+        l1_normalize_within_scale=True,
+        final_l1_normalize=True,
+        dtype=np.float32,
+        spatial_key=spatial_key,
+        label_key=label_key,
+    )
 
-    neighborhood_distribution_sliceA = to_backend(neighborhood_distribution_sliceA, nx, data_type=data_type)
-    neighborhood_distribution_sliceB = to_backend(neighborhood_distribution_sliceB, nx, data_type=data_type)
+    featB = neighborhood_distribution_multiscale(
+        sliceB,
+        radii=radii,
+        cell_types=all_types,
+        n_shells=n_shells,
+        harmonics=harmonics,
+        harmonic_weights=harmonic_weights,
+        distance_decay=distance_decay,
+        sigma=sigma,
+        include_self=include_self,
+        area_normalize=True,
+        add_empty_bin_per_scale=False,
+        l1_normalize_within_scale=True,
+        final_l1_normalize=True,
+        dtype=np.float32,
+        spatial_key=spatial_key,
+        label_key=label_key,
+    )
 
-    js_dist_neighborhood = jensenshannon_divergence_backend(neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
+    # Add epsilon, THEN renormalize.
+    featA = featA + eps
+    featB = featB + eps
+    featA = featA / featA.sum(axis=1, keepdims=True)
+    featB = featB / featB.sum(axis=1, keepdims=True)
 
-    return js_dist_neighborhood
+    if nx is None:
+        return featA, featB
 
+    featA = to_backend(featA, nx, data_type=data_type)
+    featB = to_backend(featB, nx, data_type=data_type)
+
+    return jensenshannon_divergence_backend(featA, featB)
