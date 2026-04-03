@@ -28,7 +28,6 @@ def pairwise_align(
     use_gpu: bool = False,
     data_type = np.float32,
     epsilon: float = 1e-6,
-    log: bool = False,
     verbose: bool = False,
     gpu_verbose: bool = True,
     dummy_cell: bool = True,
@@ -227,7 +226,7 @@ def pairwise_align(
             G_init = _gi_aug
         G_init = to_backend(G_init, nx, data_type=data_type)
     
-    pi, logw = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, log=log, numItermax=numItermax, verbose=verbose, **kwargs)
+    pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
 
     # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
