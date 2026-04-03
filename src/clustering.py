@@ -28,12 +28,15 @@ def build_spatial_graph(coords: np.ndarray, method: str = 'knn', k: int = 6, rad
     if method == 'knn':
         nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='ball_tree').fit(coords)
         distances, indices = nbrs.kneighbors(coords)
+        seen = set()
         for i in range(n_cells):
             for j_idx in range(1, k+1):
                 j = indices[i, j_idx]
                 dist = distances[i, j_idx]
-                if i < j:
-                    edges.append((i, j))
+                u, v = min(i, j), max(i, j)
+                if (u, v) not in seen:
+                    seen.add((u, v))
+                    edges.append((u, v))
                     weights.append(1.0 / (dist + 1e-5))
     elif method == 'radius':
         if radius is None:
@@ -88,12 +91,12 @@ def cluster_cells_spatial(adata: AnnData, spatial_key: str = 'spatial', resoluti
     
     # 3. Leiden Community Detection
     partition = leidenalg.find_partition(
-        g, 
-        leidenalg.CPMVertexPartition, 
-        weights='weight', 
+        g,
+        leidenalg.RBConfigurationVertexPartition,
+        weights='weight',
         resolution_parameter=resolution
     )
-    
+
     labels = np.array(partition.membership)
     return labels
 
