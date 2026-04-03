@@ -1,11 +1,13 @@
 from .src import (
     pairwise_align,
     calculate_performance_metrics,
+    calculate_forward_reverse_compactness,
     visualize_alignment
 )
 
 __all__ = [
     'pairwise_align',
     'calculate_performance_metrics',
+    'calculate_forward_reverse_compactness',
     'visualize_alignment'
 ]

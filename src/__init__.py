@@ -3,7 +3,8 @@ from .core import (
 )
 
 from .metrices import (
-    calculate_performance_metrics
+    calculate_performance_metrics,
+    calculate_forward_reverse_compactness
 )
 
 from .visualize import (
@@ -13,5 +14,6 @@ from .visualize import (
 __all__ = [
     'pairwise_align',
     'calculate_performance_metrics',
+    'calculate_forward_reverse_compactness',
     'visualize_alignment'
 ]

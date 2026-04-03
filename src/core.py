@@ -2,7 +2,6 @@ import ot
 import torch
 import numpy as np
 
-from tqdm import tqdm
 from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
@@ -18,6 +17,7 @@ def pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
+    reg_compact: float = 0.0,
     radius: Optional[float] = None,
     use_rep: Optional[str] = None, 
     G_init = None, 
@@ -225,7 +225,7 @@ def pairwise_align(
             G_init = _gi_aug
         G_init = to_backend(G_init, nx, data_type=data_type)
     
-    pi, logw = fused_gromov_wasserstein_incent(M1, M2, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, gamma=gamma, log=True, numItermax=numItermax, verbose=verbose, **kwargs)
+    pi, logw = fused_gromov_wasserstein_incent(M1, M2, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, gamma=gamma, reg_compact=reg_compact, log=True, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
 
     # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────

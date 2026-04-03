@@ -75,7 +75,7 @@ def to_backend(x, nx, data_type=None, reference=None):
     return x_nx
 
 
-def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, G_init = None, loss_fun='square_loss', alpha = 0.1, gamma = 1.0, armijo=False, log=False, numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, **kwargs):
+def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, G_init = None, loss_fun='square_loss', alpha = 0.1, gamma = 1.0, reg_compact=0.0, armijo=False, log=False, numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 
@@ -99,6 +99,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, G_init = None, loss_fu
     # loss_fun: loss function to use (square loss)
     # alpha: step size
     # armijo: whether to use armijo line search
+    # reg_compact: the quadratic compactness regularizer coefficient (Form B)
     # log: whether to print log
     # numItermax: maximum number of iterations
     # tol_rel: relative tolerance
@@ -143,7 +144,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, G_init = None, loss_fu
 
     if log:
    
-        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
+        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, reg_compact=reg_compact, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
         fgw_dist = log['loss'][-1]
 
@@ -153,7 +154,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, G_init = None, loss_fu
         return res, log
 
     else:
-        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
+        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, reg_compact=reg_compact, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
 
 def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
@@ -224,7 +225,7 @@ def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
 
 
 def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solver, line_search,
-                                         gamma, G0=None, numItermax=6000, stopThr=1e-9,
+                                         gamma, reg_compact=0.0, G0=None, numItermax=6000, stopThr=1e-9,
                                          stopThr2=1e-9, verbose=False, log=False, **kwargs):
     r"""
     Solve the general regularized OT problem or its semi-relaxed version with
@@ -386,7 +387,12 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         alpha = reg1
         
         # with niche aware
-        return (1-alpha) * (nx.sum(M1 * G) + gamma * nx.sum(M2 * G)) + alpha * f(G)
+        cost_val = (1-alpha) * (nx.sum(M1 * G) + gamma * nx.sum(M2 * G)) + alpha * f(G)
+
+        if reg_compact > 0:
+            cost_val += reg_compact * nx.sum(G ** 2)
+            
+        return cost_val
 
         # without niche aware
         # return (1-alpha) * (nx.sum(M1 * G)) + alpha * f(G)
@@ -413,6 +419,9 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         # M2 (JSD/neighborhood) must be in the gradient for it to drive
         # the FW direction, not just the line search cost evaluation.
         Mi = M1 + gamma * M2 + reg1 * df(G)
+        
+        if reg_compact > 0:
+            Mi = Mi + 2 * reg_compact * G
 
         if not (reg2 is None):
             Mi = Mi + reg2 * (1 + nx.log(G))
@@ -454,7 +463,7 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         return G
 
 
-def cg_incent(a, b, M1, M2, reg, f, df, gamma, G0=None, line_search=line_search_armijo,
+def cg_incent(a, b, M1, M2, reg, f, df, gamma, reg_compact=0.0, G0=None, line_search=line_search_armijo,
        numItermax=6000, numItermaxEmd=100000, stopThr=1e-9, stopThr2=1e-9,
        verbose=False, log=False, **kwargs):
     r"""
@@ -545,7 +554,7 @@ def cg_incent(a, b, M1, M2, reg, f, df, gamma, G0=None, line_search=line_search_
         return emd(a, b, M, numItermaxEmd, log=True)
 
     return generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg, None, lp_solver, line_search, G0=G0,
-                                               gamma = gamma, numItermax=numItermax, stopThr=stopThr,
+                                               gamma = gamma, reg_compact=reg_compact, numItermax=numItermax, stopThr=stopThr,
                                                stopThr2=stopThr2, verbose=verbose, log=log, **kwargs)
 
 

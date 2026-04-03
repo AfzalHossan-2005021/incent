@@ -144,3 +144,69 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
     print("="*80 + "\n")
 
     return results
+
+
+def calculate_forward_reverse_compactness(pi_mat, sliceA, sliceB):
+    """
+    Form A diagnostic metric for spatial compactness.
+    Calculates the spatial variance of mapping for both forward and reverse directions
+    as well as effective support.
+
+    Args:
+        pi_mat: Alignment mapping matrix (ns x nt)
+        sliceA: Source anndata object containing spatial coordinates in .obsm['spatial']
+        sliceB: Target anndata object containing spatial coordinates in .obsm['spatial']
+        
+    Returns:
+        dict containing:
+            'forward_compactness': Average spatial variance in target per source cell
+            'reverse_compactness': Average spatial variance in source per target cell
+            'effective_support_fwd': Mean effective number of target cells per source cell
+            'effective_support_rev': Mean effective number of source cells per target cell
+    """
+    pi_mat = np.asarray(pi_mat)
+    Xs = np.asarray(sliceA.obsm['spatial'])
+    Xt = np.asarray(sliceB.obsm['spatial'])
+    
+    # Epsilon for numerical stability
+    eps = 1e-12
+
+    # Forward Compactness (Target variance for each source cell)
+    pi_row_sums = pi_mat.sum(axis=1)
+    pi_row_sums_safe = np.maximum(pi_row_sums, eps)
+    pi_row_normalized = pi_mat / pi_row_sums_safe[:, None]
+    
+    bary_t = pi_row_normalized @ Xt  # Source barycenters in Target space (N x 2)
+    # Variance = E[||x||^2] - ||E[x]||^2
+    var_fwd_E_x2 = pi_row_normalized @ np.sum(Xt ** 2, axis=1)
+    var_fwd_Ex_2 = np.sum(bary_t ** 2, axis=1)
+    # Average variance across source cells that have mass
+    active_sources = pi_row_sums > eps
+    var_fwd = np.clip(var_fwd_E_x2[active_sources] - var_fwd_Ex_2[active_sources], 0, None)
+    forward_compactness = np.mean(var_fwd) if len(var_fwd) > 0 else 0.0
+
+    # Reverse Compactness (Source variance for each target cell)
+    pi_col_sums = pi_mat.sum(axis=0)
+    pi_col_sums_safe = np.maximum(pi_col_sums, eps)
+    pi_col_normalized = pi_mat / pi_col_sums_safe[None, :]
+    
+    bary_s = pi_col_normalized.T @ Xs  # Target barycenters in Source space (M x 2)
+    var_rev_E_x2 = pi_col_normalized.T @ np.sum(Xs ** 2, axis=1)
+    var_rev_Ex_2 = np.sum(bary_s ** 2, axis=1)
+    # Average variance across target cells that have mass
+    active_targets = pi_col_sums > eps
+    var_rev = np.clip(var_rev_E_x2[active_targets] - var_rev_Ex_2[active_targets], 0, None)
+    reverse_compactness = np.mean(var_rev) if len(var_rev) > 0 else 0.0
+
+    # Effective support
+    eff_support_fwd = (pi_row_sums ** 2) / np.maximum(np.sum(pi_mat ** 2, axis=1), eps)
+    eff_support_rev = (pi_col_sums ** 2) / np.maximum(np.sum(pi_mat ** 2, axis=0), eps)
+    mean_eff_support_fwd = np.mean(eff_support_fwd[active_sources]) if len(eff_support_fwd[active_sources]) > 0 else 0.0
+    mean_eff_support_rev = np.mean(eff_support_rev[active_targets]) if len(eff_support_rev[active_targets]) > 0 else 0.0
+
+    return {
+        'forward_compactness': forward_compactness,
+        'reverse_compactness': reverse_compactness,
+        'effective_support_fwd': mean_eff_support_fwd,
+        'effective_support_rev': mean_eff_support_rev
+    }
