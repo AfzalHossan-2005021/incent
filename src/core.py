@@ -19,6 +19,9 @@ def hierarchical_pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
+    reg_compact: float = 0.001,
+    numItermax: int = 100000,
+    use_gpu: bool = True,
     resolution: float = 1.0,
     spatial_key: str = "spatial",
     use_rep: Optional[str] = "X_pca",
@@ -97,9 +100,10 @@ def hierarchical_pairwise_align(
         alpha=alpha,
         beta=beta,
         gamma=gamma,
-        use_rep=use_rep,
+        reg_compact=reg_compact,
         G_init=G_init,
-        dummy_cell=False, # rely on partial FGW for matching macro instead
+        numItermax=numItermax,
+        use_gpu=use_gpu,
         **kwargs
     )
     
