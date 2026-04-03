@@ -6,9 +6,53 @@ from tqdm import tqdm
 from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
+from scipy.spatial import cKDTree
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
+
+
+# ---------------------------------------------------------------------
+# Spatial scale & Helper Functions
+# ---------------------------------------------------------------------
+
+def estimate_characteristic_spacing(slice_obj, k=6, spatial_key="spatial"):
+    """
+    Robust local spacing estimate from the k-th nearest neighbor distance.
+    Used to normalize spatial distances and to set a data-driven neighborhood radius.
+    """
+    coords = np.asarray(slice_obj.obsm[spatial_key], dtype=np.float64)
+    n = coords.shape[0]
+    if n < 2:
+        return 1.0
+
+    k_eff = min(k + 1, n)  # +1 because the first neighbor is the point itself
+    tree = cKDTree(coords)
+    dists, _ = tree.query(coords, k=k_eff)
+
+    kth = dists[:, -1]
+    kth = kth[np.isfinite(kth) & (kth > 0)]
+    if kth.size == 0:
+        return 1.0
+
+    return float(np.median(kth))
+
+def _equal_area_shell_edges(radius, n_shells):
+    """Equal-area shells reduce the geometric bias of outer shells."""
+    return radius * np.sqrt(np.linspace(0.0, 1.0, n_shells + 1))
+
+
+def _distance_weights(dist, radius, mode="linear", sigma=None):
+    if mode is None or mode == "uniform":
+        return np.ones_like(dist, dtype=np.float64)
+    if mode == "linear":
+        return np.maximum(0.0, 1.0 - dist / radius)
+    if mode == "gaussian":
+        s = radius / 2.0 if sigma is None else float(sigma)
+        if s <= 0:
+            raise ValueError("`sigma` must be > 0 for gaussian weighting.")
+        return np.exp(-(dist ** 2) / (2.0 * s * s))
+    raise ValueError("distance_decay must be one of: None, 'uniform', 'linear', 'gaussian'.")
 
 
 def pairwise_align(
@@ -270,13 +314,17 @@ def neighborhood_distribution(slice, radius, n_shells=2, n_sectors=4, distance_d
     cells_within_radius = np.zeros((num_cells, num_features), dtype=float)
 
     source_coords = slice.obsm['spatial']
-    distances = euclidean_distances(source_coords, source_coords)
     
-    shell_edges = np.linspace(0, radius, n_shells + 1)
+    # Use cKDTree for massive memory savings over O(N^2) dense matrix
+    tree = cKDTree(source_coords)
+    neighbor_lists = tree.query_ball_point(source_coords, r=radius)
+    
+    # Use Equal-area shells to prevent geometric bias of outer shells having too much mass
+    shell_edges = _equal_area_shell_edges(radius, n_shells)
     angle_edges = np.linspace(0, 2 * np.pi, n_sectors + 1)
 
     for i in tqdm(range(num_cells)):
-        target_indices = np.where(distances[i] <= radius)[0]
+        target_indices = np.array(neighbor_lists[i], dtype=int)
         
         if not include_self:
             target_indices = target_indices[target_indices != i]
@@ -287,16 +335,12 @@ def neighborhood_distribution(slice, radius, n_shells=2, n_sectors=4, distance_d
 
         target_coords = source_coords[target_indices]
         rel_coords = target_coords - source_coords[i]
-        target_dists = distances[i, target_indices]
+        
+        # Calculate distances exactly for this sparse neighborhood
+        target_dists = np.linalg.norm(rel_coords, axis=1)
         
         # 1. Calculate weights
-        if distance_decay == "linear":
-            weights = np.maximum(0.0, 1.0 - target_dists / radius)
-        elif distance_decay == "gaussian":
-            sigma = radius / 2.0
-            weights = np.exp(-(target_dists ** 2) / (2 * sigma * sigma))
-        else:
-            weights = np.ones_like(target_dists)
+        weights = _distance_weights(target_dists, radius=radius, mode=distance_decay)
 
         # 2. Establish Local Principal Axis (Density Dipole)
         angles = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
@@ -341,35 +385,40 @@ def neighborhood_distribution(slice, radius, n_shells=2, n_sectors=4, distance_d
     return np.array(cells_within_radius)
 
 
-def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-6):
+def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-8, norm_k=6):
     """
-    Calculate spatial distance between cells in a slice.
+    Calculate spatial distance between cells in a slice, normalized by robust local spacing.
 
     Args:
         sliceA: First slice for which to calculate spatial distance.
         sliceB: Second slice for which to calculate spatial distance.
-        nx: Backend to use for calculations (e.g., NumpyBackend or TorchBackend).
-        data_type: Data type for backend tensors (default is float32).
-        spatial_key: Key for the spatial coordinates in the slice's obsm.
-        eps: Small constant to add to distance matrices to avoid zero vectors.
+        nx: Backend to use for calculations.
+        data_type: Data type for backend tensors.
+        spatial_key: Key for the spatial coordinates.
+        eps: Small constant to avoid division by zero.
+        norm_k: Kth neighbor to use for characteristic spacing estimation.
     Returns:
-    D_A, D_B: Pairwise spatial distance matrices of the slices.
+    D_A, D_B: Pairwise spatial distance matrices.
     """
     
     print("Calculating spatial distance between cells in slice A and slice B")
 
-    coordinates_A = sliceA.obsm[spatial_key]
-    coordinates_B = sliceB.obsm[spatial_key]
+    coordinates_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
+    coordinates_B = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)
 
     D_A = euclidean_distances(coordinates_A, coordinates_A)
     D_B = euclidean_distances(coordinates_B, coordinates_B)
 
-    D_A = to_backend(D_A, nx, data_type=data_type)
-    D_B = to_backend(D_B, nx, data_type=data_type)
+    # Normalize by local characteristic spacing instead of global max tissue diameter
+    scale_A = estimate_characteristic_spacing(sliceA, k=norm_k, spatial_key=spatial_key)
+    scale_B = estimate_characteristic_spacing(sliceB, k=norm_k, spatial_key=spatial_key)
+    scale = max(scale_A, scale_B, eps)
 
-    scale = max(D_A.max(), D_B.max()) + eps
     D_A = D_A / scale
     D_B = D_B / scale
+
+    D_A = to_backend(D_A, nx, data_type=data_type)
+    D_B = to_backend(D_B, nx, data_type=data_type)
 
     return D_A, D_B
 
@@ -425,50 +474,32 @@ def calculate_cell_type_mismatch(sliceA, sliceB):
     return cell_type_mismatch
 
 
-def calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=np.float32, eps=1e-6):
+def calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=np.float32, eps=1e-8, radius_k=6, radius_scale=4.0):
     """
     Calculate neighborhood dissimilarity between two slices based on Jensen-Shannon distance of neighborhood distributions.
     Args:
         sliceA: First slice.
         sliceB: Second slice.
         radius: Radius for neighborhood calculation. If None, it is estimated data-driven.
-        nx: Backend to use for calculations (e.g., NumpyBackend or TorchBackend).
-        data_type: Data type for backend tensors (default is float32).
-        eps: Small constant to add to neighborhood distributions to avoid zero vectors.
+        nx: Backend to use for calculations.
+        data_type: Data type for backend tensors.
+        eps: Small constant to avoid zero vectors.
+        radius_k: Neighbor count for characteristic scale calculation if radius is None.
+        radius_scale: Multiplier for characteristic scale.
     Returns:
         js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions between sliceA and sliceB.
     """
     # 1. Establish a global cell type vocabulary so A and B features align to the exact same columns
     all_types = np.array(sorted(list(set(sliceA.obs['cell_type_annot'].unique()).union(set(sliceB.obs['cell_type_annot'].unique())))))
-    num_total_types = len(all_types)
 
     # 2. Data-Driven Radius Selection
     if radius is None:
-        print("Radius not provided. Estimating an optimal data-driven radius...")
-        # Rule of thumb: We want the radius to enclose enough cells to see most types if homogeneously mixed.
-        # Often a neighborhood of K = (1.5 to 2) * num_types is needed for a stable biological niche compositional profile.
-        K_target = int(2.0 * num_total_types) 
+        print("Radius not provided. Estimating an optimal data-driven radius from local spacing...")
+        scale_A = estimate_characteristic_spacing(sliceA, k=radius_k)
+        scale_B = estimate_characteristic_spacing(sliceB, k=radius_k)
         
-        # Calculate distances to find median radius required to capture K cells
-        coords_A = sliceA.obsm['spatial']
-        coords_B = sliceB.obsm['spatial']
-        
-        dist_A = euclidean_distances(coords_A, coords_A)
-        dist_B = euclidean_distances(coords_B, coords_B)
-
-        # Sort to find distance to K_target-th neighbor
-        dist_A.sort(axis=1)
-        dist_B.sort(axis=1)
-        
-        # Protect against K_target being larger than dataset size
-        k_idx_A = min(K_target, dist_A.shape[1] - 1)
-        k_idx_B = min(K_target, dist_B.shape[1] - 1)
-        
-        median_radius_A = np.median(dist_A[:, k_idx_A])
-        median_radius_B = np.median(dist_B[:, k_idx_B])
-        
-        radius = float(max(median_radius_A, median_radius_B))
-        print(f"Data-Driven computed Radius: {radius:.4f} (target K = {K_target} neighbors based on {num_total_types} types).")
+        radius = float(radius_scale * max(scale_A, scale_B))
+        print(f"Data-Driven computed Radius: {radius:.4f} (based on local density spacing).")
 
     neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius=radius, cell_types=all_types) + eps
     neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius=radius, cell_types=all_types) + eps

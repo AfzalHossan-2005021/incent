@@ -96,8 +96,6 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
     if js_dist_neighborhood is None:
         if sliceA is None or sliceB is None:
             raise ValueError("sliceA and sliceB must be provided to calculate js_dist_neighborhood")
-        if radius is None:
-            raise ValueError("radius must be provided to calculate js_dist_neighborhood")
         
         # Calculate neighborhood dissimilarity using the provided slices and radius
         use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
