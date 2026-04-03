@@ -30,6 +30,7 @@ def hierarchical_pairwise_align(
     penalty: float = 1e3,
     use_mask: bool = True,
     use_init: bool = True,
+    visualize_clusters: bool = True,
     **kwargs
 ):
     """
@@ -44,6 +45,24 @@ def hierarchical_pairwise_align(
     
     print(f"Slice A: {len(np.unique(labelsA))} clusters")
     print(f"Slice B: {len(np.unique(labelsB))} clusters")
+    
+    if visualize_clusters:
+        try:
+            import matplotlib.pyplot as plt
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+            ptsA = sliceA.obsm[spatial_key]
+            ptsB = sliceB.obsm[spatial_key]
+            # using categorical cmap
+            cmap = plt.get_cmap('tab20')
+            ax1.scatter(ptsA[:,0], ptsA[:,1], c=labelsA, cmap=cmap, s=2, alpha=0.8)
+            ax1.set_title(f"Slice A: {len(np.unique(labelsA))} Clusters")
+            ax1.axis('equal')
+            ax2.scatter(ptsB[:,0], ptsB[:,1], c=labelsB, cmap=cmap, s=2, alpha=0.8)
+            ax2.set_title(f"Slice B: {len(np.unique(labelsB))} Clusters")
+            ax2.axis('equal')
+            plt.show()
+        except Exception as e:
+            print(f"Cluster visualization failed: {e}")
     
     print("--- [HOT] Step 2: Extracting Cluster Features ---")
     featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key)

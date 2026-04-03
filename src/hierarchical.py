@@ -142,18 +142,18 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None):
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
     
     try:
-        if hasattr(ot, 'partial') and hasattr(ot.partial, 'partial_fused_gromov_wasserstein'):
-            Pi_cluster = ot.partial.partial_fused_gromov_wasserstein(
+        if hasattr(ot.gromov, 'partial_fused_gromov_wasserstein'):
+            Pi_cluster = ot.gromov.partial_fused_gromov_wasserstein(
                 M_norm, C_A_norm, C_B_norm, p_A, p_B, m=m, alpha=alpha,
-                log=False, numItermax=500
+                loss_fun='square_loss', log=False, max_iter=500
             )
         else:
-            raise NotImplementedError("POT partial_fused_gromov_wasserstein not found. Upgrade POT.")
+            raise NotImplementedError("Not found")
     except Exception as e:
         logging.warning(f"Partial FGW failed or missing ({e}). Falling back to emd/FGW.")
         # Fallback to standard FGW
         Pi_cluster = ot.gromov.fused_gromov_wasserstein(
-            M_norm, C_A_norm, C_B_norm, p_A, p_B, loss_fun='square_loss', alpha=alpha, log=False, numItermax=500
+            M_norm, C_A_norm, C_B_norm, p_A, p_B, loss_fun='square_loss', alpha=alpha, log=False, max_iter=500
         )
         
     return Pi_cluster
