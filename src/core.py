@@ -17,7 +17,7 @@ def pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    radius: float,
+    radius: Optional[float] = None,
     use_rep: Optional[str] = None, 
     G_init = None, 
     a_distribution = None, 
@@ -431,15 +431,44 @@ def calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=n
     Args:
         sliceA: First slice.
         sliceB: Second slice.
-        radius: Radius for neighborhood calculation.
+        radius: Radius for neighborhood calculation. If None, it is estimated data-driven.
         nx: Backend to use for calculations (e.g., NumpyBackend or TorchBackend).
         data_type: Data type for backend tensors (default is float32).
         eps: Small constant to add to neighborhood distributions to avoid zero vectors.
     Returns:
         js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions between sliceA and sliceB.
     """
-    # 1. Establish a global cell type vocabulary so A and B features align to the exact same columns!
+    # 1. Establish a global cell type vocabulary so A and B features align to the exact same columns
     all_types = np.array(sorted(list(set(sliceA.obs['cell_type_annot'].unique()).union(set(sliceB.obs['cell_type_annot'].unique())))))
+    num_total_types = len(all_types)
+
+    # 2. Data-Driven Radius Selection
+    if radius is None:
+        print("Radius not provided. Estimating an optimal data-driven radius...")
+        # Rule of thumb: We want the radius to enclose enough cells to see most types if homogeneously mixed.
+        # Often a neighborhood of K = (1.5 to 2) * num_types is needed for a stable biological niche compositional profile.
+        K_target = int(2.0 * num_total_types) 
+        
+        # Calculate distances to find median radius required to capture K cells
+        coords_A = sliceA.obsm['spatial']
+        coords_B = sliceB.obsm['spatial']
+        
+        dist_A = euclidean_distances(coords_A, coords_A)
+        dist_B = euclidean_distances(coords_B, coords_B)
+
+        # Sort to find distance to K_target-th neighbor
+        dist_A.sort(axis=1)
+        dist_B.sort(axis=1)
+        
+        # Protect against K_target being larger than dataset size
+        k_idx_A = min(K_target, dist_A.shape[1] - 1)
+        k_idx_B = min(K_target, dist_B.shape[1] - 1)
+        
+        median_radius_A = np.median(dist_A[:, k_idx_A])
+        median_radius_B = np.median(dist_B[:, k_idx_B])
+        
+        radius = float(max(median_radius_A, median_radius_B))
+        print(f"Data-Driven computed Radius: {radius:.4f} (target K = {K_target} neighbors based on {num_total_types} types).")
 
     neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius=radius, cell_types=all_types) + eps
     neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius=radius, cell_types=all_types) + eps
