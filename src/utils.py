@@ -120,13 +120,16 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
     p_inv = 1.0 / nx.maximum(p, 1e-12)
     q_inv = 1.0 / nx.maximum(q, 1e-12)
 
+    C1_sq = C1 ** 2
+    C2_sq = C2 ** 2
+
     def f(G):
         # Base Gromov-Wasserstein term
         gw_loss = nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
-        # Form A Compactness (Fréchet variance) penalty
+        # Form A Compactness penalty requires squared distances for precise variance
         if reg_compact > 0:
-            compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2 * G)
-            compact_rev = 0.5 * nx.sum(C1 @ (G * q_inv[None, :]) * G)
+            compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2_sq * G)
+            compact_rev = 0.5 * nx.sum(C1_sq @ (G * q_inv[None, :]) * G)
             return gw_loss + reg_compact * (compact_fwd + compact_rev)
         return gw_loss
 
@@ -135,8 +138,8 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         gw_grad = 2 * (nx.dot(C1, G) + nx.dot(G, C2))
         # Gradient of Form A Compactness term
         if reg_compact > 0:
-            grad_fwd = (p_inv[:, None] * G) @ C2
-            grad_rev = C1 @ (G * q_inv[None, :])
+            grad_fwd = (p_inv[:, None] * G) @ C2_sq
+            grad_rev = C1_sq @ (G * q_inv[None, :])
             return gw_grad + reg_compact * (grad_fwd + grad_rev)
         return gw_grad
 
