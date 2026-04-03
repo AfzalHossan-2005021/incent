@@ -237,55 +237,106 @@ def pairwise_align(
     return pi
 
 
-def neighborhood_distribution(slice, radius, num_fourier_modes=2):
+def neighborhood_distribution(slice, radius, n_shells=2, n_sectors=4, distance_decay='linear', include_self=False, cell_types=None):
     """
-    Calculate the neighborhood distribution for a given slice, incorporating 
-    rotation-invariant directional features via Fourier coefficient magnitudes.
+    Calculate the neighborhood distribution using a Local Reference Frame (Density Dipole).
+    This descriptor is rotation-invariant, preserves relative angular positions (co-localization
+    vs repulsion), prevents empty bin edge-case explosions, and is strictly non-negative for JSD.
 
     Args:
         slice: Slice to get niche distribution for.
         radius: Radius of the niche.
-        num_fourier_modes: Maximum Fourier mode to calculate. 0 is just counts.
+        n_shells: Number of radial bins (distance layers).
+        n_sectors: Number of angular bins relative to the local principal axis.
+        distance_decay: 'linear', 'gaussian', or None. Weights closer cells more.
+        include_self: Whether to include the focal cell in its own neighborhood.
+        cell_types: Global array of cell types to ensure consistent feature columns.
 
     Returns:
-        niche_distribution: Niche distribution for the slice. Features are concatenated 
-                            magnitudes of Fourier modes up to num_fourier_modes for each cell type.
+        niche_distribution: Features for each cell containing local-frame binned neighbor weights.
     """
-    print("Calculating neighborhood distribution for the slice")
+    print("Calculating local-reference neighborhood distribution...")
 
-    unique_cell_types = np.array(list(slice.obs['cell_type_annot'].unique()))
+    if cell_types is None:
+        unique_cell_types = np.array(sorted(list(slice.obs['cell_type_annot'].unique())))
+    else:
+        unique_cell_types = np.array(cell_types)
+
     num_types = len(unique_cell_types)
     cell_type_to_index = dict(zip(unique_cell_types, list(range(num_types))))
     
     num_cells = slice.shape[0]
-    num_features = num_types * (num_fourier_modes + 1)
+    num_features = num_types * n_shells * n_sectors + 1  # +1 for empty neighborhood feature
     cells_within_radius = np.zeros((num_cells, num_features), dtype=float)
 
     source_coords = slice.obsm['spatial']
     distances = euclidean_distances(source_coords, source_coords)
+    
+    shell_edges = np.linspace(0, radius, n_shells + 1)
+    angle_edges = np.linspace(0, 2 * np.pi, n_sectors + 1)
 
     for i in tqdm(range(num_cells)):
         target_indices = np.where(distances[i] <= radius)[0]
+        
+        if not include_self:
+            target_indices = target_indices[target_indices != i]
+
+        if len(target_indices) == 0:
+            cells_within_radius[i, -1] = 1.0  # Assign all mass to the "empty" feature bin
+            continue
 
         target_coords = source_coords[target_indices]
         rel_coords = target_coords - source_coords[i]
+        target_dists = distances[i, target_indices]
         
-        if num_fourier_modes > 0:
-            angles = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
+        # 1. Calculate weights
+        if distance_decay == "linear":
+            weights = np.maximum(0.0, 1.0 - target_dists / radius)
+        elif distance_decay == "gaussian":
+            sigma = radius / 2.0
+            weights = np.exp(-(target_dists ** 2) / (2 * sigma * sigma))
+        else:
+            weights = np.ones_like(target_dists)
 
-        complex_fourier = np.zeros((num_types, num_fourier_modes + 1), dtype=complex)
+        # 2. Establish Local Principal Axis (Density Dipole)
+        angles = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
+        dipole_x = np.sum(weights * np.cos(angles))
+        dipole_y = np.sum(weights * np.sin(angles))
+        principal_angle = np.arctan2(dipole_y, dipole_x)  # "Local North"
+        
+        # 3. Align angles to Local Reference Frame
+        aligned_angles = (angles - principal_angle) % (2 * np.pi)
+        
+        # 4. Discretize into Shells and Sectors
+        rad_bins = np.digitize(target_dists, shell_edges[1:], right=True)
+        rad_bins = np.clip(rad_bins, 0, n_shells - 1)
+        
+        ang_bins = np.digitize(aligned_angles, angle_edges[:-1]) - 1
+        ang_bins = np.clip(ang_bins, 0, n_sectors - 1)
+
+        # Build feature histogram for this cell
+        local_feat = np.zeros((num_types, n_shells, n_sectors), dtype=float)
 
         for idx, ind in enumerate(target_indices):
             cell_type_str_j = str(slice.obs['cell_type_annot'].iloc[ind])
+            if cell_type_str_j not in cell_type_to_index:
+                continue
+                
             cell_type_idx = cell_type_to_index[cell_type_str_j]
+            ww = weights[idx]
+            rb = rad_bins[idx]
+            ab = ang_bins[idx]
             
-            complex_fourier[cell_type_idx, 0] += 1
-            if num_fourier_modes > 0:
-                theta = angles[idx]
-                for m in range(1, num_fourier_modes + 1):
-                    complex_fourier[cell_type_idx, m] += np.exp(1j * m * theta)
+            local_feat[cell_type_idx, rb, ab] += ww
 
-        cells_within_radius[i, :] = np.abs(complex_fourier).flatten()
+        cells_within_radius[i, :-1] = local_feat.flatten()
+        
+        # 5. Normalize to proper probability distribution for Jensen-Shannon Divergence
+        row_sum = np.sum(cells_within_radius[i, :-1])
+        if row_sum > 0:
+            cells_within_radius[i, :-1] /= row_sum
+        else:
+            cells_within_radius[i, -1] = 1.0
 
     return np.array(cells_within_radius)
 
@@ -387,8 +438,11 @@ def calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=n
     Returns:
         js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions between sliceA and sliceB.
     """
-    neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius=radius) + eps
-    neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius=radius) + eps
+    # 1. Establish a global cell type vocabulary so A and B features align to the exact same columns!
+    all_types = np.array(sorted(list(set(sliceA.obs['cell_type_annot'].unique()).union(set(sliceB.obs['cell_type_annot'].unique())))))
+
+    neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius=radius, cell_types=all_types) + eps
+    neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius=radius, cell_types=all_types) + eps
 
     neighborhood_distribution_sliceA = to_backend(neighborhood_distribution_sliceA, nx, data_type=data_type)
     neighborhood_distribution_sliceB = to_backend(neighborhood_distribution_sliceB, nx, data_type=data_type)
