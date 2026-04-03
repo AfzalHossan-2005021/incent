@@ -11,6 +11,38 @@ from ot.lp import emd
 from ot.optim import line_search_armijo
 from ot.utils import list_to_array, get_backend
 
+
+def select_backend(use_gpu=False, gpu_verbose=True):
+    """
+    Selects the appropriate backend (numpy or torch) based on GPU availability and user preference.
+
+    Args:
+        use_gpu: Whether to use GPU if available.
+        gpu_verbose: Whether to print GPU information when selected.
+    Returns:
+        The selected backend module (numpy or torch).
+    """
+    nx = None
+    if use_gpu:
+        if torch.cuda.is_available():
+            nx = ot.backend.TorchBackend()
+            if gpu_verbose:
+                print("Using gpu with Pytorch backend.")
+        else:
+            use_gpu = False
+            nx = ot.backend.NumpyBackend()
+            if gpu_verbose:
+                print("CUDA is not available on your system. Reverting to CPU with Numpy backend.")
+    else:
+        if torch.cuda.is_available() and gpu_verbose:
+            print("Tip: CUDA is available on your system. You can enable GPU support by setting use_gpu=True.")
+        else:
+            nx = ot.backend.NumpyBackend()
+            if gpu_verbose:
+                print("Using cpu with Numpy backend.")
+    return use_gpu, nx
+
+
 def to_backend(x, nx, data_type=None, reference=None):
     """
     Centralized function to manage CPU-GPU movement and type consistency.
@@ -41,6 +73,7 @@ def to_backend(x, nx, data_type=None, reference=None):
             x_nx = x_nx.cuda()
 
     return x_nx
+
 
 def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, loss_fun='square_loss', alpha = 0.1, beta = 0.8, armijo=False, log=False,numItermax=6000, tol_rel=1e-9, tol_abs=1e-9, **kwargs):
     """
@@ -90,13 +123,6 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
             G0 = G0.cuda()
 
     def f(G):
-   
-        # print("G.shape: ", G.shape)
-        # print("C1.shape: ", C1.shape)
-        # print("C2.shape: ", C2.shape)
-        # print("G", G)
-        # print("C1", C1)
-        # print("C2", C2)
         return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
 
     def df(G):

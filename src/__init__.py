@@ -1,6 +1,9 @@
 from .core import (
-    pairwise_align,
-    calculate_performance_metrics    
+    pairwise_align
+)
+
+from .metrices import (
+    calculate_performance_metrics
 )
 
 from .visualize import (

@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
-from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
+from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
 
 
 def pairwise_align(
@@ -71,24 +71,8 @@ def pairwise_align(
     epsilon = 1e-6
     
     # Determine if gpu or cpu is being used
-    nx = None
-    if use_gpu:
-        if torch.cuda.is_available():
-            nx = ot.backend.TorchBackend()
-            if gpu_verbose:
-                print("Using gpu with Pytorch backend.")
-        else:
-            use_gpu = False
-            nx = ot.backend.NumpyBackend()
-            if gpu_verbose:
-                print("CUDA is not available on your system. Reverting to CPU with Numpy backend.")
-    else:
-        if torch.cuda.is_available() and gpu_verbose:
-            print("Tip: CUDA is available on your system. You can enable GPU support by setting use_gpu=True.")
-        else:
-            nx = ot.backend.NumpyBackend()
-            if gpu_verbose:
-                print("Using cpu with Numpy backend.")
+    use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=gpu_verbose)
+    
     
     # check if slices are valid
     for s in [sliceA, sliceB]:
@@ -96,37 +80,24 @@ def pairwise_align(
             raise ValueError(f"Found empty `AnnData`:\n{s}.")   
     
     # ────────────────────── Calculate spatial distances ──────────────────────
-    D_A = to_backend(calculate_spatial_distance(sliceA), nx, data_type=data_type)
-    D_B = to_backend(calculate_spatial_distance(sliceB), nx, data_type=data_type)
-
-    # ────────────────────── Normalize spatial distances ──────────────────────
-    scale = max(D_A.max(), D_B.max()) + epsilon
-    D_A = D_A / scale
-    D_B = D_B / scale
+    D_A, D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=data_type, eps=epsilon)
     
+
     # ────────────────────── Calculate gene expression dissimilarity ──────────────────────
     cosine_dist_gene_expr = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps=epsilon)
 
+
     # ────────────────────── Calculate cell-type mismatch penalty ──────────────────────
-    M_celltype = calculate_cell_type_mismatch(sliceA, sliceB)
+    cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB)
 
 
     # Combine gene expression dissimilarity and cell-type mismatch penalty into a single cost matrix M1
-    M1_combined = (1 - beta) * cosine_dist_gene_expr + beta * M_celltype
+    M1_combined = (1 - beta) * cosine_dist_gene_expr + beta * cell_type_mismatch
     M1 = to_backend(M1_combined, nx, data_type=data_type)
 
 
-    # ────────────────────── Calculate neighborhood distribution ──────────────────────
-    neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius = radius) + epsilon
-    neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius = radius) + epsilon
-
-
-    neighborhood_distribution_sliceA = to_backend(neighborhood_distribution_sliceA, nx, data_type=data_type)
-    neighborhood_distribution_sliceB = to_backend(neighborhood_distribution_sliceB, nx, data_type=data_type)
-
-
     # ────────────────────── Calculate neighborhood dissimilarity ──────────────────────
-    js_dist_neighborhood = jensenshannon_divergence_backend(neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
+    js_dist_neighborhood = calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=data_type, eps=epsilon)
     M2 = to_backend(js_dist_neighborhood, nx, data_type=data_type)
 
 
@@ -302,23 +273,37 @@ def neighborhood_distribution(slice, radius):
     return np.array(cells_within_radius)
 
 
-def calculate_spatial_distance(slice, spatial_key = 'spatial'):
+def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial_key = 'spatial', eps=1e-6):
     """
     Calculate spatial distance between cells in a slice.
 
     Args:
-        slice: Slice for which to calculate spatial distance.
+        sliceA: First slice for which to calculate spatial distance.
+        sliceB: Second slice for which to calculate spatial distance.
+        nx: Backend to use for calculations (e.g., NumpyBackend or TorchBackend).
+        data_type: Data type for backend tensors (default is float32).
         spatial_key: Key for the spatial coordinates in the slice's obsm.
-
+        eps: Small constant to add to distance matrices to avoid zero vectors.
     Returns:
-    D: Pairwise spatial distance matrix of the slice.
+    D_A, D_B: Pairwise spatial distance matrices of the slices.
     """
     
-    print("Calculating spatial distance between cells in the slice")
+    print("Calculating spatial distance between cells in slice A and slice B")
 
-    coordinates = slice.obsm[spatial_key]
+    coordinates_A = sliceA.obsm[spatial_key]
+    coordinates_B = sliceB.obsm[spatial_key]
 
-    return euclidean_distances(coordinates, coordinates)
+    D_A = euclidean_distances(coordinates_A, coordinates_A)
+    D_B = euclidean_distances(coordinates_B, coordinates_B)
+
+    D_A = to_backend(D_A, nx, data_type=data_type)
+    D_B = to_backend(D_B, nx, data_type=data_type)
+
+    scale = max(D_A.max(), D_B.max()) + eps
+    D_A = D_A / scale
+    D_B = D_B / scale
+
+    return D_A, D_B
 
 
 def calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps = 1e-6):
@@ -361,154 +346,37 @@ def calculate_cell_type_mismatch(sliceA, sliceB):
         sliceB: Second slice.
 
     Returns:
-        M_celltype: Binary matrix indicating cell-type mismatches.
+        cell_type_mismatch: Binary matrix indicating cell-type mismatches.
     """
 
     _lab_A = np.asarray(sliceA.obs['cell_type_annot'].values)
     _lab_B = np.asarray(sliceB.obs['cell_type_annot'].values)
 
-    M_celltype = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
+    cell_type_mismatch = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
 
-    return M_celltype
+    return cell_type_mismatch
 
 
-def calculate_neighborhood_similarity(js_dist_neighborhood, pi):
+def calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx, data_type=np.float32, eps=1e-6):
     """
-    Calculate neighborhood similarity cost for a given alignment mapping.
-    
-    Uses element-wise multiplication: sum all weighted distances across the mapping.
-    Equivalent to INCENT.py's initial objective calculation for all dissimilarity types.
-    
+    Calculate neighborhood dissimilarity between two slices based on Jensen-Shannon distance of neighborhood distributions.
     Args:
-        js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions.
-        pi: Alignment mapping matrix (either uniform G or optimal transport solution).
-    
+        sliceA: First slice.
+        sliceB: Second slice.
+        radius: Radius for neighborhood calculation.
+        nx: Backend to use for calculations (e.g., NumpyBackend or TorchBackend).
+        data_type: Data type for backend tensors (default is float32).
+        eps: Small constant to add to neighborhood distributions to avoid zero vectors.
     Returns:
-        neighborhood_similarity: Weighted neighborhood dissimilarity cost.
+        js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions between sliceA and sliceB.
     """
-    return np.sum(js_dist_neighborhood * pi)
+    neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius=radius) + eps
+    neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius=radius) + eps
 
+    neighborhood_distribution_sliceA = to_backend(neighborhood_distribution_sliceA, nx, data_type=data_type)
+    neighborhood_distribution_sliceB = to_backend(neighborhood_distribution_sliceB, nx, data_type=data_type)
 
-def cell_type_matching(cell_type_mismatch, pi_mat):
-    """
-    Compute cell-type matching percentage from a pre-computed mismatch matrix.
-    
-    Args:
-        cell_type_mismatch: Binary mismatch matrix (1 = mismatch, 0 = match) from calculate_cell_type_mismatch().
-        pi_mat: Alignment mapping matrix (probabilistic transport plan).
-    
-    Returns:
-        Percentage of transported mass representing cell-type matches (0-100).
-    """
-    M_match = 1 - cell_type_mismatch
-    expected_matches = np.sum(M_match * pi_mat)
-    total_mass = np.sum(pi_mat)
-    
-    if total_mass > 0:
-        return (expected_matches / total_mass)
-    return 0.0
+    js_dist_neighborhood = jensenshannon_divergence_backend(neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
 
+    return js_dist_neighborhood
 
-def calculate_gene_expression_similarity(cosine_dist_gene_expr, pi):
-    """
-    Calculate gene expression similarity cost for a given alignment mapping.
-    
-    Uses element-wise multiplication: sum of weighted gene expression distances.
-    Matches INCENT.py's calculation for both initial and final objectives.
-    
-    Args:
-        cosine_dist_gene_expr: Cosine distance matrix of gene expression profiles.
-        pi: Alignment mapping matrix (either uniform G or optimal transport solution).
-    
-    Returns:
-        gene_expression_similarity: Weighted gene expression dissimilarity cost.
-    """
-    return np.sum(cosine_dist_gene_expr * pi)
-
-
-def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=None, cosine_dist_gene_expr=None, 
-                               cell_type_mismatch=None, sliceA=None, sliceB=None, use_rep=None, radius=100.0):
-    """
-    Calculate all similarity metrics for alignment quality assessment.
-    
-    **Note:** Neighborhood similarity uses element-wise multiplication (sum over all mapping entries).
-    This matches INCENT.py's initial objective calculation for all dissimilarity types (JSD/MSD/cosine).
-    For specialized metrics like INCENT.py's final JSD objective (argmax per row), compute separately.
-    
-    Args:
-        final_pi: Final optimal transport alignment mapping (required).
-        init_pi: Initial alignment mapping (optional). If None, uses uniform distribution.
-        js_dist_neighborhood: Jensen-Shannon distance matrix of neighborhood distributions (optional).
-                             If not provided and sliceA, sliceB, radius are given, will be calculated.
-        cosine_dist_gene_expr: Cosine distance matrix of gene expression profiles (optional).
-                              If not provided and sliceA, sliceB, use_rep are given, will be calculated.
-        sliceA: First slice for calculating missing distance matrices (optional).
-        sliceB: Second slice for calculating missing distance matrices (optional).
-        use_rep: Representation key for gene expression (optional, used with cosine_dist_gene_expr calculation).
-        radius: Radius for neighborhood calculation (optional, used with js_dist_neighborhood calculation).
-    
-    Returns:
-        Dictionary with keys: 'initial_obj_neighbor', 'initial_obj_gene', 
-                              'final_obj_neighbor', 'final_obj_gene',
-                              'initial_cell_type_match', 'final_cell_type_match'
-                              
-    Raises:
-        ValueError: If required parameters for distance calculation are missing.
-    """
-    # Use uniform distribution if init_pi not provided
-    if init_pi is None:
-        init_pi = np.ones(final_pi.shape) / (final_pi.shape[0] * final_pi.shape[1])
-    
-    # Calculate js_dist_neighborhood if not provided
-    if js_dist_neighborhood is None:
-        if sliceA is None or sliceB is None:
-            raise ValueError("sliceA and sliceB must be provided to calculate js_dist_neighborhood")
-        if radius is None:
-            raise ValueError("radius must be provided to calculate js_dist_neighborhood")
-        
-        # Calculate neighborhood distributions
-        nd_sliceA = neighborhood_distribution(sliceA, radius=radius) + 1e-6
-        nd_sliceB = neighborhood_distribution(sliceB, radius=radius) + 1e-6
-        js_dist_neighborhood = jensenshannon_divergence_backend(nd_sliceA, nd_sliceB)
-        
-        # Convert to numpy if necessary
-        if isinstance(js_dist_neighborhood, torch.Tensor):
-            js_dist_neighborhood = js_dist_neighborhood.detach().cpu().numpy()
-    
-    # Calculate cosine_dist_gene_expr if not provided
-    if cosine_dist_gene_expr is None:
-        if sliceA is None or sliceB is None:
-            raise ValueError("sliceA and sliceB must be provided to calculate cosine_dist_gene_expr")
-        cosine_dist_gene_expr = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep)
-
-    # Calculate cell-type matching metrics if slices are provided
-    if cell_type_mismatch is None:
-        if sliceA is None or sliceB is None:
-            raise ValueError("sliceA and sliceB must be provided to calculate cell_type_matching_percentage")
-        cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB)
-
-    results = {}
-    
-    # Calculate neighborhood similarities
-    results['initial_obj_neighbor'] = calculate_neighborhood_similarity(js_dist_neighborhood, init_pi)
-    results['final_obj_neighbor'] = calculate_neighborhood_similarity(js_dist_neighborhood, final_pi)
-    
-    # Calculate gene expression similarities
-    results['initial_obj_gene'] = calculate_gene_expression_similarity(cosine_dist_gene_expr, init_pi)
-    results['final_obj_gene'] = calculate_gene_expression_similarity(cosine_dist_gene_expr, final_pi)
-    
-    # Calculate cell-type matching percentages
-    results['initial_cell_type_match'] = cell_type_matching(cell_type_mismatch, init_pi)
-    results['final_cell_type_match'] = cell_type_matching(cell_type_mismatch, final_pi)
-
-    print(f"Initial neighborhood similarity (jsd): {results['initial_obj_neighbor']}")
-    print(f"Final neighborhood similarity (jsd): {results['final_obj_neighbor']}")
-    print(f"Improvement in neighborhood similarity: {(results['initial_obj_neighbor'] - results['final_obj_neighbor']) * 100:.2f}%")
-    print(f"Initial gene expression similarity: {results['initial_obj_gene']}")
-    print(f"Final gene expression similarity: {results['final_obj_gene']}")
-    print(f"Improvement in gene expression similarity: {(results['initial_obj_gene'] - results['final_obj_gene']) * 100:.2f}%")
-    print(f"Initial cell-type matching percentage: {results['initial_cell_type_match']}")
-    print(f"Final cell-type matching percentage: {results['final_cell_type_match']}")
-    print(f"Improvement in cell-type matching percentage: {(results['final_cell_type_match'] - results['initial_cell_type_match']) * 100:.2f}%")
-
-    return results
