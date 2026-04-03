@@ -117,20 +117,42 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         G0 = (1/nx.sum(G_init)) * G_init
     G0 = to_backend(G0, nx)
 
+    p_inv = 1.0 / nx.maximum(p, 1e-12)
+    q_inv = 1.0 / nx.maximum(q, 1e-12)
+
     def f(G):
-        # f(G) = <C1, GG^T> + <C2, G^T G> + reg_compact * ||G||^2
-        return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2) + reg_compact * nx.sum(G ** 2)
+        # Base Gromov-Wasserstein term
+        gw_loss = nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
+        # Form A Compactness (Fréchet variance) penalty
+        if reg_compact > 0:
+            compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2 * G)
+            compact_rev = 0.5 * nx.sum(C1 @ (G * q_inv[None, :]) * G)
+            return gw_loss + reg_compact * (compact_fwd + compact_rev)
+        return gw_loss
 
     def df(G):
-        # Gradient of f(G)=<C1, GG^T> + <C2, G^T G> is 2*(C1G + GC2) + 2*reg_compact*G
-        return 2 * (nx.dot(C1, G) + nx.dot(G, C2)) + 2 * reg_compact * G
+        # Gradient of GW term
+        gw_grad = 2 * (nx.dot(C1, G) + nx.dot(G, C2))
+        # Gradient of Form A Compactness term
+        if reg_compact > 0:
+            grad_fwd = (p_inv[:, None] * G) @ C2
+            grad_rev = C1 @ (G * q_inv[None, :])
+            return gw_grad + reg_compact * (grad_fwd + grad_rev)
+        return gw_grad
 
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
-            return line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
+            alpha_step, fc, cost_new = line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
+            # Enforce probability simplex limit to avoid negative masses entirely
+            if alpha_step is None: alpha_step = 1.0
+            if alpha_step > 1.0: alpha_step = 1.0
+            if alpha_step < 0.0: alpha_step = 0.0
+            cost_new = cost(G + alpha_step * deltaG)
+            return alpha_step, fc, cost_new
     else:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
-            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=(1-alpha)*M, reg=alpha, nx=nx, **kwargs)
+            # enforce hard bounds natively from solve_1d_linesearch_quad
+            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=(1-alpha)*M, reg=alpha, alpha_min=0.0, alpha_max=1.0, nx=nx, **kwargs)
 
     if log:
    
