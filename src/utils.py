@@ -225,6 +225,11 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
     M = (X + Y) / 2.0
     kl_X_M = kl_divergence_corresponding_backend(X, M)
     kl_Y_M = kl_divergence_corresponding_backend(Y, M)
+    js_dist = nx.sqrt((kl_X_M + kl_Y_M) / 2.0).T[0]
+    return js_dist
+
+
+def jensenshannon_divergence_backend(X, Y):
     """
     This function is added ny Nuwaisir
     
