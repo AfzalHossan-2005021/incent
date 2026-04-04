@@ -258,8 +258,8 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             centroids_B[i] = coords_B[mask].mean(axis=0)
             valid_B[i] = True
 
-    # 2. Build Structural Adjacency Matrices for Clusters (k=10)
-    k_A = min(10, np.sum(valid_A))
+    # 2. Build Structural Adjacency Matrices for Clusters (k=6)
+    k_A = min(6, np.sum(valid_A))
     adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
     if k_A > 0:
         nn_A = NearestNeighbors(n_neighbors=k_A).fit(centroids_A[valid_A])
@@ -270,7 +270,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 adj_A[valid_idx_A[i], valid_idx_A[n]] = True
                 adj_A[valid_idx_A[n], valid_idx_A[i]] = True
 
-    k_B = min(10, np.sum(valid_B))
+    k_B = min(6, np.sum(valid_B))
     adj_B = np.zeros((num_clusters_B, num_clusters_B), dtype=bool)
     if k_B > 0:
         nn_B = NearestNeighbors(n_neighbors=k_B).fit(centroids_B[valid_B])
@@ -284,12 +284,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     np.fill_diagonal(adj_A, True)
     np.fill_diagonal(adj_B, True)
 
-    # 3. Select ENLARGED subset of transport masses (Top 95%)
+    # 3. Select ENLARGED subset of transport masses (Top 85%)
     flat_pi = Pi_cluster.flatten()
     sorted_idx = np.argsort(flat_pi)[::-1]
     sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.95)
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.85)
     selected_flat_idx = sorted_idx[:cutoff_idx+1]
     
     matches = []
@@ -334,21 +334,17 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
     
-    # Compute dynamic extension radius
-    def compute_radius(coords_core):
-        if len(coords_core) > 1:
-            nn = NearestNeighbors(n_neighbors=min(6, len(coords_core))).fit(coords_core)
-            dists, _ = nn.kneighbors(coords_core)
-            median_dist = np.median(dists[:, 1:])
-            # 1 hop roughly equals the median neighbor distance
-            # Enlarging the hop multiplier from 2.0 to 4.0 to aggressively sweep in aligned border structures
-            return median_dist * (extension_hops * 4.0)
-        return 10.0
-            
-    rad_A = compute_radius(coords_A[core_cells_A])
-    rad_B = compute_radius(coords_B[core_cells_B])
+    # 6. Continuous Enlargement to Maximum Bounding Target
+    # We want to match exactly the size of the smaller slice to maximize coverage.
+    target_count = min(N, M)
     
-    idx_A = np.where(dist_A <= rad_A)[0]
-    idx_B = np.where(dist_B <= rad_B)[0]
+    # Sorting by physical distance to the matching macro-core ensures that 
+    # the selection grows outward continuously like a concentric region-fill
+    sorted_A = np.argsort(dist_A)
+    sorted_B = np.argsort(dist_B)
+    
+    # Slice the exact identical volume of contiguous cells
+    idx_A = sorted_A[:target_count]
+    idx_B = sorted_B[:target_count]
     
     return idx_A, idx_B, dist_A[idx_A], dist_B[idx_B]
