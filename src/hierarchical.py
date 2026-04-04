@@ -222,16 +222,14 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
     return G_init
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, p_A, p_B, spatial_key='spatial', extension_hops=2):
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, centroids_A, centroids_B, spatial_key='spatial', extension_hops=2):
     """
-    Identifies the largest continuous, highly-matched section from the clustering alignment
-    by evaluating the retained marginal probability mass for each cluster.
-    Returns the cell indices for the extended macro-region in both slices,
-    along with their boundary-distances for weight decay.
+    Identifies a continuous, highly-matched section from the clustering alignment
+    by selecting the most confident cluster pair as a seed, and then iteratively
+    growing the region into structurally consistent neighboring clusters.
     """
-    from sklearn.neighbors import NearestNeighbors
-    from scipy.sparse.csgraph import connected_components
-    from scipy.spatial import cKDTree
+    from scipy.spatial import Delaunay, cKDTree
+    from collections import defaultdict
     import numpy as np
 
     N, M = sliceA.shape[0], sliceB.shape[0]
@@ -240,65 +238,86 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if total_mass == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    # Evaluate Unbalanced OT Marginal Mass Retention (biological confidence)
-    # Clusters mapping poorly have their probabilities destroyed by UFGW penalty
-    marg_A = np.sum(Pi_cluster, axis=1)
-    marg_B = np.sum(Pi_cluster, axis=0)
+    def build_cluster_adj(centroids):
+        # Fallback to fully connected if 3 points or fewer
+        if len(centroids) < 4:
+            return {i: set(range(len(centroids))) - {i} for i in range(len(centroids))}
+        try:
+            tri = Delaunay(centroids)
+            adj = defaultdict(set)
+            indptr, indices = tri.vertex_neighbor_vertices
+            for i in range(len(centroids)):
+                adj[i] = set(indices[indptr[i]:indptr[i+1]])
+            return adj
+        except Exception:
+            return {i: set(range(len(centroids))) - {i} for i in range(len(centroids))}
+
+    adj_A = build_cluster_adj(centroids_A)
+    adj_B = build_cluster_adj(centroids_B)
     
-    ratio_A = marg_A / (p_A + 1e-15)
-    ratio_B = marg_B / (p_B + 1e-15)
+    # 1. Seed: Find the absolute most confident cluster mapping pair
+    seed_A, seed_B = np.unravel_index(np.argmax(Pi_cluster), Pi_cluster.shape)
     
-    # We only take clusters retaining at least 50% of the max survival ratio!
-    # If the strongest matching cluster kept 90% of its cells aligned, we demand at least 45%.
-    max_ret_A = np.max(ratio_A)
-    max_ret_B = np.max(ratio_B)
+    # We require a candidate neighbor matching to retain at least a fraction of the core match strength
+    # Since UFGW can squash bounds, we'll set the propagation boundary requirement modestly: > 15% of peak
+    dynamic_thresh = np.max(Pi_cluster) * 0.15 
     
-    strong_A = np.where(ratio_A > (max_ret_A * 0.5))[0]
-    strong_B = np.where(ratio_B > (max_ret_B * 0.5))[0]
+    matched_A = {seed_A}
+    matched_B = {seed_B}
+    queue = [(seed_A, seed_B)]
     
-    if len(strong_A) == 0: # fallback
-        thresh = np.max(Pi_cluster) * 0.1
-        strong_A, strong_B = np.where(Pi_cluster > thresh)
+    # 2. Region Grow
+    while len(queue) > 0:
+        curr_A, curr_B = queue.pop(0)
         
+        # Traverse spatial neighbors in Slice A
+        for n_A in adj_A[curr_A]:
+            if n_A in matched_A: continue
+                
+            # Traverse spatial neighbors in Slice B
+            for n_B in adj_B[curr_B]:
+                if n_B in matched_B: continue
+                
+                # Check cross-slice matching confidence between these neighbors
+                if Pi_cluster[n_A, n_B] >= dynamic_thresh:
+                    matched_A.add(n_A)
+                    matched_B.add(n_B)
+                    queue.append((n_A, n_B))
+                    
+    strong_A = np.array(list(matched_A))
+    strong_B = np.array(list(matched_B))
+    
+    # 3. Form mapped cell clusters
     core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
     core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
     
     if len(core_cells_A) == 0 or len(core_cells_B) == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-    
-    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
-
-    def largest_component(coords, cell_idx):
-        if len(cell_idx) < 2: return cell_idx
-        nn = NearestNeighbors(n_neighbors=min(6, len(cell_idx))).fit(coords[cell_idx])
-        adj = nn.kneighbors_graph(mode='connectivity')
-        n_comp, comp_labels = connected_components(adj, directed=False)
-        largest = np.bincount(comp_labels).argmax()
-        return cell_idx[comp_labels == largest]
         
-    contig_A = largest_component(coords_A, core_cells_A)
-    contig_B = largest_component(coords_B, core_cells_B)
+    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
     
-    # KDTree for physical distance measurement
-    tree_A = cKDTree(coords_A[contig_A])
-    tree_B = cKDTree(coords_B[contig_B])
+    # Since we topologically grew from a contiguous core, all cells here inherently form a contiguous block.
+    # 4. KDTree for physical distance measurement toward the extracted contiguous center
+    tree_A = cKDTree(coords_A[core_cells_A])
+    tree_B = cKDTree(coords_B[core_cells_B])
     
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
     
-    # Compute dynamic extension radius
+    # 5. Identify dynamic extension radius
     def compute_radius(coords_core):
+        from sklearn.neighbors import NearestNeighbors
         if len(coords_core) > 1:
             nn = NearestNeighbors(n_neighbors=min(6, len(coords_core))).fit(coords_core)
             dists, _ = nn.kneighbors(coords_core)
             median_dist = np.median(dists[:, 1:])
-            # 1 hop roughly equals the median neighbor distance
             return median_dist * (extension_hops * 2.0)
         return 5.0
             
-    rad_A = compute_radius(coords_A[contig_A])
-    rad_B = compute_radius(coords_B[contig_B])
+    rad_A = compute_radius(coords_A[core_cells_A])
+    rad_B = compute_radius(coords_B[core_cells_B])
     
+    # Extend boundary smoothly
     idx_A = np.where(dist_A <= rad_A)[0]
     idx_B = np.where(dist_B <= rad_B)[0]
     
