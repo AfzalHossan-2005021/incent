@@ -143,13 +143,11 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     
     logging.info("Running Unbalanced FGW...")
     # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
-    Pi_cluster = ot.gromov.fused_unbalanced_gromov_wasserstein(
-        Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, log=False, max_iter=500
+    pi_samp, pi_feat, log = ot.gromov.fused_unbalanced_gromov_wasserstein(
+        Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, log=True, max_iter=500
     )
-    if isinstance(Pi_cluster, tuple):
-        Pi_cluster = Pi_cluster[0]
     
-    return Pi_cluster
+    return pi_samp
 
 
 def build_block_restricted_cost(M_cell, labels_A, labels_B, Pi_cluster, threshold=1e-4, penalty=1e6):

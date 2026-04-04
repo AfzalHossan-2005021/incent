@@ -108,7 +108,7 @@ def hierarchical_pairwise_align(
                 lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
                 ax.add_collection(lc)
 
-            ax.set_title("Macro-Level Cluster Matching ($\Pi_{cluster}$)")
+            ax.set_title("Macro-Level Cluster Matching ($Pi_{cluster}$)")
             ax.axis('equal')
             ax.legend()
             plt.show()
