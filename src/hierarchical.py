@@ -222,9 +222,10 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
     return G_init
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', extension_hops=2):
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, p_A, p_B, spatial_key='spatial', extension_hops=2):
     """
-    Identifies the largest continuous, highly-matched section from the clustering alignment.
+    Identifies the largest continuous, highly-matched section from the clustering alignment
+    by evaluating the retained marginal probability mass for each cluster.
     Returns the cell indices for the extended macro-region in both slices,
     along with their boundary-distances for weight decay.
     """
@@ -239,15 +240,21 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if total_mass == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    # Strictly select the highest confidence transports that make up 50% of the mapped mass
-    flat_pi = Pi_cluster.flatten()
-    sorted_idx = np.argsort(flat_pi)[::-1]
-    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
+    # Evaluate Unbalanced OT Marginal Mass Retention (biological confidence)
+    # Clusters mapping poorly have their probabilities destroyed by UFGW penalty
+    marg_A = np.sum(Pi_cluster, axis=1)
+    marg_B = np.sum(Pi_cluster, axis=0)
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.50)
-    selected_flat_idx = sorted_idx[:cutoff_idx+1]
+    ratio_A = marg_A / (p_A + 1e-15)
+    ratio_B = marg_B / (p_B + 1e-15)
     
-    strong_A, strong_B = np.unravel_index(selected_flat_idx, Pi_cluster.shape)
+    # We only take clusters retaining at least 50% of the max survival ratio!
+    # If the strongest matching cluster kept 90% of its cells aligned, we demand at least 45%.
+    max_ret_A = np.max(ratio_A)
+    max_ret_B = np.max(ratio_B)
+    
+    strong_A = np.where(ratio_A > (max_ret_A * 0.5))[0]
+    strong_B = np.where(ratio_B > (max_ret_B * 0.5))[0]
     
     if len(strong_A) == 0: # fallback
         thresh = np.max(Pi_cluster) * 0.1

@@ -80,8 +80,17 @@ def hierarchical_pairwise_align(
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
     
+    # Biologically adjust uniformly normalized masses to absolute cell-count ratios.
+    n_A, n_B = sliceA.shape[0], sliceB.shape[0]
+    scale_factor = float(max(n_A, n_B))
+    
+    p_A_scaled = p_A * (n_A / scale_factor)
+    p_B_scaled = p_B * (n_B / scale_factor)
+    
+    # We deeply drop reg_marginals (default 1.0 -> 0.1) so mismatched space gets legally discarded
+    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A_scaled, p_B_scaled, alpha=alpha, reg_m=kwargs.get('macro_reg_m', 0.1))
+
     if visualize_clusters:
         try:
             import matplotlib.pyplot as plt
@@ -119,7 +128,7 @@ def hierarchical_pairwise_align(
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
     idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
         sliceA, sliceB, labelsA, labelsB, Pi_cluster, 
-        spatial_key=spatial_key, extension_hops=2
+        p_A=p_A_scaled, p_B=p_B_scaled, spatial_key=spatial_key, extension_hops=2
     )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
