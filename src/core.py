@@ -19,7 +19,7 @@ def pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    reg_compact: float = 0.0,
+    reg_compact: float = 0.001,
     armijo: bool = True,
     radius: Optional[float] = None,
     use_rep: Optional[str] = None,
@@ -1376,32 +1376,17 @@ def hierarchical_pairwise_align(
         feature_tau=init_feature_tau,
     )
 
-    fine_out = fused_unbalanced_gromov_wasserstein(
-        D_A,
-        D_B,
-        wx=a,
-        wy=b,
-        reg_marginals=fine_reg_marginals,
-        epsilon=fine_epsilon,
-        divergence='kl',
-        unbalanced_solver='sinkhorn',
-        alpha=fine_alpha,
-        M=M_fine,
-        init_pi=G_init,
-        max_iter=fine_max_iter,
-        tol=1e-7,
-        max_iter_ot=fine_max_iter_ot,
-        tol_ot=1e-7,
-        log=return_details,
-        verbose=verbose,
-        **kwargs,
+    fine_out = pairwise_align(
+        sliceA,
+        sliceB,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        radius=radius,
+        G_init=G_init
     )
 
-    if return_details:
-        fine_plan, _, fine_log = fine_out
-    else:
-        fine_plan, _ = fine_out
-        fine_log = None
+    fine_plan = fine_out
 
     fine_plan = np.asarray(fine_plan, dtype=np.float64)
 
@@ -1416,8 +1401,7 @@ def hierarchical_pairwise_align(
         'cell_feature_cost': M_fine,
         'cell_structure_A': D_A,
         'cell_structure_B': D_B,
-        'coarse_log': coarse_log,
-        'fine_log': fine_log,
+        'coarse_log': coarse_log
     }
 
     return (fine_plan, details) if return_details else fine_plan
