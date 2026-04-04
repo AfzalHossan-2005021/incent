@@ -222,103 +222,101 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
     return G_init
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, centroids_A, centroids_B, spatial_key='spatial', extension_hops=2):
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, p_A, p_B, spatial_key='spatial', extension_hops=2):
     """
-    Identifies a continuous, highly-matched section from the clustering alignment
-    by selecting the most confident cluster pair as a seed, and then iteratively
-    growing the region into structurally consistent neighboring clusters.
+    Identifies the largest continuous, structurally-identical macro-section 
+    by aligning tissue coordinates via core-OT points, calculating strict mutual
+    spatial overlap, and drawing matching cell quotas for identical visual shapes.
     """
-    from scipy.spatial import Delaunay, cKDTree
-    from collections import defaultdict
+    from sklearn.neighbors import NearestNeighbors
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
     import numpy as np
 
     N, M = sliceA.shape[0], sliceB.shape[0]
+    coords_A = sliceA.obsm[spatial_key]
+    coords_B = sliceB.obsm[spatial_key]
     
     total_mass = np.sum(Pi_cluster)
-    if total_mass == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+    if total_mass == 0: return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    def build_cluster_adj(centroids):
-        # Fallback to fully connected if 3 points or fewer
-        if len(centroids) < 4:
-            return {i: set(range(len(centroids))) - {i} for i in range(len(centroids))}
-        try:
-            tri = Delaunay(centroids)
-            adj = defaultdict(set)
-            indptr, indices = tri.vertex_neighbor_vertices
-            for i in range(len(centroids)):
-                adj[i] = set(indices[indptr[i]:indptr[i+1]])
-            return adj
-        except Exception:
-            return {i: set(range(len(centroids))) - {i} for i in range(len(centroids))}
+    # 1. Define Macro Anchor Points (Centroids of matched clusters)
+    cent_A = np.zeros((Pi_cluster.shape[0], 2))
+    for i in range(Pi_cluster.shape[0]):
+        idx = np.where(labels_A == i)[0]
+        if len(idx) > 0: cent_A[i] = np.mean(coords_A[idx], axis=0)
 
-    adj_A = build_cluster_adj(centroids_A)
-    adj_B = build_cluster_adj(centroids_B)
+    cent_B = np.zeros((Pi_cluster.shape[1], 2))
+    for j in range(Pi_cluster.shape[1]):
+        idx = np.where(labels_B == j)[0]
+        if len(idx) > 0: cent_B[j] = np.mean(coords_B[idx], axis=0)
+
+    # Find highest confidence anchor cluster pairs for spatial synchronization
+    flat_pi = Pi_cluster.flatten()
+    sorted_idx = np.argsort(flat_pi)[::-1]
+    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
+    # Take clusters strictly representing the top 40% of transported flow
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.40)
+    selected_flat_idx = sorted_idx[:max(cutoff_idx+1, 3)] # At least 3 points for affine rotation
+    strong_A, strong_B = np.unravel_index(selected_flat_idx, Pi_cluster.shape)
+
+    # 2. Rigid Tissue Alignment (Procrustes)
+    X, Y = cent_A[strong_A], cent_B[strong_B]
+    mu_X, mu_Y = np.mean(X, axis=0), np.mean(Y, axis=0)
+    H = (Y - mu_Y).T @ (X - mu_X)
+    U, S, Vt = np.linalg.svd(H)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = U @ Vt
     
-    # 1. Seed: Find the absolute most confident cluster mapping pair
-    seed_A, seed_B = np.unravel_index(np.argmax(Pi_cluster), Pi_cluster.shape)
-    
-    # We require a candidate neighbor matching to retain at least a fraction of the core match strength
-    # Since UFGW can squash bounds, we'll set the propagation boundary requirement modestly: > 15% of peak
-    dynamic_thresh = np.max(Pi_cluster) * 0.15 
-    
-    matched_A = {seed_A}
-    matched_B = {seed_B}
-    queue = [(seed_A, seed_B)]
-    
-    # 2. Region Grow
-    while len(queue) > 0:
-        curr_A, curr_B = queue.pop(0)
-        
-        # Traverse spatial neighbors in Slice A
-        for n_A in adj_A[curr_A]:
-            if n_A in matched_A: continue
-                
-            # Traverse spatial neighbors in Slice B
-            for n_B in adj_B[curr_B]:
-                if n_B in matched_B: continue
-                
-                # Check cross-slice matching confidence between these neighbors
-                if Pi_cluster[n_A, n_B] >= dynamic_thresh:
-                    matched_A.add(n_A)
-                    matched_B.add(n_B)
-                    queue.append((n_A, n_B))
-                    
-    strong_A = np.array(list(matched_A))
-    strong_B = np.array(list(matched_B))
-    
-    # 3. Form mapped cell clusters
-    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
-    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
-    
-    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
+    # Slice B natively projected onto Slice A space
+    coords_B_aligned = (coords_B - mu_Y) @ R + mu_X
+
+    # 3. Mutual Geometric Intersection
+    tree_A = cKDTree(coords_A)
+    tree_B = cKDTree(coords_B_aligned)
+
+    # Base native density of Slice A
+    nn = NearestNeighbors(n_neighbors=6).fit(coords_A)
+    dists, _ = nn.kneighbors(coords_A)
+    # Define rigid spatial similarity bounds
+    search_radius = np.median(dists[:, 1:]) * (extension_hops * 3.0)
+
+    # Query mutual boundaries
+    dist_A_to_B, _ = tree_B.query(coords_A)       # How far is A's cell from B's tissue
+    dist_B_to_A, _ = tree_A.query(coords_B_aligned) # How far is B's cell from A's tissue
+
+    # Restrict to tightly identical polygons
+    overlap_A = np.where(dist_A_to_B < search_radius)[0]
+    overlap_B = np.where(dist_B_to_A < search_radius)[0]
+
+    if len(overlap_A) == 0 or len(overlap_B) == 0:
+        # Fallback
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-        
-    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
+
+    # 4. Extract single largest contiguous structure inside overlap polygon
+    def largest_component(coords, cell_idx):
+        if len(cell_idx) < 2: return cell_idx
+        nn = NearestNeighbors(n_neighbors=min(6, len(cell_idx))).fit(coords[cell_idx])
+        adj = nn.kneighbors_graph(mode='connectivity')
+        n_comp, comp_labels = connected_components(adj, directed=False)
+        return cell_idx[comp_labels == np.bincount(comp_labels).argmax()]
+
+    contig_A = largest_component(coords_A, overlap_A)
+    contig_B = largest_component(coords_B_aligned, overlap_B)
+
+    # 5. Lock to near-identical cell counts for strictly structural balance
+    target_size = min(len(contig_A), len(contig_B))
     
-    # Since we topologically grew from a contiguous core, all cells here inherently form a contiguous block.
-    # 4. KDTree for physical distance measurement toward the extracted contiguous center
-    tree_A = cKDTree(coords_A[core_cells_A])
-    tree_B = cKDTree(coords_B[core_cells_B])
-    
-    dist_A, _ = tree_A.query(coords_A)
-    dist_B, _ = tree_B.query(coords_B)
-    
-    # 5. Identify dynamic extension radius
-    def compute_radius(coords_core):
-        from sklearn.neighbors import NearestNeighbors
-        if len(coords_core) > 1:
-            nn = NearestNeighbors(n_neighbors=min(6, len(coords_core))).fit(coords_core)
-            dists, _ = nn.kneighbors(coords_core)
-            median_dist = np.median(dists[:, 1:])
-            return median_dist * (extension_hops * 2.0)
-        return 5.0
-            
-    rad_A = compute_radius(coords_A[core_cells_A])
-    rad_B = compute_radius(coords_B[core_cells_B])
-    
-    # Extend boundary smoothly
-    idx_A = np.where(dist_A <= rad_A)[0]
-    idx_B = np.where(dist_B <= rad_B)[0]
-    
-    return idx_A, idx_B, dist_A[idx_A], dist_B[idx_B]
+    if target_size > 0:
+        # Drop the jagged asymmetric boundary edges that jut out furthest
+        sort_A = np.argsort(dist_A_to_B[contig_A])
+        idx_A = contig_A[sort_A[:target_size]]
+
+        sort_B = np.argsort(dist_B_to_A[contig_B])
+        idx_B = contig_B[sort_B[:target_size]]
+    else:
+        idx_A, idx_B = np.arange(N), np.arange(M)
+
+    return idx_A, idx_B, dist_A_to_B[idx_A], dist_B_to_A[idx_B]
