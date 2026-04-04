@@ -223,8 +223,14 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
 
 
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, p_A, p_B, spatial_key='spatial', extension_hops=2):
+    """
+    Identifies the largest continuous, structurally-identical macro-section 
+    by automatically detecting and solving major anatomical portions (e.g. 1 vs 2 hemispheres).
+    Then uses core-OT point strict mutual overlap and draws matching cell quotas.
+    """
     from sklearn.neighbors import NearestNeighbors
     from scipy.sparse.csgraph import connected_components
+    from sklearn.cluster import DBSCAN
     from scipy.spatial import cKDTree
     import numpy as np
 
@@ -234,6 +240,49 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     total_mass = np.sum(Pi_cluster)
     if total_mass == 0: return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
+    # --- SMART ALIGNMENT: Dynamic Structural Portion Matching ---
+    # Automatically detect disconnected tissue portions in physical space
+    nn_A = NearestNeighbors(n_neighbors=6).fit(coords_A)
+    eps_A = np.median(nn_A.kneighbors(coords_A)[0][:, 1:]) * 5.0
+    port_A = DBSCAN(eps=eps_A, min_samples=10).fit_predict(coords_A)
+    
+    nn_B = NearestNeighbors(n_neighbors=6).fit(coords_B)
+    eps_B = np.median(nn_B.kneighbors(coords_B)[0][:, 1:]) * 5.0
+    port_B = DBSCAN(eps=eps_B, min_samples=10).fit_predict(coords_B)
+    
+    unique_port_A = [p for p in np.unique(port_A) if p >= 0]
+    unique_port_B = [p for p in np.unique(port_B) if p >= 0]
+    
+    if len(unique_port_A) > 0 and len(unique_port_B) > 0 and (len(unique_port_A) != len(unique_port_B)):
+        import logging
+        logging.info(f"Smart Align: Asymmetric portions detected (A:{len(unique_port_A)} vs B:{len(unique_port_B)}). Finding best subspace mapping.")
+        mass_matrix = np.zeros((len(unique_port_A), len(unique_port_B)))
+        
+        for i, pa in enumerate(unique_port_A):
+            clusters_pa = np.unique(labels_A[port_A == pa])
+            for j, pb in enumerate(unique_port_B):
+                clusters_pb = np.unique(labels_B[port_B == pb])
+                if len(clusters_pa) > 0 and len(clusters_pb) > 0:
+                    grid = np.ix_(clusters_pa, clusters_pb)
+                    mass_matrix[i, j] = np.sum(Pi_cluster[grid])
+                
+        # Smart Select: Keep only the portions holding the maximal OT mass
+        keep_port_A, keep_port_B = unique_port_A, unique_port_B
+        if len(unique_port_A) < len(unique_port_B):
+            best_B_idx = np.argmax(mass_matrix, axis=1)
+            keep_port_B = [unique_port_B[j] for j in best_B_idx]
+        else:
+            best_A_idx = np.argmax(mass_matrix, axis=0)
+            keep_port_A = [unique_port_A[i] for i in best_A_idx]
+            
+        # Zero out the cross-portion mass for anything completely unmatched
+        valid_cA = np.unique(labels_A[np.isin(port_A, keep_port_A)])
+        valid_cB = np.unique(labels_B[np.isin(port_B, keep_port_B)])
+        
+        invalid_mask_A = ~np.isin(np.arange(Pi_cluster.shape[0]), valid_cA)
+        invalid_mask_B = ~np.isin(np.arange(Pi_cluster.shape[1]), valid_cB)
+        Pi_cluster[invalid_mask_A, :] = 0
+        Pi_cluster[:, invalid_mask_B] = 0
     # 1. Strict 1-to-1 Mutual Mapping to prevent averaging across multi-mapped clusters
     best_A = np.argmax(Pi_cluster, axis=1)
     best_B = np.argmax(Pi_cluster, axis=0)
