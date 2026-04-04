@@ -235,16 +235,22 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
     N, M = sliceA.shape[0], sliceB.shape[0]
     
-    max_pi = np.max(Pi_cluster)
-    if max_pi == 0:
+    total_mass = np.sum(Pi_cluster)
+    if total_mass == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    # Strict matching threshold: only take top 30% of transport flow
-    thresh = max_pi * 0.3
-    strong_A, strong_B = np.where(Pi_cluster > thresh)
+    # Strictly select the highest confidence transports that make up 50% of the mapped mass
+    flat_pi = Pi_cluster.flatten()
+    sorted_idx = np.argsort(flat_pi)[::-1]
+    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
+    
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.50)
+    selected_flat_idx = sorted_idx[:cutoff_idx+1]
+    
+    strong_A, strong_B = np.unravel_index(selected_flat_idx, Pi_cluster.shape)
     
     if len(strong_A) == 0: # fallback
-        thresh = max_pi * 0.1
+        thresh = np.max(Pi_cluster) * 0.1
         strong_A, strong_B = np.where(Pi_cluster > thresh)
         
     core_cells_A = np.where(np.isin(labels_A, strong_A))[0]

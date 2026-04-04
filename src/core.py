@@ -124,6 +124,28 @@ def hierarchical_pairwise_align(
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
+    if visualize_clusters:
+        try:
+            import matplotlib.pyplot as plt
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+            
+            ptsA = sliceA.obsm[spatial_key]
+            ptsB = sliceB.obsm[spatial_key]
+            
+            ax1.scatter(ptsA[:,0], ptsA[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
+            ax1.scatter(ptsA[idx_A,0], ptsA[idx_A,1], c=dist_A, cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
+            ax1.set_title("Slice A: Macro Selection")
+            ax1.axis('equal')
+            
+            ax2.scatter(ptsB[:,0], ptsB[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
+            ax2.scatter(ptsB[idx_B,0], ptsB[idx_B,1], c=dist_B, cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
+            ax2.set_title("Slice B: Macro Selection")
+            ax2.axis('equal')
+            
+            plt.show()
+        except Exception as e:
+            print(f"Sub-selection visualization failed: {e}")
+
     # Only run base OT on the selected continuous matching blocks
     sub_sliceA = sliceA[idx_A].copy()
     sub_sliceB = sliceB[idx_B].copy()
