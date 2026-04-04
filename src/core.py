@@ -9,181 +9,7 @@ from scipy.spatial import cKDTree
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
-from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init, extract_continuous_macro_section
 
-
-def hierarchical_pairwise_align(
-    sliceA: AnnData,
-    sliceB: AnnData,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    reg_compact: float = 0.001,
-    numItermax: int = 100000,
-    use_gpu: bool = True,
-    resolution: float = 1.0,
-    spatial_key: str = "spatial",
-    use_rep: Optional[str] = "X_pca",
-    label_key: str = "cell_type_annot",
-    w_expr: float = 0.5,
-    w_type: float = 0.5,
-    w_graph: float = 0.5,
-    block_threshold: float = 1e-4,
-    penalty: float = 1e3,
-    use_mask: bool = True,
-    use_init: bool = True,
-    visualize_clusters: bool = True,
-    **kwargs
-):
-    """
-    Performs Hierarchical OT by clustering cells into mesoregions, aligning clusters with Partial FGW,
-    and then restricting the cell-level OT matchings to the aligned blocks.
-    
-    Returns the cell-level alignment pi.
-    """
-    print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method='knn', k=6)
-    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method='knn', k=6)
-    
-    print(f"Slice A: {len(np.unique(labelsA))} clusters")
-    print(f"Slice B: {len(np.unique(labelsB))} clusters")
-    
-    if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-            ptsA = sliceA.obsm[spatial_key]
-            ptsB = sliceB.obsm[spatial_key]
-            # using categorical cmap
-            cmap = plt.get_cmap('tab20')
-            ax1.scatter(ptsA[:,0], ptsA[:,1], c=labelsA, cmap=cmap, s=2, alpha=0.8)
-            ax1.set_title(f"Slice A: {len(np.unique(labelsA))} Clusters")
-            ax1.axis('equal')
-            ax2.scatter(ptsB[:,0], ptsB[:,1], c=labelsB, cmap=cmap, s=2, alpha=0.8)
-            ax2.set_title(f"Slice B: {len(np.unique(labelsB))} Clusters")
-            ax2.axis('equal')
-            plt.show()
-        except Exception as e:
-            print(f"Cluster visualization failed: {e}")
-    
-    print("--- [HOT] Step 2: Extracting Cluster Features ---")
-    featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key)
-    featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key)
-    
-    p_A, _, _, centroidsA, _ = featA
-    p_B, _, _, centroidsB, _ = featB
-    
-    print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    M_cluster = compute_cluster_costs(featA, featB, w_expr, w_type)
-    C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
-    C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
-    
-    print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
-    
-    if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            from matplotlib.collections import LineCollection
-            
-            # Center the coordinates purely for overlap plotting
-            cA_plot = centroidsA - np.mean(centroidsA, axis=0)
-            cB_plot = centroidsB - np.mean(centroidsB, axis=0)
-
-            fig, ax = plt.subplots(figsize=(10, 10))
-            ax.scatter(cA_plot[:,0], cA_plot[:,1], c='blue', s=20, label='Slice A Clusters (Centered)', zorder=2)
-            ax.scatter(cB_plot[:,0], cB_plot[:,1], c='red', s=20, label='Slice B Clusters (Centered)', zorder=2)
-
-            max_pi = np.max(Pi_cluster)
-            if max_pi > 0:
-                lines = []
-                linewidths = []
-                for i in range(Pi_cluster.shape[0]):
-                    for j in range(Pi_cluster.shape[1]):
-                        if Pi_cluster[i, j] > block_threshold:
-                            lines.append([(cA_plot[i,0], cA_plot[i,1]), (cB_plot[j,0], cB_plot[j,1])])
-                            linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)      
-
-                lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
-                ax.add_collection(lc)
-
-            ax.set_title("Macro-Level Cluster Matching ($Pi_{cluster}$)")
-            ax.axis('equal')
-            ax.legend()
-            plt.show()
-        except Exception as e:
-            print(f"Cluster matching visualization failed: {e}")
-
-    # We now prepare the injection into standard cell-level pairwise_align
-    print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
-        sliceA, sliceB, labelsA, labelsB, Pi_cluster, 
-        spatial_key=spatial_key, extension_hops=2
-    )
-    
-    print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
-
-    if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-            
-            ptsA = sliceA.obsm[spatial_key]
-            ptsB = sliceB.obsm[spatial_key]
-            
-            ax1.scatter(ptsA[:,0], ptsA[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
-            ax1.scatter(ptsA[idx_A,0], ptsA[idx_A,1], c=dist_A, cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
-            ax1.set_title("Slice A: Macro Selection")
-            ax1.axis('equal')
-            
-            ax2.scatter(ptsB[:,0], ptsB[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
-            ax2.scatter(ptsB[idx_B,0], ptsB[idx_B,1], c=dist_B, cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
-            ax2.set_title("Slice B: Macro Selection")
-            ax2.axis('equal')
-            
-            plt.show()
-        except Exception as e:
-            print(f"Sub-selection visualization failed: {e}")
-
-    # Only run base OT on the selected continuous matching blocks
-    sub_sliceA = sliceA[idx_A].copy()
-    sub_sliceB = sliceB[idx_B].copy()
-
-    # The selected sections will have an initial plan that decays based on distance from the core
-    sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
-    G_init_sub = None
-    if use_init and sub_N > 0 and sub_M > 0:
-        sigma_A = max(1e-5, np.max(dist_A) / 2.0)
-        sigma_B = max(1e-5, np.max(dist_B) / 2.0)
-        
-        weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
-        weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
-        
-        G_init_sub = np.outer(weight_A, weight_B)
-        G_init_sub /= np.sum(G_init_sub)
-
-    print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
-    pi_sub = pairwise_align(
-        sliceA=sub_sliceA,
-        sliceB=sub_sliceB,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        reg_compact=reg_compact,
-        G_init=G_init_sub,
-        numItermax=numItermax,
-        use_gpu=use_gpu,
-        **kwargs
-    )
-
-    # Rest of the region will have zero initial/final plan
-    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]))
-    if sub_N > 0 and sub_M > 0:
-        grid_A, grid_B = np.ix_(idx_A, idx_B)
-        pi_full[grid_A, grid_B] = pi_sub
-
-    return pi_full
 
 def pairwise_align(
     sliceA: AnnData,
@@ -426,6 +252,80 @@ def pairwise_align(
             torch.cuda.empty_cache()
 
     return pi
+
+
+def hierarchical_pairwise_align(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    cluster_size: int = 50,
+    ufgw_rho: float = 1.0,
+    ufgw_eps: float = 0.01,
+    decay_sigma: float = 10.0,
+    **kwargs
+) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
+    """
+    Performs a 2-step hierarchical unbalanced Optimal Transport alignment.
+    Step 1: Cluster-level unbalanced alignment using Constrained KMeans and UFGW approximation.
+    Step 2: Cell-level alignment guided by the cluster-level transport plan prior (G_init).
+    """
+    from k_means_constrained import KMeansConstrained
+    from .utils import (compute_cluster_features, compute_cluster_distances, 
+                        unbalanced_fgw_cluster, build_cell_prior_from_clusters)
+
+    n_A, n_B = sliceA.shape[0], sliceB.shape[0]
+    
+    # Step 1a: Clustering with Constrained KMeans
+    n_clusters_A = max(1, n_A // cluster_size)
+    n_clusters_B = max(1, n_B // cluster_size)
+    
+    # We want clusters of roughly equal sizes in both slices
+    kmeans_A = KMeansConstrained(n_clusters=n_clusters_A, size_min=cluster_size-10, size_max=cluster_size+10)
+    labels_A = kmeans_A.fit_predict(sliceA.obsm['spatial'])
+    
+    kmeans_B = KMeansConstrained(n_clusters=n_clusters_B, size_min=cluster_size-10, size_max=cluster_size+10)
+    labels_B = kmeans_B.fit_predict(sliceB.obsm['spatial'])
+    
+    # Step 1b: Extract cluster features and distributions
+    features_A = compute_cluster_features(sliceA, labels_A, n_clusters_A)
+    features_B = compute_cluster_features(sliceB, labels_B, n_clusters_B)
+    
+    dist_A, barycenters_A = compute_cluster_distances(sliceA, labels_A, n_clusters_A)
+    dist_B, barycenters_B = compute_cluster_distances(sliceB, labels_B, n_clusters_B)
+    
+    # Marginal weights computation for UFGW (allowing partial mass matches)
+    max_N = max(n_A, n_B)
+    counts_A = np.array([np.sum(labels_A == i) for i in range(n_clusters_A)])
+    counts_B = np.array([np.sum(labels_B == i) for i in range(n_clusters_B)])
+    w_A = counts_A / max_N
+    w_B = counts_B / max_N
+    
+    # Step 1c: Solve Unbalanced Cluster-level OT
+    pi_cluster = unbalanced_fgw_cluster(
+        features_A, features_B, 
+        dist_A, dist_B, 
+        w_A, w_B, 
+        alpha=0.5, rho=ufgw_rho, epsilon=ufgw_eps
+    )
+    
+    # Step 2: Build Cell-Level Prior (G_init) with spatial distance decay
+    G_init = build_cell_prior_from_clusters(
+        labels_A, labels_B, 
+        pi_cluster, 
+        sliceA.obsm['spatial'], sliceB.obsm['spatial'], 
+        barycenters_A, barycenters_B, 
+        decay_sigma=decay_sigma
+    )
+    
+    # Pass generated initial mapping into existing pairwise alignment
+    return pairwise_align(
+        sliceA, sliceB, 
+        alpha=alpha, beta=beta, gamma=gamma, 
+        G_init=G_init, 
+        **kwargs
+    )
 
 
 def estimate_characteristic_spacing(adata, k=6, spatial_key="spatial"):

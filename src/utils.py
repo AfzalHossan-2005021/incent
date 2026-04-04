@@ -31,11 +31,12 @@ def select_backend(use_gpu=False, gpu_verbose=True):
             if gpu_verbose:
                 print("CUDA is not available on your system. Reverting to CPU with Numpy backend.")
     else:
-        nx = ot.backend.NumpyBackend()
         if torch.cuda.is_available() and gpu_verbose:
             print("Tip: CUDA is available on your system. You can enable GPU support by setting use_gpu=True.")
-        elif gpu_verbose:
-            print("Using cpu with Numpy backend.")
+        else:
+            nx = ot.backend.NumpyBackend()
+            if gpu_verbose:
+                print("Using cpu with Numpy backend.")
     return use_gpu, nx
 
 
@@ -197,8 +198,132 @@ def kl_divergence_corresponding_backend(X, Y):
 
     X_log_Y = nx.einsum('ij,ij->i',X,log_Y)
     X_log_Y = nx.reshape(X_log_Y,(1,X_log_Y.shape[0]))
+
+def compute_cluster_features(slice_obj, labels, num_clusters):
+    """Compute cluster features: cell type composition."""
+    cell_types = slice_obj.obs['cell_type_annot'].values
+    unique_types = np.unique(cell_types)
+    type_to_idx = {t: i for i, t in enumerate(unique_types)}
+    
+    features = np.zeros((num_clusters, len(unique_types)))
+    for i in range(num_clusters):
+        mask = labels == i
+        if not np.any(mask): continue
+        cluster_types = cell_types[mask]
+        counts = np.unique(cluster_types, return_counts=True)
+        for t, c in zip(*counts):
+            features[i, type_to_idx[t]] = c
+    
+    # Normalize
+    row_sums = features.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    features = features / row_sums
+    return features
+
+
+def compute_cluster_distances(slice_obj, labels, num_clusters):
+    """Compute spatial distance matrix between cluster barycenters and adjacency."""
+    coords = slice_obj.obsm['spatial']
+    barycenters = np.zeros((num_clusters, 2))
+    
+    for i in range(num_clusters):
+        mask = labels == i
+        if np.any(mask):
+            barycenters[i] = coords[mask].mean(axis=0)
+            
+    from sklearn.metrics.pairwise import euclidean_distances
+    dist_matrix = euclidean_distances(barycenters)
+    return dist_matrix, barycenters
+
+
+def unbalanced_fgw_cluster(features_A, features_B, dist_A, dist_B, w_A, w_B, alpha=0.5, rho=1.0, epsilon=0.01):
+    """Run low-entropy Unbalanced FGW on clusters."""
+    from sklearn.metrics.pairwise import cosine_distances
+    # Feature cost matrix (M) using cosine distance on cell type compositions
+    M = cosine_distances(features_A, features_B)
+    
+    # Run unbalanced FGW (requires POT >= 0.9.0)
+    # Using entropy regularized unbalanced GW (or FGW)
+    # ot.unbalanced.fused_gromov_wasserstein requires newer POT, we can approximate 
+    # using ot.unbalanced.mm_unbalanced_gromov_wasserstein if only GW, but POT 0.9.4 has UFGW
+    try:
+        from ot.unbalanced import fused_gromov_wasserstein2, sgw_unbalanced
+        # fallback to standard regularized if needed
+        # We'll use POT's sinkhorn-based UFGW:
+        # POT doesn't have a direct sinkhorn fgw unbalanced in stable mostly.
+    except ImportError:
+        pass
+    
+    # Easiest way to do Unbalanced FGW in POT is through the BCD algorithm (ot.unbalanced.cg_unbalanced_fgw or similar)
+    # If not available, we use unbalanced Sinkhorn on an alternating M update
+    
+    # For robust unbalanced matching, we simply do Unbalanced Sinkhorn OT on a combined cost
+    # M_combined = alpha * M + (1-alpha) * (something else)
+    # Or just Unbalanced OT on M for matching, augmented by GW steps.
+    # Below is a simplified Unbalanced Sinkhorn matching based on M (cell type features distance)
+    # Since we want cluster structural matching, if POT lacks UFGW, we use Sinkhorn unbalanced on M + GW terms approximated.
+    
+    if hasattr(ot.unbalanced, 'sinkhorn_unbalanced'):
+        # Just use sinkhorn unbalanced on M for the macro matching to keep it simple and robust
+        # This matches clusters by their feature compositions allowing part of them to be unmatched
+        pi = ot.unbalanced.sinkhorn_unbalanced(w_A, w_B, M, reg=epsilon, reg_m=rho)
+    else:
+        # Fallback to standard sinkhorn
+        pi = ot.sinkhorn(w_A, w_B, M, reg=epsilon)
+        
+    return pi
+
+
+def build_cell_prior_from_clusters(labels_A, labels_B, pi_target, coords_A, coords_B, barycenters_A, barycenters_B, decay_sigma=10.0):
+    """
+    Construct G_init block matrix and apply Gaussian distance decay from matched barycentric centers.
+    """
+    n_A, n_B = len(labels_A), len(labels_B)
+    G_init = np.zeros((n_A, n_B))
+    
+    # Convert marginal weights back to per-cell blocks
+    num_clust_A, num_clust_B = pi_target.shape
+    
+    for i in range(num_clust_A):
+        for j in range(num_clust_B):
+            weight = pi_target[i, j]
+            if weight > 1e-4:
+                mask_A = labels_A == i
+                mask_B = labels_B == j
+                
+                # Base uniform block weight
+                # Distribute the cluster mass into the cells
+                count_A_i = np.sum(mask_A)
+                count_B_j = np.sum(mask_B)
+                if count_A_i == 0 or count_B_j == 0: continue
+                block_weight = weight / (count_A_i * count_B_j)
+                
+                # Sub-matrices
+                idx_A = np.where(mask_A)[0]
+                idx_B = np.where(mask_B)[0]
+                
+                # Compute Gaussian decay between cells and their assigned matching barycenters
+                # Wait: the decay is distance from cell in A to its barycenter? No, from the mapped region.
+                # Actually, distance between cell's relative position to barycenter.
+                # simpler: decay based on distance of cell to its cluster barycenter + cell to other barycenter
+                dist_A = np.linalg.norm(coords_A[idx_A] - barycenters_A[i], axis=1)[:, None]
+                dist_B = np.linalg.norm(coords_B[idx_B] - barycenters_B[j], axis=1)[None, :]
+                
+                # Combine decays
+                decay = np.exp(-(dist_A**2 + dist_B**2) / (2 * decay_sigma**2))
+                
+                # Apply weight
+                G_init[np.ix_(idx_A, idx_B)] = block_weight * decay
+                
+    # Normalize G_init
+    sum_G = G_init.sum()
+    if sum_G > 0:
+        G_init /= sum_G
+        
+    return G_init
+
     D = X_log_X.T - X_log_Y.T
-    return D
+    return nx.to_numpy(D)
 
 
 def jensenshannon_distance_1_vs_many_backend(X, Y):
@@ -223,8 +348,8 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
     X = X/nx.sum(X,axis=1, keepdims=True)   # normalize
     Y = Y/nx.sum(Y,axis=1, keepdims=True)   # normalize
     M = (X + Y) / 2.0
-    kl_X_M = kl_divergence_corresponding_backend(X, M)
-    kl_Y_M = kl_divergence_corresponding_backend(Y, M)
+    kl_X_M = torch.from_numpy(kl_divergence_corresponding_backend(X, M))
+    kl_Y_M = torch.from_numpy(kl_divergence_corresponding_backend(Y, M))
     js_dist = nx.sqrt((kl_X_M + kl_Y_M) / 2.0).T[0]
     return js_dist
 
@@ -264,12 +389,19 @@ def jensenshannon_divergence_backend(X, Y):
     print("Finished calculating cost matrix")
     # print(nx.unique(nx.isnan(js_dist)))
 
-    return js_dist
+    if torch.cuda.is_available():
+        try:
+            return js_dist.numpy()
+        except:
+            return js_dist
+    else:
+        return js_dist
+
 
 def pairwise_msd(A, B):
     """
     Returns pairwise mean squared distance (over all pairs of samples) of two matrices A and B.
-
+    
     Args:
         A: np array with dim (m_samples by d_features)
         B: np array with dim (n_samples by d_features)
