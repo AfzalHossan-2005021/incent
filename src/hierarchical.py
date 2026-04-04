@@ -223,107 +223,118 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
 
 
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, p_A, p_B, spatial_key='spatial', extension_hops=2):
-    """
-    Solves the 'cluster averaging' issue by locking strictly onto 1-to-1 mutually best matched clusters.
-    Constructs a contiguous geographic map, and enforces identical cell counts per-cluster by 
-    trimming fringe boundaries (cells furthest from cluster centers).
-    Guarantees mathematically continuous domains with similar visual borders.
-    """
     from sklearn.neighbors import NearestNeighbors
     from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
     import numpy as np
 
     N, M = sliceA.shape[0], sliceB.shape[0]
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
-    
+
     total_mass = np.sum(Pi_cluster)
-    if total_mass == 0: 
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+    if total_mass == 0: return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    # 1. Strict 1-to-1 Mutual Mapping (No 1-to-Many Averaging)
+    # 1. Strict 1-to-1 Mutual Mapping to prevent averaging across multi-mapped clusters
     best_A = np.argmax(Pi_cluster, axis=1)
     best_B = np.argmax(Pi_cluster, axis=0)
-    
+
     mutual_pairs = []
     masses = []
     for i in range(Pi_cluster.shape[0]):
         j = best_A[i]
-        if best_B[j] == i:  # It's a mutual best match
+        if best_B[j] == i:
             mutual_pairs.append((i, j))
             masses.append(Pi_cluster[i, j])
-            
-    if not mutual_pairs:
+
+    # Extract centroids to use as rigid anchor points
+    anchor_A, anchor_B = [], []
+    if len(mutual_pairs) >= 3:
+        # Use top 50% most confident mutual matches to avoid boundary distortion
+        mutual_pairs = np.array(mutual_pairs)
+        masses = np.array(masses)
+        thresh = np.median(masses) if len(masses) > 3 else 0
+        strong_pairs = mutual_pairs[masses >= thresh]
+        for i, j in strong_pairs:
+            anchor_A.append(np.mean(coords_A[labels_A == i], axis=0))
+            anchor_B.append(np.mean(coords_B[labels_B == j], axis=0))
+    
+    # Fallback if too few strict mutual matches exist for 2D rigid transform
+    if len(anchor_A) < 3:
+        flat_pi = Pi_cluster.flatten()
+        sorted_idx = np.argsort(flat_pi)[::-1]
+        pairs_A, pairs_B = np.unravel_index(sorted_idx, Pi_cluster.shape)
+        
+        seen_A, seen_B = set(), set()
+        anchor_A, anchor_B = [], []
+        for i, j in zip(pairs_A, pairs_B):
+            if i not in seen_A and j not in seen_B:
+                seen_A.add(i)
+                seen_B.add(j)
+                anchor_A.append(np.mean(coords_A[labels_A == i], axis=0))
+                anchor_B.append(np.mean(coords_B[labels_B == j], axis=0))
+                if len(anchor_A) >= max(3, len(mutual_pairs)): break
+                
+    if len(anchor_A) < 3: 
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    mutual_pairs = np.array(mutual_pairs)
-    masses = np.array(masses)
+    anchor_A, anchor_B = np.array(anchor_A), np.array(anchor_B)
+
+    # 2. Rigid Tissue Alignment (Orthogonal Procrustes)
+    X, Y = anchor_A, anchor_B
+    mu_X, mu_Y = np.mean(X, axis=0), np.mean(Y, axis=0)
+    H = (Y - mu_Y).T @ (X - mu_X)
+    U, S, Vt = np.linalg.svd(H)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = U @ Vt
     
-    # Reject extreme outliers/ghost clusters by dropping the weakest half of mutual matches
-    thresh = np.median(masses) if len(masses) > 2 else 0
-    strong_pairs = mutual_pairs[masses >= thresh]
-    
-    # Extract centers of these candidate clusters
-    cent_A, cent_B = [], []
-    for i, j in strong_pairs:
-        cent_A.append(np.mean(coords_A[labels_A == i], axis=0))
-        cent_B.append(np.mean(coords_B[labels_B == j], axis=0))
-    cent_A, cent_B = np.array(cent_A), np.array(cent_B)
-    
-    # 2. Extract Largest Physically Contiguous Chain of Clusters
-    def connected_chain(centers):
-        if len(centers) < 2: return np.arange(len(centers))
-        nn = NearestNeighbors(n_neighbors=min(6, len(centers))).fit(centers)
-        adj = nn.kneighbors_graph(mode='connectivity')
+    # Slice B geometrically projected cleanly onto Slice A space
+    coords_B_aligned = (coords_B - mu_Y) @ R + mu_X
+
+    # 3. Base native geometric density for spatial intersection
+    nn = NearestNeighbors(n_neighbors=6).fit(coords_A)
+    dists, _ = nn.kneighbors(coords_A)
+    # Define rigid spatial overlap bound roughly equal to "extension_hops" cells away
+    search_radius = np.median(dists[:, 1:]) * max(2.0, float(extension_hops))
+
+    # 4. Strict Geometric Overlap
+    tree_A = cKDTree(coords_A)
+    tree_B = cKDTree(coords_B_aligned)
+
+    dist_A_to_B, _ = tree_B.query(coords_A)       # How far is A's cell from B's mapped tissue
+    dist_B_to_A, _ = tree_A.query(coords_B_aligned) # How far is B's cell from A's tissue
+
+    # Cells that perfectly exist in both slices simultaneously (identical spatial footprint)
+    overlap_A = np.where(dist_A_to_B < search_radius)[0]
+    overlap_B = np.where(dist_B_to_A < search_radius)[0]
+
+    if len(overlap_A) < 5 or len(overlap_B) < 5:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+
+    # 5. Restrict to a STRICTLY CONTINUOUS physical structure
+    # By using radius graph, we absolutely forbid jumping across empty gaps
+    def largest_contiguous_block(coords, cell_idx, rad):
+        if len(cell_idx) < 2: return cell_idx
+        nn_rad = NearestNeighbors(radius=rad * 1.5).fit(coords[cell_idx])
+        adj = nn_rad.radius_neighbors_graph(mode='connectivity')
         n_comp, comp_labels = connected_components(adj, directed=False)
-        return np.where(comp_labels == np.bincount(comp_labels).argmax())[0]
-        
-    chain_A_idx = connected_chain(cent_A)
-    # The pairs are already 1-to-1 locked, so the subset of pairs must just be continuous
-    # We restrict to those physically continuous in A, and then physically continuous in B.
-    valid_pairs = strong_pairs[chain_A_idx]
+        return cell_idx[comp_labels == np.bincount(comp_labels).argmax()]
+
+    contig_A = largest_contiguous_block(coords_A, overlap_A, search_radius)
+    contig_B = largest_contiguous_block(coords_B_aligned, overlap_B, search_radius)
+
+    # 6. Force exactly identical numbers of cells for absolutely balanced geometry
+    target_count = min(len(contig_A), len(contig_B))
     
-    cent_B_subset = cent_B[chain_A_idx]
-    chain_B_idx = connected_chain(cent_B_subset)
-    final_pairs = valid_pairs[chain_B_idx]
-    
-    # 3. Geometric Alignment: Extract equal cell counts per cluster and cluster-centric distances
-    idx_A, idx_B = [], []
-    dist_A, dist_B = [], []
-    
-    for i, j in final_pairs:
-        c_A = np.where(labels_A == i)[0]
-        c_B = np.where(labels_B == j)[0]
-        
-        target_k = min(len(c_A), len(c_B))
-        if target_k == 0: continue
-            
-        cA_loc = coords_A[c_A]
-        cB_loc = coords_B[c_B]
-        
-        # Center of this specific cluster domain
-        mu_A = np.mean(cA_loc, axis=0)
-        mu_B = np.mean(cB_loc, axis=0)
-        
-        dA = np.linalg.norm(cA_loc - mu_A, axis=1)
-        dB = np.linalg.norm(cB_loc - mu_B, axis=1)
-        
-        # Trim cells furthest from the core (fringe boundaries that distort shape)
-        if len(c_A) > target_k:
-            keep_A = np.argsort(dA)[:target_k]
-            c_A = c_A[keep_A]
-            dA = dA[keep_A]
-            
-        if len(c_B) > target_k:
-            keep_B = np.argsort(dB)[:target_k]
-            c_B = c_B[keep_B]
-            dB = dB[keep_B]
-            
-        idx_A.extend(c_A)
-        idx_B.extend(c_B)
-        dist_A.extend(dA)
-        dist_B.extend(dB)
-        
-    if len(idx_A) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-        
-    return np.array(idx_A), np.array(idx_B), np.array(dist_A), np.array(dist_B)
+    if target_count > 0:
+        # If A has 5 more cells, we drop the 5 cells that are structurally furthest from B!
+        sort_A = np.argsort(dist_A_to_B[contig_A])
+        idx_A = contig_A[sort_A[:target_count]]
+
+        sort_B = np.argsort(dist_B_to_A[contig_B])
+        idx_B = contig_B[sort_B[:target_count]]
+    else:
+        idx_A, idx_B = np.arange(N), np.arange(M)
+
+    return idx_A, idx_B, dist_A_to_B[idx_A], dist_B_to_A[idx_B]
