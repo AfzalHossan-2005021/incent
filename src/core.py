@@ -4,11 +4,13 @@ import numpy as np
 
 from anndata import AnnData
 from numpy.typing import NDArray
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict, Any, List
 from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist
+import heapq
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
-from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
+from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 
 
 def pairwise_align(
@@ -25,7 +27,7 @@ def pairwise_align(
     a_distribution = None,
     b_distribution = None,
     numItermax: int = 6000,
-    use_gpu: bool = False,
+    use_gpu: bool = True,
     data_type = np.float32,
     epsilon: float = 1e-6,
     verbose: bool = False,
@@ -252,80 +254,6 @@ def pairwise_align(
             torch.cuda.empty_cache()
 
     return pi
-
-
-def hierarchical_pairwise_align(
-    sliceA: AnnData,
-    sliceB: AnnData,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    cluster_size: int = 50,
-    ufgw_rho: float = 1.0,
-    ufgw_eps: float = 0.01,
-    decay_sigma: float = 10.0,
-    **kwargs
-) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
-    """
-    Performs a 2-step hierarchical unbalanced Optimal Transport alignment.
-    Step 1: Cluster-level unbalanced alignment using Constrained KMeans and UFGW approximation.
-    Step 2: Cell-level alignment guided by the cluster-level transport plan prior (G_init).
-    """
-    from k_means_constrained import KMeansConstrained
-    from .utils import (compute_cluster_features, compute_cluster_distances, 
-                        unbalanced_fgw_cluster, build_cell_prior_from_clusters)
-
-    n_A, n_B = sliceA.shape[0], sliceB.shape[0]
-    
-    # Step 1a: Clustering with Constrained KMeans
-    n_clusters_A = max(1, n_A // cluster_size)
-    n_clusters_B = max(1, n_B // cluster_size)
-    
-    # We want clusters of roughly equal sizes in both slices
-    kmeans_A = KMeansConstrained(n_clusters=n_clusters_A, size_min=cluster_size-10, size_max=cluster_size+10)
-    labels_A = kmeans_A.fit_predict(sliceA.obsm['spatial'])
-    
-    kmeans_B = KMeansConstrained(n_clusters=n_clusters_B, size_min=cluster_size-10, size_max=cluster_size+10)
-    labels_B = kmeans_B.fit_predict(sliceB.obsm['spatial'])
-    
-    # Step 1b: Extract cluster features and distributions
-    features_A = compute_cluster_features(sliceA, labels_A, n_clusters_A)
-    features_B = compute_cluster_features(sliceB, labels_B, n_clusters_B)
-    
-    dist_A, barycenters_A = compute_cluster_distances(sliceA, labels_A, n_clusters_A)
-    dist_B, barycenters_B = compute_cluster_distances(sliceB, labels_B, n_clusters_B)
-    
-    # Marginal weights computation for UFGW (allowing partial mass matches)
-    max_N = max(n_A, n_B)
-    counts_A = np.array([np.sum(labels_A == i) for i in range(n_clusters_A)])
-    counts_B = np.array([np.sum(labels_B == i) for i in range(n_clusters_B)])
-    w_A = counts_A / max_N
-    w_B = counts_B / max_N
-    
-    # Step 1c: Solve Unbalanced Cluster-level OT
-    pi_cluster = unbalanced_fgw_cluster(
-        features_A, features_B, 
-        dist_A, dist_B, 
-        w_A, w_B, 
-        alpha=0.5, rho=ufgw_rho, epsilon=ufgw_eps
-    )
-    
-    # Step 2: Build Cell-Level Prior (G_init) with spatial distance decay
-    G_init = build_cell_prior_from_clusters(
-        labels_A, labels_B, 
-        pi_cluster, 
-        sliceA.obsm['spatial'], sliceB.obsm['spatial'], 
-        barycenters_A, barycenters_B, 
-        decay_sigma=decay_sigma
-    )
-    
-    # Pass generated initial mapping into existing pairwise alignment
-    return pairwise_align(
-        sliceA, sliceB, 
-        alpha=alpha, beta=beta, gamma=gamma, 
-        G_init=G_init, 
-        **kwargs
-    )
 
 
 def estimate_characteristic_spacing(adata, k=6, spatial_key="spatial"):
@@ -795,3 +723,701 @@ def calculate_neighborhood_dissimilarity(
     featB = to_backend(featB, nx, data_type=data_type)
 
     return jensenshannon_divergence_backend(featA, featB)
+
+
+
+def _safe_normalize_vector(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    s = float(x.sum())
+    if s <= eps:
+        return np.full_like(x, 1.0 / max(len(x), 1), dtype=np.float64)
+    return x / s
+
+
+
+def _normalize_cost_matrix(M: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    M = np.asarray(M, dtype=np.float64)
+    finite = np.isfinite(M)
+    if not np.any(finite):
+        return np.zeros_like(M, dtype=np.float64)
+    lo = float(np.min(M[finite]))
+    hi = float(np.max(M[finite]))
+    if hi - lo <= eps:
+        out = np.zeros_like(M, dtype=np.float64)
+        out[~finite] = 1.0
+        return out
+    out = (M - lo) / (hi - lo)
+    out[~finite] = 1.0
+    return out
+
+
+
+def _pairwise_js_distance(P: np.ndarray, Q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    P = np.clip(P, eps, None)
+    Q = np.clip(Q, eps, None)
+    P /= P.sum(axis=1, keepdims=True)
+    Q /= Q.sum(axis=1, keepdims=True)
+
+    js = np.empty((P.shape[0], Q.shape[0]), dtype=np.float64)
+    for i in range(P.shape[0]):
+        m = 0.5 * (P[i][None, :] + Q)
+        kl_pm = np.sum(P[i][None, :] * (np.log(P[i][None, :]) - np.log(m)), axis=1)
+        kl_qm = np.sum(Q * (np.log(Q) - np.log(m)), axis=1)
+        js[i] = np.sqrt(np.maximum(0.0, 0.5 * (kl_pm + kl_qm)))
+    return js
+
+
+
+def _extract_embedding_matrix(adata: AnnData, use_rep: Optional[str] = None) -> np.ndarray:
+    X = extract_data_matrix(adata, use_rep)
+    if hasattr(X, 'toarray'):
+        return np.asarray(X.toarray(), dtype=np.float64)
+    return np.asarray(X, dtype=np.float64)
+
+
+
+def _compute_local_density(adata: AnnData, k: int = 6, spatial_key: str = 'spatial', eps: float = 1e-8) -> np.ndarray:
+    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    n = coords.shape[0]
+    if n <= 1:
+        return np.ones(n, dtype=np.float64)
+    k_eff = min(k + 1, n)
+    tree = cKDTree(coords)
+    dists, _ = tree.query(coords, k=k_eff)
+    local_scale = np.mean(dists[:, 1:], axis=1)
+    density = 1.0 / np.maximum(local_scale, eps)
+    med = np.median(density[density > 0]) if np.any(density > 0) else 1.0
+    return density / max(med, eps)
+
+
+
+def _farthest_point_seeds(coords: np.ndarray, n_seeds: int) -> np.ndarray:
+    n = coords.shape[0]
+    n_seeds = int(max(1, min(n_seeds, n)))
+    seeds = [int(np.argmax(np.linalg.norm(coords - coords.mean(axis=0), axis=1)))]
+    min_d2 = np.sum((coords - coords[seeds[0]]) ** 2, axis=1)
+    while len(seeds) < n_seeds:
+        nxt = int(np.argmax(min_d2))
+        if nxt in seeds:
+            break
+        seeds.append(nxt)
+        min_d2 = np.minimum(min_d2, np.sum((coords - coords[nxt]) ** 2, axis=1))
+    while len(seeds) < n_seeds:
+        candidate = len(seeds) % n
+        if candidate not in seeds:
+            seeds.append(candidate)
+    return np.asarray(seeds, dtype=np.int32)
+
+
+
+def _build_spatial_knn_graph(coords: np.ndarray, k_neighbors: int = 10) -> Tuple[List[List[int]], List[List[float]], List[Tuple[int, int, float]]]:
+    n = coords.shape[0]
+    if n == 0:
+        return [], [], []
+    k_eff = max(1, min(int(k_neighbors), n - 1)) if n > 1 else 0
+    if k_eff == 0:
+        return [[] for _ in range(n)], [[] for _ in range(n)], []
+
+    tree = cKDTree(coords)
+    dists, idx = tree.query(coords, k=k_eff + 1)
+    neighbors = [[] for _ in range(n)]
+    weights = [[] for _ in range(n)]
+    edges = {}
+
+    for i in range(n):
+        for j, d in zip(idx[i, 1:], dists[i, 1:]):
+            j = int(j)
+            d = float(d)
+            if i == j:
+                continue
+            neighbors[i].append(j)
+            weights[i].append(d)
+            a, b = (i, j) if i < j else (j, i)
+            edges[(a, b)] = min(d, edges.get((a, b), d))
+
+    for (i, j), d in list(edges.items()):
+        if i not in neighbors[j]:
+            neighbors[j].append(i)
+            weights[j].append(d)
+        if j not in neighbors[i]:
+            neighbors[i].append(j)
+            weights[i].append(d)
+
+    edge_list = [(i, j, d) for (i, j), d in edges.items()]
+    return neighbors, weights, edge_list
+
+
+
+def _build_supercell_features(
+    adata: AnnData,
+    use_rep: Optional[str] = None,
+    spatial_key: str = 'spatial',
+    label_key: str = 'cell_type_annot',
+    density_k: int = 6,
+) -> Dict[str, Any]:
+    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    labels = adata.obs[label_key].astype(str).to_numpy()
+    density = _compute_local_density(adata, k=density_k, spatial_key=spatial_key)
+    unique_types = np.array(sorted(np.unique(labels)), dtype=str)
+    one_hot = np.zeros((coords.shape[0], len(unique_types)), dtype=np.float64)
+    label_to_idx = {lab: i for i, lab in enumerate(unique_types)}
+    for i, lab in enumerate(labels):
+        one_hot[i, label_to_idx[lab]] = 1.0
+
+    embedding = _extract_embedding_matrix(adata, use_rep)
+    feat = np.concatenate([
+        one_hot,
+        density[:, None],
+        embedding / np.maximum(np.std(embedding, axis=0, keepdims=True) + 1e-8, 1e-8),
+    ], axis=1)
+
+    feat -= feat.mean(axis=0, keepdims=True)
+    feat /= np.maximum(feat.std(axis=0, keepdims=True), 1e-8)
+
+    return {
+        'coords': coords,
+        'labels': labels,
+        'density': density,
+        'embedding': embedding,
+        'feature_matrix': feat,
+        'cell_types': unique_types,
+    }
+
+
+
+def _balanced_region_growing_labels(
+    coords: np.ndarray,
+    node_features: np.ndarray,
+    neighbors: List[List[int]],
+    edge_weights: List[List[float]],
+    n_clusters: int,
+    feature_weight: float = 0.25,
+) -> np.ndarray:
+    n = coords.shape[0]
+    if n_clusters <= 1 or n <= 1:
+        return np.zeros(n, dtype=np.int32)
+
+    n_clusters = int(max(1, min(n_clusters, n)))
+    seeds = _farthest_point_seeds(coords, n_clusters)
+    target_sizes = np.full(n_clusters, n // n_clusters, dtype=np.int32)
+    target_sizes[: n % n_clusters] += 1
+
+    flat_weights = np.concatenate([np.asarray(w, dtype=np.float64) for w in edge_weights if len(w) > 0]) if any(len(w) > 0 for w in edge_weights) else np.array([1.0])
+    edge_scale = float(np.median(flat_weights[flat_weights > 0])) if np.any(flat_weights > 0) else 1.0
+
+    assigned = np.full(n, -1, dtype=np.int32)
+    cluster_sizes = np.zeros(n_clusters, dtype=np.int32)
+    cluster_coord_sum = np.zeros((n_clusters, coords.shape[1]), dtype=np.float64)
+    cluster_feat_sum = np.zeros((n_clusters, node_features.shape[1]), dtype=np.float64)
+    heap = []
+
+    for c, seed in enumerate(seeds):
+        heapq.heappush(heap, (0.0, c, int(seed), int(seed)))
+
+    while heap:
+        cost, c, node, parent = heapq.heappop(heap)
+        if assigned[node] != -1:
+            continue
+        if cluster_sizes[c] >= target_sizes[c]:
+            continue
+
+        assigned[node] = c
+        cluster_sizes[c] += 1
+        cluster_coord_sum[c] += coords[node]
+        cluster_feat_sum[c] += node_features[node]
+
+        coord_center = cluster_coord_sum[c] / cluster_sizes[c]
+        feat_center = cluster_feat_sum[c] / cluster_sizes[c]
+
+        for nbr, edge_d in zip(neighbors[node], edge_weights[node]):
+            if assigned[nbr] != -1:
+                continue
+            spatial_term = float(edge_d) / max(edge_scale, 1e-8)
+            frontier_term = np.linalg.norm(coords[nbr] - coord_center) / max(edge_scale, 1e-8)
+            feature_term = np.linalg.norm(node_features[nbr] - feat_center) / max(np.sqrt(node_features.shape[1]), 1.0)
+            score = cost + spatial_term + 0.15 * frontier_term + feature_weight * feature_term
+            heapq.heappush(heap, (score, c, int(nbr), node))
+
+    leftover = np.where(assigned < 0)[0]
+    if leftover.size:
+        for node in leftover:
+            not_full = np.where(cluster_sizes < target_sizes)[0]
+            if not_full.size == 0:
+                not_full = np.arange(n_clusters)
+            centers = cluster_coord_sum[not_full] / np.maximum(cluster_sizes[not_full][:, None], 1)
+            costs = np.linalg.norm(centers - coords[node], axis=1)
+            c = int(not_full[np.argmin(costs)])
+            assigned[node] = c
+            cluster_sizes[c] += 1
+            cluster_coord_sum[c] += coords[node]
+            cluster_feat_sum[c] += node_features[node]
+
+    return assigned.astype(np.int32)
+
+
+
+def _cluster_mean_rows(X: np.ndarray, labels: np.ndarray, n_clusters: int) -> np.ndarray:
+    out = np.zeros((n_clusters, X.shape[1]), dtype=np.float64)
+    for c in range(n_clusters):
+        idx = np.where(labels == c)[0]
+        if idx.size:
+            out[c] = X[idx].mean(axis=0)
+    return out
+
+
+
+def _compute_cluster_statistics(
+    adata: AnnData,
+    cluster_labels: np.ndarray,
+    coords: np.ndarray,
+    cell_graph_edges: List[Tuple[int, int, float]],
+    density: np.ndarray,
+    neighborhood_features: np.ndarray,
+    cell_types_union: np.ndarray,
+    use_rep: Optional[str] = None,
+    spatial_key: str = 'spatial',
+    label_key: str = 'cell_type_annot',
+    graph_structure_weight: float = 0.65,
+) -> Dict[str, Any]:
+    n_clusters = int(cluster_labels.max()) + 1
+    embedding = _extract_embedding_matrix(adata, use_rep)
+    labels = adata.obs[label_key].astype(str).to_numpy()
+    cluster_sizes = np.bincount(cluster_labels, minlength=n_clusters).astype(np.float64)
+    centroids = np.zeros((n_clusters, coords.shape[1]), dtype=np.float64)
+    radii = np.zeros(n_clusters, dtype=np.float64)
+    type_hist = np.zeros((n_clusters, len(cell_types_union)), dtype=np.float64)
+    type_to_idx = {ct: i for i, ct in enumerate(cell_types_union)}
+
+    for c in range(n_clusters):
+        idx = np.where(cluster_labels == c)[0]
+        if idx.size == 0:
+            continue
+        centroids[c] = coords[idx].mean(axis=0)
+        radii[c] = float(np.median(np.linalg.norm(coords[idx] - centroids[c], axis=1))) if idx.size > 1 else 1.0
+        for lab in labels[idx]:
+            type_hist[c, type_to_idx[lab]] += 1.0
+
+    type_hist = np.vstack([_safe_normalize_vector(row) for row in type_hist])
+    mean_embedding = _cluster_mean_rows(embedding, cluster_labels, n_clusters)
+    mean_neighborhood = _cluster_mean_rows(neighborhood_features, cluster_labels, n_clusters)
+
+    density_stats = np.zeros((n_clusters, 2), dtype=np.float64)
+    for c in range(n_clusters):
+        idx = np.where(cluster_labels == c)[0]
+        if idx.size:
+            density_stats[c, 0] = density[idx].mean()
+            density_stats[c, 1] = density[idx].std() if idx.size > 1 else 0.0
+
+    centroid_dist = euclidean_distances(centroids, centroids)
+    centroid_dist = _normalize_cost_matrix(centroid_dist)
+
+    adjacency = np.full((n_clusters, n_clusters), np.inf, dtype=np.float64)
+    np.fill_diagonal(adjacency, 0.0)
+    for i, j, d in cell_graph_edges:
+        ci = int(cluster_labels[i])
+        cj = int(cluster_labels[j])
+        if ci == cj:
+            continue
+        centroid_edge = float(np.linalg.norm(centroids[ci] - centroids[cj]))
+        edge_cost = min(max(float(d), 1e-8), centroid_edge if centroid_edge > 0 else float(d))
+        if edge_cost < adjacency[ci, cj]:
+            adjacency[ci, cj] = edge_cost
+            adjacency[cj, ci] = edge_cost
+
+    graph_dist = adjacency.copy()
+    for k in range(n_clusters):
+        graph_dist = np.minimum(graph_dist, graph_dist[:, [k]] + graph_dist[[k], :])
+    inf_mask = ~np.isfinite(graph_dist)
+    graph_dist[inf_mask] = centroid_dist[inf_mask]
+    graph_dist = _normalize_cost_matrix(graph_dist)
+
+    structure = graph_structure_weight * graph_dist + (1.0 - graph_structure_weight) * centroid_dist
+    structure = _normalize_cost_matrix(structure)
+
+    return {
+        'sizes': cluster_sizes,
+        'centroids': centroids,
+        'radii': radii,
+        'type_hist': type_hist,
+        'mean_embedding': mean_embedding,
+        'mean_neighborhood': np.vstack([_safe_normalize_vector(row + 1e-8) for row in mean_neighborhood]),
+        'density_stats': density_stats,
+        'structure': structure,
+        'adjacency': adjacency,
+        'cluster_labels': cluster_labels,
+    }
+
+
+
+def _compute_cluster_feature_cost(
+    stats_A: Dict[str, Any],
+    stats_B: Dict[str, Any],
+    beta: float,
+    gamma: float,
+    density_weight: float = 0.2,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    type_cost = _pairwise_js_distance(stats_A['type_hist'] + eps, stats_B['type_hist'] + eps)
+    expr_cost = cosine_distances(stats_A['mean_embedding'] + eps, stats_B['mean_embedding'] + eps)
+    nbr_cost = _pairwise_js_distance(stats_A['mean_neighborhood'] + eps, stats_B['mean_neighborhood'] + eps)
+    density_cost = euclidean_distances(stats_A['density_stats'], stats_B['density_stats'])
+
+    type_cost = _normalize_cost_matrix(type_cost)
+    expr_cost = _normalize_cost_matrix(expr_cost)
+    nbr_cost = _normalize_cost_matrix(nbr_cost)
+    density_cost = _normalize_cost_matrix(density_cost)
+
+    linear_cost = (1.0 - beta) * expr_cost + beta * type_cost
+    linear_cost += gamma * nbr_cost + density_weight * density_cost
+    return _normalize_cost_matrix(linear_cost)
+
+
+
+def _compute_numpy_cell_costs(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    beta: float,
+    gamma: float,
+    radius: Optional[float] = None,
+    use_rep: Optional[str] = None,
+    epsilon: float = 1e-6,
+    spatial_key: str = 'spatial',
+    label_key: str = 'cell_type_annot',
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    coords_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
+    coords_B = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)
+    D_A = euclidean_distances(coords_A, coords_A)
+    D_B = euclidean_distances(coords_B, coords_B)
+    scale = max(estimate_characteristic_spacing(sliceA, spatial_key=spatial_key), estimate_characteristic_spacing(sliceB, spatial_key=spatial_key), epsilon)
+    D_A /= scale
+    D_B /= scale
+
+    expr_cost = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps=epsilon)
+    type_cost = calculate_cell_type_mismatch(sliceA, sliceB)
+    nbr_A, nbr_B = calculate_neighborhood_dissimilarity(
+        sliceA,
+        sliceB,
+        radius=radius,
+        nx=None,
+        data_type=np.float32,
+        eps=epsilon,
+        radii=None,
+        radius_k=6,
+        radius_multipliers=(2.5, 4.0, 6.0),
+        n_shells=3,
+        harmonics=(0, 1, 2),
+        harmonic_weights={1: 1.25, 2: 1.5},
+        distance_decay='linear',
+        include_self=False,
+        spatial_key=spatial_key,
+        label_key=label_key,
+    )
+    nbr_cost = _pairwise_js_distance(nbr_A + epsilon, nbr_B + epsilon)
+
+    M = (1.0 - beta) * _normalize_cost_matrix(expr_cost) + beta * _normalize_cost_matrix(type_cost)
+    M += gamma * _normalize_cost_matrix(nbr_cost)
+    M = _normalize_cost_matrix(M)
+    return D_A, D_B, M
+
+
+
+def _sinkhorn_project_kernel(K: np.ndarray, a: np.ndarray, b: np.ndarray, n_iter: int = 50, eps: float = 1e-12) -> np.ndarray:
+    K = np.maximum(np.asarray(K, dtype=np.float64), eps)
+    a = _safe_normalize_vector(a, eps=eps)
+    b = _safe_normalize_vector(b, eps=eps)
+    u = np.ones_like(a)
+    v = np.ones_like(b)
+    for _ in range(n_iter):
+        Kv = K @ v
+        Kv = np.maximum(Kv, eps)
+        u = a / Kv
+        KTu = K.T @ u
+        KTu = np.maximum(KTu, eps)
+        v = b / KTu
+    return (u[:, None] * K) * v[None, :]
+
+
+
+def _build_cell_level_init_from_cluster_plan(
+    coarse_plan: np.ndarray,
+    cluster_labels_A: np.ndarray,
+    cluster_labels_B: np.ndarray,
+    coords_A: np.ndarray,
+    coords_B: np.ndarray,
+    cluster_centroids_A: np.ndarray,
+    cluster_centroids_B: np.ndarray,
+    cluster_radii_A: np.ndarray,
+    cluster_radii_B: np.ndarray,
+    feature_cost: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    topk_clusters: int = 2,
+    min_mass_fraction: float = 0.05,
+    spatial_sigma_scale: float = 2.0,
+    feature_tau: float = 0.5,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    nA, nB = feature_cost.shape
+    G = np.zeros((nA, nB), dtype=np.float64)
+
+    unique_A = np.unique(cluster_labels_A)
+    for u in unique_A:
+        src_idx = np.where(cluster_labels_A == u)[0]
+        row = np.asarray(coarse_plan[u], dtype=np.float64)
+        if row.sum() <= eps:
+            row = np.zeros_like(row)
+            row[np.argmin(np.linalg.norm(cluster_centroids_B - cluster_centroids_A[u], axis=1))] = 1.0
+        vmax = row.max() if row.size else 0.0
+        active = np.where(row >= min_mass_fraction * max(vmax, eps))[0]
+        if active.size == 0:
+            active = np.argsort(row)[-topk_clusters:]
+        elif active.size > topk_clusters:
+            active = active[np.argsort(row[active])[-topk_clusters:]]
+        active = np.asarray(active, dtype=np.int32)
+        active_weights = _safe_normalize_vector(row[active] + eps, eps=eps)
+
+        src_rel = coords_A[src_idx] - cluster_centroids_A[u]
+        for weight_uv, v in zip(active_weights, active):
+            tgt_idx = np.where(cluster_labels_B == v)[0]
+            if tgt_idx.size == 0:
+                continue
+            pred = src_rel + cluster_centroids_B[v]
+            d2 = cdist(pred, coords_B[tgt_idx], metric='sqeuclidean')
+            sigma = spatial_sigma_scale * max(cluster_radii_A[u], cluster_radii_B[v], 1e-3)
+            spatial_kernel = np.exp(-d2 / (2.0 * sigma * sigma))
+            feat_kernel = np.exp(-feature_cost[np.ix_(src_idx, tgt_idx)] / max(feature_tau, 1e-6))
+            G[np.ix_(src_idx, tgt_idx)] += weight_uv * spatial_kernel * feat_kernel
+
+    fallback = np.exp(-feature_cost / max(feature_tau, 1e-6))
+    row_zero = np.where(G.sum(axis=1) <= eps)[0]
+    if row_zero.size:
+        G[row_zero] = fallback[row_zero]
+    col_zero = np.where(G.sum(axis=0) <= eps)[0]
+    if col_zero.size:
+        G[:, col_zero] += fallback[:, col_zero]
+
+    return _sinkhorn_project_kernel(G + eps, a, b, n_iter=75, eps=eps)
+
+
+
+def hierarchical_pairwise_align(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    radius: Optional[float] = None,
+    use_rep: Optional[str] = None,
+    target_cluster_size: int = 96,
+    n_clusters: Optional[int] = None,
+    clustering_k_neighbors: int = 12,
+    clustering_feature_weight: float = 0.25,
+    graph_structure_weight: float = 0.65,
+    coarse_density_weight: float = 0.20,
+    coarse_reg_marginals: float = 10.0,
+    coarse_epsilon: float = 1e-2,
+    coarse_alpha: float = 0.6,
+    coarse_max_iter: int = 1000,
+    coarse_max_iter_ot: int = 2000,
+    fine_reg_marginals: float = 1.0,
+    fine_epsilon: float = 1e-2,
+    fine_alpha: Optional[float] = None,
+    fine_max_iter: int = 100,
+    fine_max_iter_ot: int = 300,
+    init_topk_clusters: int = 2,
+    init_min_mass_fraction: float = 0.05,
+    init_spatial_sigma_scale: float = 2.0,
+    init_feature_tau: float = 0.5,
+    spatial_key: str = 'spatial',
+    label_key: str = 'cell_type_annot',
+    a_distribution = None,
+    b_distribution = None,
+    verbose: bool = False,
+    return_details: bool = False,
+    **kwargs,
+) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], Dict[str, Any]]]:
+    """
+    Hierarchical coarse-to-fine alignment using contiguous supercells and unbalanced FGW
+    at both the cluster and cell levels.
+
+    The coarse level builds balanced-ish spatial supercells, computes a cluster graph,
+    solves fused unbalanced Gromov-Wasserstein, and then uses the coarse transport plan
+    to construct a cell-level initialization for a second unbalanced FGW solve.
+    """
+    try:
+        from ot.gromov import fused_unbalanced_gromov_wasserstein
+    except ImportError as exc:
+        raise ImportError('POT with ot.gromov.fused_unbalanced_gromov_wasserstein is required for hierarchical_pairwise_align_unbalanced.') from exc
+
+    for s in [sliceA, sliceB]:
+        if not len(s):
+            raise ValueError(f'Found empty `AnnData`:\n{s}.')
+        if spatial_key not in s.obsm:
+            raise KeyError(f'Missing spatial coordinates in `obsm[{spatial_key!r}]`.')
+        if label_key not in s.obs:
+            raise KeyError(f'Missing cell type labels in `obs[{label_key!r}]`.')
+
+    nA, nB = sliceA.n_obs, sliceB.n_obs
+    if n_clusters is None:
+        n_clusters = int(np.ceil(max(nA, nB) / max(target_cluster_size, 2)))
+    n_clusters = int(max(1, min(n_clusters, nA, nB)))
+
+    if fine_alpha is None:
+        fine_alpha = alpha
+
+    if verbose:
+        print(f'[hierarchical] n_clusters={n_clusters}, target_cluster_size≈{int(np.ceil(max(nA, nB) / n_clusters))}')
+
+    super_A = _build_supercell_features(sliceA, use_rep=use_rep, spatial_key=spatial_key, label_key=label_key)
+    super_B = _build_supercell_features(sliceB, use_rep=use_rep, spatial_key=spatial_key, label_key=label_key)
+    nbrs_A, edgew_A, edges_A = _build_spatial_knn_graph(super_A['coords'], k_neighbors=clustering_k_neighbors)
+    nbrs_B, edgew_B, edges_B = _build_spatial_knn_graph(super_B['coords'], k_neighbors=clustering_k_neighbors)
+
+    cluster_labels_A = _balanced_region_growing_labels(
+        super_A['coords'], super_A['feature_matrix'], nbrs_A, edgew_A, n_clusters=n_clusters, feature_weight=clustering_feature_weight
+    )
+    cluster_labels_B = _balanced_region_growing_labels(
+        super_B['coords'], super_B['feature_matrix'], nbrs_B, edgew_B, n_clusters=n_clusters, feature_weight=clustering_feature_weight
+    )
+
+    union_cell_types = np.array(sorted(set(super_A['labels']) | set(super_B['labels'])), dtype=str)
+
+    radii = [float(radius)] if radius is not None else default_radii_from_spacing(sliceA, sliceB, k=6, multipliers=(2.5, 4.0, 6.0), spatial_key=spatial_key)
+    neighborhood_A = neighborhood_distribution_multiscale(
+        sliceA, radii=radii, cell_types=union_cell_types, n_shells=3, harmonics=(0, 1, 2),
+        harmonic_weights={1: 1.25, 2: 1.5}, distance_decay='linear', include_self=False,
+        area_normalize=True, add_empty_bin_per_scale=False, l1_normalize_within_scale=True,
+        final_l1_normalize=True, dtype=np.float32, spatial_key=spatial_key, label_key=label_key,
+    )
+    neighborhood_B = neighborhood_distribution_multiscale(
+        sliceB, radii=radii, cell_types=union_cell_types, n_shells=3, harmonics=(0, 1, 2),
+        harmonic_weights={1: 1.25, 2: 1.5}, distance_decay='linear', include_self=False,
+        area_normalize=True, add_empty_bin_per_scale=False, l1_normalize_within_scale=True,
+        final_l1_normalize=True, dtype=np.float32, spatial_key=spatial_key, label_key=label_key,
+    )
+
+    stats_A = _compute_cluster_statistics(
+        sliceA, cluster_labels_A, super_A['coords'], edges_A, super_A['density'], neighborhood_A,
+        cell_types_union=union_cell_types, use_rep=use_rep, spatial_key=spatial_key, label_key=label_key,
+        graph_structure_weight=graph_structure_weight,
+    )
+    stats_B = _compute_cluster_statistics(
+        sliceB, cluster_labels_B, super_B['coords'], edges_B, super_B['density'], neighborhood_B,
+        cell_types_union=union_cell_types, use_rep=use_rep, spatial_key=spatial_key, label_key=label_key,
+        graph_structure_weight=graph_structure_weight,
+    )
+
+    M_coarse = _compute_cluster_feature_cost(stats_A, stats_B, beta=beta, gamma=gamma, density_weight=coarse_density_weight)
+    p = _safe_normalize_vector(stats_A['sizes'])
+    q = _safe_normalize_vector(stats_B['sizes'])
+    init_coarse = np.outer(p, q)
+
+    coarse_out = fused_unbalanced_gromov_wasserstein(
+        stats_A['structure'],
+        stats_B['structure'],
+        wx=p,
+        wy=q,
+        reg_marginals=coarse_reg_marginals,
+        epsilon=coarse_epsilon,
+        divergence='kl',
+        unbalanced_solver='mm',
+        alpha=coarse_alpha,
+        M=M_coarse,
+        init_pi=init_coarse,
+        max_iter=coarse_max_iter,
+        tol=1e-7,
+        max_iter_ot=coarse_max_iter_ot,
+        tol_ot=1e-7,
+        log=return_details,
+        verbose=verbose,
+        **kwargs,
+    )
+
+    if return_details:
+        coarse_plan, _, coarse_log = coarse_out
+    else:
+        coarse_plan, _ = coarse_out
+        coarse_log = None
+
+    coarse_plan = np.asarray(coarse_plan, dtype=np.float64)
+
+    D_A, D_B, M_fine = _compute_numpy_cell_costs(
+        sliceA, sliceB, beta=beta, gamma=gamma, radius=radius, use_rep=use_rep, epsilon=1e-6,
+        spatial_key=spatial_key, label_key=label_key,
+    )
+
+    if a_distribution is None:
+        a = np.full(nA, 1.0 / max(nA, 1), dtype=np.float64)
+    else:
+        a = _safe_normalize_vector(np.asarray(a_distribution, dtype=np.float64))
+    if b_distribution is None:
+        b = np.full(nB, 1.0 / max(nB, 1), dtype=np.float64)
+    else:
+        b = _safe_normalize_vector(np.asarray(b_distribution, dtype=np.float64))
+
+    G_init = _build_cell_level_init_from_cluster_plan(
+        coarse_plan=coarse_plan,
+        cluster_labels_A=cluster_labels_A,
+        cluster_labels_B=cluster_labels_B,
+        coords_A=super_A['coords'],
+        coords_B=super_B['coords'],
+        cluster_centroids_A=stats_A['centroids'],
+        cluster_centroids_B=stats_B['centroids'],
+        cluster_radii_A=np.maximum(stats_A['radii'], 1e-3),
+        cluster_radii_B=np.maximum(stats_B['radii'], 1e-3),
+        feature_cost=M_fine,
+        a=a,
+        b=b,
+        topk_clusters=init_topk_clusters,
+        min_mass_fraction=init_min_mass_fraction,
+        spatial_sigma_scale=init_spatial_sigma_scale,
+        feature_tau=init_feature_tau,
+    )
+
+    fine_out = fused_unbalanced_gromov_wasserstein(
+        D_A,
+        D_B,
+        wx=a,
+        wy=b,
+        reg_marginals=fine_reg_marginals,
+        epsilon=fine_epsilon,
+        divergence='kl',
+        unbalanced_solver='sinkhorn',
+        alpha=fine_alpha,
+        M=M_fine,
+        init_pi=G_init,
+        max_iter=fine_max_iter,
+        tol=1e-7,
+        max_iter_ot=fine_max_iter_ot,
+        tol_ot=1e-7,
+        log=return_details,
+        verbose=verbose,
+        **kwargs,
+    )
+
+    if return_details:
+        fine_plan, _, fine_log = fine_out
+    else:
+        fine_plan, _ = fine_out
+        fine_log = None
+
+    fine_plan = np.asarray(fine_plan, dtype=np.float64)
+
+    details = {
+        'cluster_labels_A': cluster_labels_A,
+        'cluster_labels_B': cluster_labels_B,
+        'coarse_plan': coarse_plan,
+        'cluster_feature_cost': M_coarse,
+        'cluster_structure_A': stats_A['structure'],
+        'cluster_structure_B': stats_B['structure'],
+        'cell_level_init': G_init,
+        'cell_feature_cost': M_fine,
+        'cell_structure_A': D_A,
+        'cell_structure_B': D_B,
+        'coarse_log': coarse_log,
+        'fine_log': fine_log,
+    }
+
+    return (fine_plan, details) if return_details else fine_plan
