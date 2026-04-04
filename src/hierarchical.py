@@ -130,9 +130,9 @@ def compute_cluster_structural_matrix(centroids, w_euc=1.0, w_graph=0.0):
     return C
 
 
-def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None):
+def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg_m=1.0):
     """
-    Solves cluster-level partial FGW.
+    Solves cluster-level partial/unbalanced FGW.
     """
     if m is None:
         m = min(np.sum(p_A), np.sum(p_B)) * 0.999
@@ -141,20 +141,11 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None):
     C_B_norm = C_B / (np.max(C_B) + 1e-8)
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
     
-    try:
-        if hasattr(ot.gromov, 'partial_fused_gromov_wasserstein'):
-            Pi_cluster = ot.gromov.partial_fused_gromov_wasserstein(
-                M_norm, C_A_norm, C_B_norm, p_A, p_B, m=m, alpha=alpha,
-                loss_fun='square_loss', log=False, max_iter=500
-            )
-        else:
-            raise NotImplementedError("Not found")
-    except Exception as e:
-        logging.warning(f"Partial FGW failed or missing ({e}). Falling back to emd/FGW.")
-        # Fallback to standard FGW
-        Pi_cluster = ot.gromov.fused_gromov_wasserstein(
-            M_norm, C_A_norm, C_B_norm, p_A, p_B, loss_fun='square_loss', alpha=alpha, log=False, max_iter=500
-        )
+    logging.info("Running Unbalanced FGW...")
+    # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
+    Pi_cluster = ot.gromov.fused_unbalanced_gromov_wasserstein(
+        Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, log=False, max_iter=500
+    )
         
     return Pi_cluster
 

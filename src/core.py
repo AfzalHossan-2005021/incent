@@ -82,6 +82,35 @@ def hierarchical_pairwise_align(
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
     Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
     
+    if visualize_clusters:
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.collections import LineCollection
+            
+            fig, ax = plt.subplots(figsize=(10, 10))
+            ax.scatter(centroidsA[:,0], centroidsA[:,1], c='blue', s=20, label='Slice A Clusters', zorder=2)
+            ax.scatter(centroidsB[:,0], centroidsB[:,1], c='red', s=20, label='Slice B Clusters', zorder=2)
+            
+            max_pi = np.max(Pi_cluster)
+            if max_pi > 0:
+                lines = []
+                linewidths = []
+                for i in range(Pi_cluster.shape[0]):
+                    for j in range(Pi_cluster.shape[1]):
+                        if Pi_cluster[i, j] > block_threshold:
+                            lines.append([(centroidsA[i,0], centroidsA[i,1]), (centroidsB[j,0], centroidsB[j,1])])
+                            linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)
+                
+                lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
+                ax.add_collection(lc)
+            
+            ax.set_title("Macro-Level Cluster Matching (Pi_cluster)")
+            ax.axis('equal')
+            ax.legend()
+            plt.show()
+        except Exception as e:
+            print(f"Cluster matching visualization failed: {e}")
+    
     # We now prepare the injection into standard cell-level pairwise_align
     G_init = None
     if use_init:
