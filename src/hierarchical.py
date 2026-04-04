@@ -224,14 +224,12 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
 
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', extension_hops=2):
     """
-    Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
-    Returns the cell indices for the extended macro-region in both slices,
-    along with their boundary-distances for weight decay.
+    Identifies a continuous, highly-matched section from the clustering alignment
+    by performing balanced region growing on the cluster adjacency graph.
+    Returns the cell indices for the macro-region in both slices, and boundary distances.
     """
-    from sklearn.neighbors import NearestNeighbors
-    from scipy.sparse.csgraph import connected_components
-    from scipy.spatial import cKDTree
     import numpy as np
+    from sklearn.neighbors import NearestNeighbors
 
     N, M = sliceA.shape[0], sliceB.shape[0]
     
@@ -239,112 +237,119 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if total_mass == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
-
-    # 1. Compute Cluster Centroids to build Spatial Graphs
-    num_clusters_A, num_clusters_B = Pi_cluster.shape
-    centroids_A, centroids_B = np.zeros((num_clusters_A, 2)), np.zeros((num_clusters_B, 2))
-    valid_A, valid_B = np.zeros(num_clusters_A, dtype=bool), np.zeros(num_clusters_B, dtype=bool)
-
-    for i in range(num_clusters_A):
-        mask = (labels_A == i)
-        if np.any(mask):
-            centroids_A[i] = coords_A[mask].mean(axis=0)
-            valid_A[i] = True
-
-    for i in range(num_clusters_B):
-        mask = (labels_B == i)
-        if np.any(mask):
-            centroids_B[i] = coords_B[mask].mean(axis=0)
-            valid_B[i] = True
-
-    # 2. Build Structural Adjacency Matrices for Clusters (k=6)
-    k_A = min(6, np.sum(valid_A))
-    adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
-    if k_A > 0:
-        nn_A = NearestNeighbors(n_neighbors=k_A).fit(centroids_A[valid_A])
-        ind_A = nn_A.kneighbors(centroids_A[valid_A], return_distance=False)
-        valid_idx_A = np.where(valid_A)[0]
-        for i, neighbors in enumerate(ind_A):
-            for n in neighbors:
-                adj_A[valid_idx_A[i], valid_idx_A[n]] = True
-                adj_A[valid_idx_A[n], valid_idx_A[i]] = True
-
-    k_B = min(6, np.sum(valid_B))
-    adj_B = np.zeros((num_clusters_B, num_clusters_B), dtype=bool)
-    if k_B > 0:
-        nn_B = NearestNeighbors(n_neighbors=k_B).fit(centroids_B[valid_B])
-        ind_B = nn_B.kneighbors(centroids_B[valid_B], return_distance=False)
-        valid_idx_B = np.where(valid_B)[0]
-        for i, neighbors in enumerate(ind_B):
-            for n in neighbors:
-                adj_B[valid_idx_B[i], valid_idx_B[n]] = True
-                adj_B[valid_idx_B[n], valid_idx_B[i]] = True
-
-    np.fill_diagonal(adj_A, True)
-    np.fill_diagonal(adj_B, True)
-
-    # 3. Select ENLARGED subset of transport masses (Top 85%)
-    flat_pi = Pi_cluster.flatten()
-    sorted_idx = np.argsort(flat_pi)[::-1]
-    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
+    num_clusters_A = Pi_cluster.shape[0]
+    num_clusters_B = Pi_cluster.shape[1]
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.85)
-    selected_flat_idx = sorted_idx[:cutoff_idx+1]
+    # 1. Precompute cluster centroids and absolute cell counts
+    centroids_A = np.zeros((num_clusters_A, 2))
+    sizes_A = np.zeros(num_clusters_A)
+    for c in range(num_clusters_A):
+        idx = np.where(labels_A == c)[0]
+        if len(idx) > 0:
+            centroids_A[c] = sliceA.obsm[spatial_key][idx].mean(axis=0)
+            sizes_A[c] = len(idx)
+
+    centroids_B = np.zeros((num_clusters_B, 2))
+    sizes_B = np.zeros(num_clusters_B)
+    for c in range(num_clusters_B):
+        idx = np.where(labels_B == c)[0]
+        if len(idx) > 0:
+            centroids_B[c] = sliceB.obsm[spatial_key][idx].mean(axis=0)
+            sizes_B[c] = len(idx)
+
+    # 2. Build Contiguous Adjacency Graphs (K=6 physical cluster neighbors)
+    nn_A = NearestNeighbors(n_neighbors=min(6, num_clusters_A)).fit(centroids_A)
+    adj_A = nn_A.kneighbors_graph(mode='connectivity').toarray()
     
-    matches = []
-    for idx in selected_flat_idx:
-        u, v = np.unravel_index(idx, Pi_cluster.shape)
-        if valid_A[u] and valid_B[v]:
-            matches.append((u, v))
-            
-    num_matches = len(matches)
-    if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+    nn_B = NearestNeighbors(n_neighbors=min(6, num_clusters_B)).fit(centroids_B)
+    adj_B = nn_B.kneighbors_graph(mode='connectivity').toarray()
+
+    # 3. Seed initialization from absolute peak confidence cluster pair
+    idx_max = np.argmax(Pi_cluster)
+    seed_A, seed_B = np.unravel_index(idx_max, Pi_cluster.shape)
+    
+    core_A, core_B = {seed_A}, {seed_B}
+    sum_cells_A, sum_cells_B = sizes_A[seed_A], sizes_B[seed_B]
+    
+    # Grow to target 75% coverage max - forces edge trim while allowing wide bulk bodies
+    target_coverage = 0.75 
+    ratio_target = N / float(M)
+    min_score = np.max(Pi_cluster) * 0.005 # Allows extending into weakly-moderate matches
+    
+    # 4. Region Growing Expansion
+    while (sum_cells_A / N < target_coverage) or (sum_cells_B / M < target_coverage):
+        # Look around outer boundary of current core
+        cand_A = set()
+        for c in core_A: 
+            cand_A.update(np.where(adj_A[c])[0])
+        cand_A -= core_A
         
-    # 4. Enforce Structural Similarity & Continuity via Match-Graph
-    # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
-    match_adj = np.zeros((num_matches, num_matches), dtype=bool)
-    for i in range(num_matches):
-        u1, v1 = matches[i]
-        for j in range(i+1, num_matches):
-            u2, v2 = matches[j]
-            if adj_A[u1, u2] and adj_B[v1, v2]:
-                match_adj[i, j] = True
-                match_adj[j, i] = True
+        cand_B = set()
+        for c in core_B: 
+            cand_B.update(np.where(adj_B[c])[0])
+        cand_B -= core_B
+        
+        if not cand_A and not cand_B:
+            break
+            
+        # Score neighboring candidates solely by Pi flow connected inward into the opposing chosen core
+        best_cand_A, best_score_A = None, -1
+        for c in cand_A:
+            score = sum(Pi_cluster[c, j] for j in core_B)
+            if score > best_score_A:
+                best_score_A = score
+                best_cand_A = c
+                
+        best_cand_B, best_score_B = None, -1
+        for c in cand_B:
+            score = sum(Pi_cluster[i, c] for i in core_A)
+            if score > best_score_B:
+                best_score_B = score
+                best_cand_B = c
+                
+        can_add_A = best_cand_A is not None and best_score_A > min_score
+        can_add_B = best_cand_B is not None and best_score_B > min_score
+        
+        if not can_add_A and not can_add_B:
+            break
+            
+        current_ratio = sum_cells_A / max(1, sum_cells_B)
+        added = False
+        
+        # 5. Dynamically balance growth to preserve N/M physical shape proportions
+        if can_add_A and can_add_B:
+            if current_ratio < ratio_target:
+                core_A.add(best_cand_A)
+                sum_cells_A += sizes_A[best_cand_A]
+            else:
+                core_B.add(best_cand_B)
+                sum_cells_B += sizes_B[best_cand_B]
+            added = True
+        elif can_add_A:
+            core_A.add(best_cand_A)
+            sum_cells_A += sizes_A[best_cand_A]
+            added = True
+        elif can_add_B:
+            core_B.add(best_cand_B)
+            sum_cells_B += sizes_B[best_cand_B]
+            added = True
+            
+        if not added:
+            break
+            
+    # 6. Extraction translation
+    core_A, core_B = np.array(list(core_A)), np.array(list(core_B))
+    
+    idx_A = np.where(np.isin(labels_A, core_A))[0]
+    idx_B = np.where(np.isin(labels_B, core_B))[0]
+    
+    # 7. Compute physical edge distances radiating off the prime "Seed" for core decay weight plan
+    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
+    
+    seed_centroid_A = centroids_A[seed_A]
+    seed_centroid_B = centroids_B[seed_B]
+    
+    dist_A = np.linalg.norm(coords_A[idx_A] - seed_centroid_A, axis=1)
+    dist_B = np.linalg.norm(coords_B[idx_B] - seed_centroid_B, axis=1)
 
-    # Find the largest Structurally Co-Contiguous Component
-    n_comp, comp_labels = connected_components(match_adj, directed=False)
-    largest = np.bincount(comp_labels).argmax()
-    largest_match_indices = np.where(comp_labels == largest)[0]
-    
-    strong_A = list(set([matches[i][0] for i in largest_match_indices]))
-    strong_B = list(set([matches[i][1] for i in largest_match_indices]))
-    
-    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
-    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
-
-    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-    
-    # 5. Cell-level Physical Distance Extension
-    tree_A = cKDTree(coords_A[core_cells_A])
-    tree_B = cKDTree(coords_B[core_cells_B])
-    
-    dist_A, _ = tree_A.query(coords_A)
-    dist_B, _ = tree_B.query(coords_B)
-    
-    # 6. Continuous Enlargement to Maximum Bounding Target
-    # We want to match exactly the size of the smaller slice to maximize coverage.
-    target_count = min(N, M)
-    
-    # Sorting by physical distance to the matching macro-core ensures that 
-    # the selection grows outward continuously like a concentric region-fill
-    sorted_A = np.argsort(dist_A)
-    sorted_B = np.argsort(dist_B)
-    
-    # Slice the exact identical volume of contiguous cells
-    idx_A = sorted_A[:target_count]
-    idx_B = sorted_B[:target_count]
-    
-    return idx_A, idx_B, dist_A[idx_A], dist_B[idx_B]
+    return idx_A, idx_B, dist_A, dist_B
