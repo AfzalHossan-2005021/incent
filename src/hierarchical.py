@@ -344,8 +344,8 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             return median_dist * (extension_hops * 2.0)
         return 5.0
             
-    rad_A = compute_radius(coords_A[contig_A])
-    rad_B = compute_radius(coords_B[contig_B])
+    rad_A = compute_radius(coords_A[core_cells_A])
+    rad_B = compute_radius(coords_B[core_cells_B])
     
     idx_A = np.where(dist_A <= rad_A)[0]
     idx_B = np.where(dist_B <= rad_B)[0]
