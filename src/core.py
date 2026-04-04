@@ -117,7 +117,7 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B = extract_continuous_macro_section(
+    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
         sliceA, sliceB, labelsA, labelsB, Pi_cluster, 
         spatial_key=spatial_key, extension_hops=2
     )
@@ -128,12 +128,18 @@ def hierarchical_pairwise_align(
     sub_sliceA = sliceA[idx_A].copy()
     sub_sliceB = sliceB[idx_B].copy()
 
-    # The selected sections will inherently have a uniform initial plan in pairwise_align (by default FGW uses p*q.T which is uniform)
-    # The user asked specifically for a uniform initial plan. We can pass an explicitly defined uniform G_init.
+    # The selected sections will have an initial plan that decays based on distance from the core
     sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
     G_init_sub = None
-    if use_init:
-        G_init_sub = np.ones((sub_N, sub_M)) / (sub_N * sub_M)
+    if use_init and sub_N > 0 and sub_M > 0:
+        sigma_A = max(1e-5, np.max(dist_A) / 2.0)
+        sigma_B = max(1e-5, np.max(dist_B) / 2.0)
+        
+        weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
+        weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
+        
+        G_init_sub = np.outer(weight_A, weight_B)
+        G_init_sub /= np.sum(G_init_sub)
 
     print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
     pi_sub = pairwise_align(

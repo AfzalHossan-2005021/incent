@@ -225,28 +225,33 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', extension_hops=2):
     """
     Identifies the largest continuous, highly-matched section from the clustering alignment.
-    Returns the cell indices for the extended macro-region in both slices.
+    Returns the cell indices for the extended macro-region in both slices,
+    along with their boundary-distances for weight decay.
     """
     from sklearn.neighbors import NearestNeighbors
     from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
     import numpy as np
 
     N, M = sliceA.shape[0], sliceB.shape[0]
-    flat_pi = Pi_cluster.flatten()
-    nonzero_pi = flat_pi[flat_pi > 0]
     
-    if len(nonzero_pi) == 0:
-        return np.arange(N), np.arange(M)
+    max_pi = np.max(Pi_cluster)
+    if max_pi == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
-    thresh = np.mean(nonzero_pi) + 0.5 * np.std(nonzero_pi)
+    # Strict matching threshold: only take top 30% of transport flow
+    thresh = max_pi * 0.3
     strong_A, strong_B = np.where(Pi_cluster > thresh)
     
-    if len(strong_A) == 0:
-        thresh = np.mean(nonzero_pi)
+    if len(strong_A) == 0: # fallback
+        thresh = max_pi * 0.1
         strong_A, strong_B = np.where(Pi_cluster > thresh)
         
     core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
     core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
+    
+    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
     
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
 
@@ -261,15 +266,27 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     contig_A = largest_component(coords_A, core_cells_A)
     contig_B = largest_component(coords_B, core_cells_B)
     
-    def extend(coords, contig, total_N, hops):
-        if 0 < len(contig) < total_N and hops > 0:
-            k = min(hops * 6, total_N)
-            nn = NearestNeighbors(n_neighbors=k).fit(coords)
-            distances, ind = nn.kneighbors(coords[contig])
-            return np.unique(ind.flatten())
-        return contig
-            
-    ext_A = extend(coords_A, contig_A, N, extension_hops)
-    ext_B = extend(coords_B, contig_B, M, extension_hops)
+    # KDTree for physical distance measurement
+    tree_A = cKDTree(coords_A[contig_A])
+    tree_B = cKDTree(coords_B[contig_B])
     
-    return ext_A, ext_B
+    dist_A, _ = tree_A.query(coords_A)
+    dist_B, _ = tree_B.query(coords_B)
+    
+    # Compute dynamic extension radius
+    def compute_radius(coords_core):
+        if len(coords_core) > 1:
+            nn = NearestNeighbors(n_neighbors=min(6, len(coords_core))).fit(coords_core)
+            dists, _ = nn.kneighbors(coords_core)
+            median_dist = np.median(dists[:, 1:])
+            # 1 hop roughly equals the median neighbor distance
+            return median_dist * (extension_hops * 2.0)
+        return 5.0
+            
+    rad_A = compute_radius(coords_A[contig_A])
+    rad_B = compute_radius(coords_B[contig_B])
+    
+    idx_A = np.where(dist_A <= rad_A)[0]
+    idx_B = np.where(dist_B <= rad_B)[0]
+    
+    return idx_A, idx_B, dist_A[idx_A], dist_B[idx_B]
