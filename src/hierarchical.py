@@ -221,3 +221,55 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
         
     return G_init
 
+
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', extension_hops=2):
+    """
+    Identifies the largest continuous, highly-matched section from the clustering alignment.
+    Returns the cell indices for the extended macro-region in both slices.
+    """
+    from sklearn.neighbors import NearestNeighbors
+    from scipy.sparse.csgraph import connected_components
+    import numpy as np
+
+    N, M = sliceA.shape[0], sliceB.shape[0]
+    flat_pi = Pi_cluster.flatten()
+    nonzero_pi = flat_pi[flat_pi > 0]
+    
+    if len(nonzero_pi) == 0:
+        return np.arange(N), np.arange(M)
+        
+    thresh = np.mean(nonzero_pi) + 0.5 * np.std(nonzero_pi)
+    strong_A, strong_B = np.where(Pi_cluster > thresh)
+    
+    if len(strong_A) == 0:
+        thresh = np.mean(nonzero_pi)
+        strong_A, strong_B = np.where(Pi_cluster > thresh)
+        
+    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
+    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
+    
+    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
+
+    def largest_component(coords, cell_idx):
+        if len(cell_idx) < 2: return cell_idx
+        nn = NearestNeighbors(n_neighbors=min(6, len(cell_idx))).fit(coords[cell_idx])
+        adj = nn.kneighbors_graph(mode='connectivity')
+        n_comp, comp_labels = connected_components(adj, directed=False)
+        largest = np.bincount(comp_labels).argmax()
+        return cell_idx[comp_labels == largest]
+        
+    contig_A = largest_component(coords_A, core_cells_A)
+    contig_B = largest_component(coords_B, core_cells_B)
+    
+    def extend(coords, contig, total_N, hops):
+        if 0 < len(contig) < total_N and hops > 0:
+            k = min(hops * 6, total_N)
+            nn = NearestNeighbors(n_neighbors=k).fit(coords)
+            distances, ind = nn.kneighbors(coords[contig])
+            return np.unique(ind.flatten())
+        return contig
+            
+    ext_A = extend(coords_A, contig_A, N, extension_hops)
+    ext_B = extend(coords_B, contig_B, M, extension_hops)
+    
+    return ext_A, ext_B

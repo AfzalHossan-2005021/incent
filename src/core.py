@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
 from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init
+from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init, extract_continuous_macro_section
 
 
 def hierarchical_pairwise_align(
@@ -116,38 +116,46 @@ def hierarchical_pairwise_align(
             print(f"Cluster matching visualization failed: {e}")
 
     # We now prepare the injection into standard cell-level pairwise_align
-    G_init = None
-    if use_init:
-        print("--- [HOT] Step 5a: Expanding Coarse Map to G_init ---")
-        G_init = blockwise_g_init(labelsA, labelsB, Pi_cluster)
-        
-    print("--- [HOT] Step 5b: Executing Base OT ---")
-    # Base OT call. For true block-masking, you would need to intercept M1 + gamma*M2 inside pairwise_align.
-    # To preserve original pairwise_align logic, we let it calculate D_A, M1, M2 natively.
-    # We will pass G_init. If use_mask is True, we must modify the base pairwise_align to accept external cost adjustments, 
-    # or recreate what pairwise_align does. Since pairwise_align is complex, we will just pass G_init here.
+    print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
+    idx_A, idx_B = extract_continuous_macro_section(
+        sliceA, sliceB, labelsA, labelsB, Pi_cluster, 
+        spatial_key=spatial_key, extension_hops=2
+    )
     
-    pi = pairwise_align(
-        sliceA=sliceA,
-        sliceB=sliceB,
+    print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
+
+    # Only run base OT on the selected continuous matching blocks
+    sub_sliceA = sliceA[idx_A].copy()
+    sub_sliceB = sliceB[idx_B].copy()
+
+    # The selected sections will inherently have a uniform initial plan in pairwise_align (by default FGW uses p*q.T which is uniform)
+    # The user asked specifically for a uniform initial plan. We can pass an explicitly defined uniform G_init.
+    sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
+    G_init_sub = None
+    if use_init:
+        G_init_sub = np.ones((sub_N, sub_M)) / (sub_N * sub_M)
+
+    print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
+    pi_sub = pairwise_align(
+        sliceA=sub_sliceA,
+        sliceB=sub_sliceB,
         alpha=alpha,
         beta=beta,
         gamma=gamma,
         reg_compact=reg_compact,
-        G_init=G_init,
+        G_init=G_init_sub,
         numItermax=numItermax,
         use_gpu=use_gpu,
         **kwargs
     )
-    
-    if use_mask:
-        # Masking after the fact, or we could pass the mask down.
-        # Simple post-masking for extreme penalties where the block transport is tiny.
-        _, mask = build_block_restricted_cost(np.zeros_like(pi), labelsA, labelsB, Pi_cluster, threshold=block_threshold)
-        pi[~mask] = 0.0
-        
-    return pi
 
+    # Rest of the region will have zero initial/final plan
+    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]))
+    if sub_N > 0 and sub_M > 0:
+        grid_A, grid_B = np.ix_(idx_A, idx_B)
+        pi_full[grid_A, grid_B] = pi_sub
+
+    return pi_full
 
 def pairwise_align(
     sliceA: AnnData,
