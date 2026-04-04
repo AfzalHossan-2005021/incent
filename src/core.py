@@ -87,10 +87,14 @@ def hierarchical_pairwise_align(
             import matplotlib.pyplot as plt
             from matplotlib.collections import LineCollection
             
+            # Center the coordinates purely for overlap plotting
+            cA_plot = centroidsA - np.mean(centroidsA, axis=0)
+            cB_plot = centroidsB - np.mean(centroidsB, axis=0)
+
             fig, ax = plt.subplots(figsize=(10, 10))
-            ax.scatter(centroidsA[:,0], centroidsA[:,1], c='blue', s=20, label='Slice A Clusters', zorder=2)
-            ax.scatter(centroidsB[:,0], centroidsB[:,1], c='red', s=20, label='Slice B Clusters', zorder=2)
-            
+            ax.scatter(cA_plot[:,0], cA_plot[:,1], c='blue', s=20, label='Slice A Clusters (Centered)', zorder=2)
+            ax.scatter(cB_plot[:,0], cB_plot[:,1], c='red', s=20, label='Slice B Clusters (Centered)', zorder=2)
+
             max_pi = np.max(Pi_cluster)
             if max_pi > 0:
                 lines = []
@@ -98,19 +102,19 @@ def hierarchical_pairwise_align(
                 for i in range(Pi_cluster.shape[0]):
                     for j in range(Pi_cluster.shape[1]):
                         if Pi_cluster[i, j] > block_threshold:
-                            lines.append([(centroidsA[i,0], centroidsA[i,1]), (centroidsB[j,0], centroidsB[j,1])])
-                            linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)
-                
+                            lines.append([(cA_plot[i,0], cA_plot[i,1]), (cB_plot[j,0], cB_plot[j,1])])
+                            linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)      
+
                 lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
                 ax.add_collection(lc)
-            
-            ax.set_title("Macro-Level Cluster Matching (Pi_cluster)")
+
+            ax.set_title("Macro-Level Cluster Matching ($\Pi_{cluster}$)")
             ax.axis('equal')
             ax.legend()
             plt.show()
         except Exception as e:
             print(f"Cluster matching visualization failed: {e}")
-    
+
     # We now prepare the injection into standard cell-level pairwise_align
     G_init = None
     if use_init:

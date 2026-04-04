@@ -146,7 +146,9 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     Pi_cluster = ot.gromov.fused_unbalanced_gromov_wasserstein(
         Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, log=False, max_iter=500
     )
-        
+    if isinstance(Pi_cluster, tuple):
+        Pi_cluster = Pi_cluster[0]
+    
     return Pi_cluster
 
 
