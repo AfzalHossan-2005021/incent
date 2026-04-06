@@ -1,13 +1,14 @@
 import ot
+import heapq
 import torch
 import numpy as np
 
 from anndata import AnnData
+from collections import Counter
 from numpy.typing import NDArray
-from typing import Optional, Tuple, Union, Dict, Any, List
 from scipy.spatial import cKDTree
+from typing import Optional, Tuple, Union, Dict, Any, List
 from scipy.spatial.distance import cdist
-import heapq
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
@@ -32,7 +33,7 @@ def pairwise_align(
     epsilon: float = 1e-6,
     verbose: bool = False,
     gpu_verbose: bool = True,
-    dummy_cell: bool = True,
+    unbalanced: bool = True,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -123,8 +124,7 @@ def pairwise_align(
     _has_dummy_src = False
     _has_dummy_tgt = False
 
-    if dummy_cell:
-        from collections import Counter
+    if unbalanced:
         ns, nt = sliceA.shape[0], sliceB.shape[0]
         labels_A = sliceA.obs['cell_type_annot'].values
         labels_B = sliceB.obs['cell_type_annot'].values
@@ -137,7 +137,7 @@ def pairwise_align(
         _has_dummy_src = _w_dummy_src > 0
         _has_dummy_tgt = _w_dummy_tgt > 0
 
-        print(f"[dummy_cell] budget={_budget}, "
+        print(f"[unbalanced] budget={_budget}, "
               f"dummy_src={'YES (birth)' if _has_dummy_src else 'NO'} w={_w_dummy_src}, "
               f"dummy_tgt={'YES (death)' if _has_dummy_tgt else 'NO'} w={_w_dummy_tgt}")
 
@@ -184,7 +184,7 @@ def pairwise_align(
 
     # init distributions
     if a_distribution is None:
-        if dummy_cell:
+        if unbalanced:
             if _has_dummy_src:
                 a_vals = np.full(ns + 1, 1.0 / _budget, dtype=np.float64)
                 a_vals[-1] = float(_w_dummy_src) / _budget
@@ -195,12 +195,12 @@ def pairwise_align(
             # uniform distribution, a = array([1/n, 1/n, ...])
             a = nx.ones((sliceA.shape[0],))/sliceA.shape[0]
     else:
-        if dummy_cell:
-            raise ValueError("Custom a_distribution is not supported with dummy_cell=True.")
+        if unbalanced:
+            raise ValueError("Custom a_distribution is not supported with unbalanced=True.")
         a = nx.from_numpy(a_distribution)
         
     if b_distribution is None:
-        if dummy_cell:
+        if unbalanced:
             if _has_dummy_tgt:
                 b_vals = np.full(nt + 1, 1.0 / _budget, dtype=np.float64)
                 b_vals[-1] = float(_w_dummy_tgt) / _budget
@@ -210,8 +210,8 @@ def pairwise_align(
         else:
             b = nx.ones((sliceB.shape[0],))/sliceB.shape[0]
     else:
-        if dummy_cell:
-            raise ValueError("Custom b_distribution is not supported with dummy_cell=True.")
+        if unbalanced:
+            raise ValueError("Custom b_distribution is not supported with unbalanced=True.")
         b = nx.from_numpy(b_distribution)
 
     a = to_backend(a, nx, data_type=data_type)
@@ -220,7 +220,7 @@ def pairwise_align(
     
     # Run OT
     if G_init is not None:
-        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+        if unbalanced and (_has_dummy_src or _has_dummy_tgt):
             # Pad user-provided (ns x nt) G_init to augmented dims
             _gi = np.array(G_init, dtype=np.float64)
             _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
@@ -232,7 +232,7 @@ def pairwise_align(
     pi = nx.to_numpy(pi)
 
     # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
-    if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+    if unbalanced and (_has_dummy_src or _has_dummy_tgt):
         pi_full = pi.copy()
 
         # Compute birth / death mass before stripping
@@ -247,7 +247,7 @@ def pairwise_align(
         elif _has_dummy_tgt:
             pi = pi_full[:, :nt]      # strip dummy target col only
 
-        print(f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}")
+        print(f"[unbalanced] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}")
 
     if isinstance(nx, ot.backend.TorchBackend):
         if torch.cuda.is_available():
@@ -1216,13 +1216,9 @@ def hierarchical_pairwise_align(
     clustering_feature_weight: float = 0.25,
     graph_structure_weight: float = 0.65,
     coarse_density_weight: float = 0.20,
-    coarse_reg_marginals: float = 10.0,
-    coarse_epsilon: float = 1e-2,
     coarse_alpha: float = 0.6,
     coarse_max_iter: int = 1000,
     coarse_max_iter_ot: int = 2000,
-    fine_reg_marginals: float = 1.0,
-    fine_epsilon: float = 1e-2,
     fine_alpha: Optional[float] = None,
     fine_max_iter: int = 100,
     fine_max_iter_ot: int = 300,
@@ -1234,6 +1230,7 @@ def hierarchical_pairwise_align(
     label_key: str = 'cell_type_annot',
     a_distribution = None,
     b_distribution = None,
+    unbalanced: bool = True,
     verbose: bool = False,
     return_details: bool = False,
     **kwargs,
@@ -1246,10 +1243,6 @@ def hierarchical_pairwise_align(
     solves fused unbalanced Gromov-Wasserstein, and then uses the coarse transport plan
     to construct a cell-level initialization for a second unbalanced FGW solve.
     """
-    try:
-        from ot.gromov import fused_unbalanced_gromov_wasserstein
-    except ImportError as exc:
-        raise ImportError('POT with ot.gromov.fused_unbalanced_gromov_wasserstein is required for hierarchical_pairwise_align_unbalanced.') from exc
 
     for s in [sliceA, sliceB]:
         if not len(s):
@@ -1314,32 +1307,114 @@ def hierarchical_pairwise_align(
     q = _safe_normalize_vector(stats_B['sizes'])
     init_coarse = np.outer(p, q)
 
-    coarse_out = fused_unbalanced_gromov_wasserstein(
-        stats_A['structure'],
-        stats_B['structure'],
-        wx=p,
-        wy=q,
-        reg_marginals=coarse_reg_marginals,
-        epsilon=coarse_epsilon,
-        divergence='kl',
-        unbalanced_solver='mm',
-        alpha=coarse_alpha,
-        M=M_coarse,
-        init_pi=init_coarse,
-        max_iter=coarse_max_iter,
-        tol=1e-7,
-        max_iter_ot=coarse_max_iter_ot,
-        tol_ot=1e-7,
-        log=return_details,
-        verbose=verbose,
-        **kwargs,
-    )
+    if unbalanced:
+        # Check deficit relative to the other slice to add dummy
+        _has_dummy_src = False
+        _has_dummy_tgt = False
+        
+        _w_dummy_src = max(0, stats_B['sizes'].sum() - stats_A['sizes'].sum())
+        _w_dummy_tgt = max(0, stats_A['sizes'].sum() - stats_B['sizes'].sum())
+        
+        _has_dummy_src = _w_dummy_src > 0
+        _has_dummy_tgt = _w_dummy_tgt > 0
+        
+        _budget = max(stats_A['sizes'].sum(), stats_B['sizes'].sum())
 
-    if return_details:
-        coarse_plan, _, coarse_log = coarse_out
+        ns_c, nt_c = len(p), len(q)
+        _ns_c_aug = ns_c + (1 if _has_dummy_src else 0)
+        _nt_c_aug = nt_c + (1 if _has_dummy_tgt else 0)
+
+        # Augment structures
+        struct_A = stats_A['structure'].copy()
+        struct_B = stats_B['structure'].copy()
+        
+        if _has_dummy_src:
+            zeros_col = np.zeros((ns_c, 1), dtype=np.float64)
+            struct_A = np.concatenate([struct_A, zeros_col], axis=1)
+            zeros_row = np.zeros((1, _ns_c_aug), dtype=np.float64)
+            struct_A = np.concatenate([struct_A, zeros_row], axis=0)
+            
+        if _has_dummy_tgt:
+            zeros_col = np.zeros((nt_c, 1), dtype=np.float64)
+            struct_B = np.concatenate([struct_B, zeros_col], axis=1)
+            zeros_row = np.zeros((1, _nt_c_aug), dtype=np.float64)
+            struct_B = np.concatenate([struct_B, zeros_row], axis=0)
+
+        # Augment feature cost M_coarse
+        if _has_dummy_tgt:
+            mean_col = M_coarse.mean(axis=1, keepdims=True)
+            M_coarse = np.concatenate([M_coarse, mean_col], axis=1)
+        if _has_dummy_src:
+            mean_row = M_coarse.mean(axis=0, keepdims=True)
+            M_coarse = np.concatenate([M_coarse, mean_row], axis=0)
+        if _has_dummy_src and _has_dummy_tgt:
+            M_coarse[-1, -1] = 0.0
+
+        # Adjust p and q distributions
+        if _has_dummy_src:
+            p = np.concatenate([stats_A['sizes'] / _budget, [_w_dummy_src / _budget]])
+        else:
+            p = stats_A['sizes'] / _budget
+            
+        if _has_dummy_tgt:
+            q = np.concatenate([stats_B['sizes'] / _budget, [_w_dummy_tgt / _budget]])
+        else:
+            q = stats_B['sizes'] / _budget
+
+        init_coarse = np.outer(p, q)
+        
+        coarse_out = fused_gromov_wasserstein_incent(
+            M=M_coarse,
+            C1=struct_A,
+            C2=struct_B,
+            p=p,
+            q=q,
+            G_init=init_coarse,
+            alpha=coarse_alpha,
+            numItermax=coarse_max_iter,
+            numItermaxEmd=coarse_max_iter_ot,
+            log=return_details,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        if return_details:
+            coarse_plan_full, coarse_log = coarse_out
+        else:
+            coarse_plan_full = coarse_out
+            coarse_log = None
+            
+        # Strip dummy rows/cols added
+        if _has_dummy_src and _has_dummy_tgt:
+            coarse_plan = coarse_plan_full[:ns_c, :nt_c]
+        elif _has_dummy_src:
+            coarse_plan = coarse_plan_full[:ns_c, :]
+        elif _has_dummy_tgt:
+            coarse_plan = coarse_plan_full[:, :nt_c]
+        else:
+            coarse_plan = coarse_plan_full
+            
     else:
-        coarse_plan, _ = coarse_out
-        coarse_log = None
+        coarse_out = fused_gromov_wasserstein_incent(
+            M=M_coarse,
+            C1=stats_A['structure'],
+            C2=stats_B['structure'],
+            p=p,
+            q=q,
+            G_init=init_coarse,
+            alpha=coarse_alpha,
+            numItermax=coarse_max_iter,
+            numItermaxEmd=coarse_max_iter_ot,
+            log=return_details,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        if return_details:
+            coarse_plan, coarse_log = coarse_out
+        else:
+            coarse_plan = coarse_out
+            coarse_log = None
 
     coarse_plan = np.asarray(coarse_plan, dtype=np.float64)
 
@@ -1379,11 +1454,19 @@ def hierarchical_pairwise_align(
     fine_out = pairwise_align(
         sliceA,
         sliceB,
-        alpha=alpha,
+        alpha=fine_alpha,
         beta=beta,
         gamma=gamma,
         radius=radius,
-        G_init=G_init
+        use_rep=use_rep,
+        G_init=G_init,
+        a_distribution=a_distribution,
+        b_distribution=b_distribution,
+        unbalanced=unbalanced,
+        verbose=verbose,
+        numItermax=fine_max_iter,
+        numItermaxEmd=fine_max_iter_ot,
+        **kwargs
     )
 
     fine_plan = fine_out
