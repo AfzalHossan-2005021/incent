@@ -182,6 +182,13 @@ def pairwise_align(
         if _has_dummy_src and _has_dummy_tgt:
             M2[-1, -1] = 0.0
 
+    # Free up memory from CPU and intermediate tensors created prior to OT
+    del cosine_dist_gene_expr, cell_type_mismatch, M1_combined, js_dist_neighborhood
+    if isinstance(nx, ot.backend.TorchBackend):
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # init distributions
     if a_distribution is None:
         if unbalanced:
@@ -222,10 +229,10 @@ def pairwise_align(
     if G_init is not None:
         if unbalanced and (_has_dummy_src or _has_dummy_tgt):
             # Pad user-provided (ns x nt) G_init to augmented dims
-            _gi = to_backend(G_init, nx, data_type=data_type)
-            _gi_aug = nx.zeros((_ns_aug, _nt_aug), type_as=_gi)
+            _gi = G_init.cpu().numpy() if hasattr(G_init, 'cpu') else np.array(G_init, dtype=data_type)
+            _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=data_type)
             _gi_aug[:ns, :nt] = _gi
-            G_init = _gi_aug
+            G_init = to_backend(_gi_aug, nx, data_type=data_type)
     
     pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
@@ -1114,8 +1121,7 @@ def _compute_numpy_cell_costs(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:    
     use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
     
-    D_A = calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, eps=epsilon)[0]
-    D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, eps=epsilon)[1]
+    D_A, D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, eps=epsilon)
     
     scale = max(estimate_characteristic_spacing(sliceA, spatial_key=spatial_key), estimate_characteristic_spacing(sliceB, spatial_key=spatial_key), epsilon)
     D_A = D_A / scale
@@ -1153,6 +1159,13 @@ def _compute_numpy_cell_costs(
     M = (1.0 - beta) * _normalize_cost_matrix(expr_cost) + beta * _normalize_cost_matrix(type_cost)
     M += gamma * _normalize_cost_matrix(nbr_cost)
     M = _normalize_cost_matrix(M)
+    
+    # Offload back to CPU to prevent massive VRAM leaks inside hierarchical details
+    if hasattr(D_A, 'cpu'):
+        D_A = nx.to_numpy(D_A)
+    if hasattr(D_B, 'cpu'):
+        D_B = nx.to_numpy(D_B)
+        
     return D_A, D_B, M
 
 
@@ -1458,6 +1471,14 @@ def hierarchical_pairwise_align(
 
     coarse_plan = np.asarray(coarse_plan, dtype=np.float64)
 
+    if use_gpu:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
     D_A, D_B, M_fine = _compute_numpy_cell_costs(
         sliceA, sliceB, beta=beta, gamma=gamma, radius=radius, use_rep=use_rep, epsilon=1e-6,
         spatial_key=spatial_key, label_key=label_key, use_gpu=use_gpu
@@ -1491,6 +1512,14 @@ def hierarchical_pairwise_align(
         feature_tau=init_feature_tau,
         use_gpu=use_gpu
     )
+
+    if use_gpu:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
     fine_out = pairwise_align(
         sliceA,

@@ -125,7 +125,8 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
 
     def f(G):
         # Base Gromov-Wasserstein term
-        gw_loss = nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
+        # Avoid G @ G.T and G.T @ G to save massive memory allocations (O(n x n) and O(m x m))
+        gw_loss = nx.sum(G * nx.dot(C1, G)) + nx.sum(G * nx.dot(G, C2))
         # Form A Compactness penalty requires squared distances for precise variance
         if reg_compact > 0:
             compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2_sq * G)
