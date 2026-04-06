@@ -350,3 +350,83 @@ def visualize_alignment(sliceA, sliceB, pi12):
 
     return new_slices
 
+
+def visualize_cluster_alignment(sliceA: AnnData, sliceB: AnnData, details: dict, show_lines: bool = True, line_alpha: float = 0.5, line_width: float = 1.0):
+    """
+    Visualizes the coarse cluster-level OT alignment from `hierarchical_pairwise_align`.
+    Shows the spatial layout of clusters, scales/translates sliceA rigidly onto sliceB 
+    based on the cluster-OT plan, and draws mapping connections.
+
+    Args:
+        sliceA: Source AnnData slice.
+        sliceB: Target AnnData slice.
+        details: The secondary dictionary returned directly by `hierarchical_pairwise_align` when `return_details=True`.
+    """
+    coarse_plan = details['coarse_plan']
+    cluster_labels_A = details['cluster_labels_A']
+    cluster_labels_B = details['cluster_labels_B']
+    
+    coords_A = sliceA.obsm['spatial']
+    coords_B = sliceB.obsm['spatial']
+    
+    unique_A = np.unique(cluster_labels_A)
+    unique_B = np.unique(cluster_labels_B)
+    
+    centroids_A = np.zeros((len(unique_A), 2))
+    for idx, c in enumerate(unique_A):
+        centroids_A[idx] = coords_A[cluster_labels_A == c].mean(axis=0)
+        
+    centroids_B = np.zeros((len(unique_B), 2))
+    for idx, c in enumerate(unique_B):
+        centroids_B[idx] = coords_B[cluster_labels_B == c].mean(axis=0)
+
+    # Perform rigid Procrustes alignment on the clusters driven by the coarse transport plan
+    # Strip out dummy row/cols from coarse_plan if they exist (unbalanced matching budget padding)
+    clean_plan = coarse_plan[:len(unique_A), :len(unique_B)]
+    
+    cen_A_aligned, cen_B_aligned, R, src_center, t = generalized_procrustes_analysis(
+        centroids_A, centroids_B, clean_plan, 
+        output_params=True, matrix=True, allow_reflection=True
+    )
+    
+    # Align the full coordinate set of slice A for visual context
+    coords_A_aligned = coords_A @ R.T + t
+    
+    plt.figure(figsize=(10, 10))
+    slice_colors = ['#e41a1c', '#377eb8']
+    
+    # Plot background generic cells (faint)
+    plt.scatter(coords_A_aligned[:, 0], coords_A_aligned[:, 1], s=2, alpha=0.15, label='Slice A cells', c=slice_colors[0])
+    plt.scatter(coords_B[:, 0], coords_B[:, 1], s=2, alpha=0.15, label='Slice B cells', c=slice_colors[1])
+    
+    # Plot matched cluster centroids
+    plt.scatter(cen_A_aligned[:, 0], cen_A_aligned[:, 1], s=60, edgecolors='white', linewidths=1, label='Slice A clusters', c=slice_colors[0], marker='o', zorder=5)
+    plt.scatter(cen_B_aligned[:, 0], cen_B_aligned[:, 1], s=60, edgecolors='white', linewidths=1, label='Slice B clusters', c=slice_colors[1], marker='s', zorder=5)
+    
+    if show_lines:
+        # Draw assignment lines matching clusters
+        # Normalize plan for line visibility
+        max_val = np.max(clean_plan)
+        if max_val > 0:
+            norm_plan = clean_plan / max_val
+            for i in range(clean_plan.shape[0]):
+                for j in range(clean_plan.shape[1]):
+                    weight = norm_plan[i, j]
+                    if weight > 0.05:  # Filter out noise traces
+                        plt.plot(
+                            [cen_A_aligned[i, 0], cen_B_aligned[j, 0]],
+                            [cen_A_aligned[i, 1], cen_B_aligned[j, 1]],
+                            c='gray', alpha=weight * line_alpha, lw=weight * line_width * 3, zorder=1
+                        )
+                        
+    plt.axis("equal")
+    plt.axis("off")
+    plt.title("Hierarchical Cluster-Level Unbalanced Alignment", fontsize=14)
+    
+    # Custom elegant legend
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), markerscale=2, loc='best')
+    
+    plt.show()
+

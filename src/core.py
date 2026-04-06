@@ -222,11 +222,10 @@ def pairwise_align(
     if G_init is not None:
         if unbalanced and (_has_dummy_src or _has_dummy_tgt):
             # Pad user-provided (ns x nt) G_init to augmented dims
-            _gi = np.array(G_init, dtype=np.float64)
-            _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
+            _gi = to_backend(G_init, nx, data_type=data_type)
+            _gi_aug = nx.zeros((_ns_aug, _nt_aug), type_as=_gi)
             _gi_aug[:ns, :nt] = _gi
             G_init = _gi_aug
-        G_init = to_backend(G_init, nx, data_type=data_type)
     
     pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
@@ -632,12 +631,10 @@ def calculate_cell_type_mismatch(sliceA, sliceB):
     return cell_type_mismatch
 
 
-def calculate_neighborhood_dissimilarity(
+def neighborhood_distributions(
     sliceA,
     sliceB,
     radius=None,
-    nx=None,
-    data_type=np.float32,
     eps=1e-8,
     radii=None,
     radius_k=6,
@@ -716,14 +713,54 @@ def calculate_neighborhood_dissimilarity(
     featA = featA / featA.sum(axis=1, keepdims=True)
     featB = featB / featB.sum(axis=1, keepdims=True)
 
-    if nx is None:
-        return featA, featB
+    return featA, featB
+
+
+def calculate_neighborhood_dissimilarity(
+    sliceA,
+    sliceB,
+    radius=None,
+    nx=None,
+    data_type=np.float32,
+    eps=1e-8,
+    radii=None,
+    radius_k=6,
+    radius_multipliers=(2.5, 4.0, 6.0),
+    n_shells=3,
+    harmonics=(0, 1, 2),
+    harmonic_weights=None,
+    distance_decay="linear",
+    sigma=None,
+    include_self=False,
+    spatial_key="spatial",
+    label_key="cell_type_annot",
+):
+    """
+    Neighborhood dissimilarity using multiscale rotation-invariant descriptors
+    and proper re-normalization before Jensen-Shannon distance.
+    """
+    featA, featB = neighborhood_distributions(
+        sliceA,
+        sliceB,
+        radius=radius,
+        eps=eps,
+        radii=radii,
+        radius_k=radius_k,
+        radius_multipliers=radius_multipliers,
+        n_shells=n_shells,
+        harmonics=harmonics,
+        harmonic_weights=harmonic_weights,
+        distance_decay=distance_decay,
+        sigma=sigma,
+        include_self=include_self,
+        spatial_key=spatial_key,
+        label_key=label_key,
+    )
 
     featA = to_backend(featA, nx, data_type=data_type)
     featB = to_backend(featB, nx, data_type=data_type)
 
     return jensenshannon_divergence_backend(featA, featB)
-
 
 
 def _safe_normalize_vector(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -732,7 +769,6 @@ def _safe_normalize_vector(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     if s <= eps:
         return np.full_like(x, 1.0 / max(len(x), 1), dtype=np.float64)
     return x / s
-
 
 
 def _normalize_cost_matrix(M: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -749,7 +785,6 @@ def _normalize_cost_matrix(M: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     out = (M - lo) / (hi - lo)
     out[~finite] = 1.0
     return out
-
 
 
 def _pairwise_js_distance(P: np.ndarray, Q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -769,13 +804,11 @@ def _pairwise_js_distance(P: np.ndarray, Q: np.ndarray, eps: float = 1e-12) -> n
     return js
 
 
-
 def _extract_embedding_matrix(adata: AnnData, use_rep: Optional[str] = None) -> np.ndarray:
     X = extract_data_matrix(adata, use_rep)
     if hasattr(X, 'toarray'):
         return np.asarray(X.toarray(), dtype=np.float64)
     return np.asarray(X, dtype=np.float64)
-
 
 
 def _compute_local_density(adata: AnnData, k: int = 6, spatial_key: str = 'spatial', eps: float = 1e-8) -> np.ndarray:
@@ -790,7 +823,6 @@ def _compute_local_density(adata: AnnData, k: int = 6, spatial_key: str = 'spati
     density = 1.0 / np.maximum(local_scale, eps)
     med = np.median(density[density > 0]) if np.any(density > 0) else 1.0
     return density / max(med, eps)
-
 
 
 def _farthest_point_seeds(coords: np.ndarray, n_seeds: int) -> np.ndarray:
@@ -809,7 +841,6 @@ def _farthest_point_seeds(coords: np.ndarray, n_seeds: int) -> np.ndarray:
         if candidate not in seeds:
             seeds.append(candidate)
     return np.asarray(seeds, dtype=np.int32)
-
 
 
 def _build_spatial_knn_graph(coords: np.ndarray, k_neighbors: int = 10) -> Tuple[List[List[int]], List[List[float]], List[Tuple[int, int, float]]]:
@@ -849,7 +880,6 @@ def _build_spatial_knn_graph(coords: np.ndarray, k_neighbors: int = 10) -> Tuple
     return neighbors, weights, edge_list
 
 
-
 def _build_supercell_features(
     adata: AnnData,
     use_rep: Optional[str] = None,
@@ -884,7 +914,6 @@ def _build_supercell_features(
         'feature_matrix': feat,
         'cell_types': unique_types,
     }
-
 
 
 def _balanced_region_growing_labels(
@@ -957,7 +986,6 @@ def _balanced_region_growing_labels(
     return assigned.astype(np.int32)
 
 
-
 def _cluster_mean_rows(X: np.ndarray, labels: np.ndarray, n_clusters: int) -> np.ndarray:
     out = np.zeros((n_clusters, X.shape[1]), dtype=np.float64)
     for c in range(n_clusters):
@@ -965,7 +993,6 @@ def _cluster_mean_rows(X: np.ndarray, labels: np.ndarray, n_clusters: int) -> np
         if idx.size:
             out[c] = X[idx].mean(axis=0)
     return out
-
 
 
 def _compute_cluster_statistics(
@@ -1050,7 +1077,6 @@ def _compute_cluster_statistics(
     }
 
 
-
 def _compute_cluster_feature_cost(
     stats_A: Dict[str, Any],
     stats_B: Dict[str, Any],
@@ -1074,7 +1100,6 @@ def _compute_cluster_feature_cost(
     return _normalize_cost_matrix(linear_cost)
 
 
-
 def _compute_numpy_cell_costs(
     sliceA: AnnData,
     sliceB: AnnData,
@@ -1085,22 +1110,26 @@ def _compute_numpy_cell_costs(
     epsilon: float = 1e-6,
     spatial_key: str = 'spatial',
     label_key: str = 'cell_type_annot',
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    coords_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
-    coords_B = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)
-    D_A = euclidean_distances(coords_A, coords_A)
-    D_B = euclidean_distances(coords_B, coords_B)
+    use_gpu: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:    
+    use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
+    
+    D_A = calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, eps=epsilon)[0]
+    D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, eps=epsilon)[1]
+    
     scale = max(estimate_characteristic_spacing(sliceA, spatial_key=spatial_key), estimate_characteristic_spacing(sliceB, spatial_key=spatial_key), epsilon)
-    D_A /= scale
-    D_B /= scale
+    D_A = D_A / scale
+    D_B = D_B / scale
 
     expr_cost = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps=epsilon)
     type_cost = calculate_cell_type_mismatch(sliceA, sliceB)
-    nbr_A, nbr_B = calculate_neighborhood_dissimilarity(
+
+    # Use GPU for neighborhood dissimilarity if requested
+    nbr_cost = calculate_neighborhood_dissimilarity(
         sliceA,
         sliceB,
         radius=radius,
-        nx=None,
+        nx=nx,
         data_type=np.float32,
         eps=epsilon,
         radii=None,
@@ -1110,11 +1139,16 @@ def _compute_numpy_cell_costs(
         harmonics=(0, 1, 2),
         harmonic_weights={1: 1.25, 2: 1.5},
         distance_decay='linear',
+        sigma=None,
         include_self=False,
         spatial_key=spatial_key,
         label_key=label_key,
     )
-    nbr_cost = _pairwise_js_distance(nbr_A + epsilon, nbr_B + epsilon)
+    
+    if hasattr(nbr_cost, 'cpu'):
+        nbr_cost = nx.to_numpy(nbr_cost)
+    elif hasattr(nbr_cost, 'numpy'):
+        nbr_cost = nbr_cost.numpy()
 
     M = (1.0 - beta) * _normalize_cost_matrix(expr_cost) + beta * _normalize_cost_matrix(type_cost)
     M += gamma * _normalize_cost_matrix(nbr_cost)
@@ -1123,20 +1157,24 @@ def _compute_numpy_cell_costs(
 
 
 
-def _sinkhorn_project_kernel(K: np.ndarray, a: np.ndarray, b: np.ndarray, n_iter: int = 50, eps: float = 1e-12) -> np.ndarray:
-    K = np.maximum(np.asarray(K, dtype=np.float64), eps)
-    a = _safe_normalize_vector(a, eps=eps)
-    b = _safe_normalize_vector(b, eps=eps)
-    u = np.ones_like(a)
-    v = np.ones_like(b)
+def _sinkhorn_project_kernel(K: np.ndarray, a: np.ndarray, b: np.ndarray, n_iter: int = 50, eps: float = 1e-12, use_gpu: bool = False):
+    use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
+
+    K = to_backend(np.maximum(np.asarray(K, dtype=np.float64), eps), nx)
+    a = to_backend(_safe_normalize_vector(a, eps=eps), nx)
+    b = to_backend(_safe_normalize_vector(b, eps=eps), nx)
+    u = nx.ones(a.shape, type_as=a)
+    v = nx.ones(b.shape, type_as=b)
     for _ in range(n_iter):
-        Kv = K @ v
-        Kv = np.maximum(Kv, eps)
+        Kv = nx.dot(K, v)
+        Kv = nx.maximum(Kv, eps)
         u = a / Kv
-        KTu = K.T @ u
-        KTu = np.maximum(KTu, eps)
+        KTu = nx.dot(K.T, u)
+        KTu = nx.maximum(KTu, eps)
         v = b / KTu
-    return (u[:, None] * K) * v[None, :]
+    
+    res = (u[:, None] * K) * v[None, :]
+    return res
 
 
 
@@ -1158,6 +1196,7 @@ def _build_cell_level_init_from_cluster_plan(
     spatial_sigma_scale: float = 2.0,
     feature_tau: float = 0.5,
     eps: float = 1e-12,
+    **kwargs,
 ) -> np.ndarray:
     nA, nB = feature_cost.shape
     G = np.zeros((nA, nB), dtype=np.float64)
@@ -1198,7 +1237,7 @@ def _build_cell_level_init_from_cluster_plan(
     if col_zero.size:
         G[:, col_zero] += fallback[:, col_zero]
 
-    return _sinkhorn_project_kernel(G + eps, a, b, n_iter=75, eps=eps)
+    return _sinkhorn_project_kernel(G + eps, a, b, n_iter=75, eps=eps, use_gpu=kwargs.get('use_gpu', False))
 
 
 
@@ -1233,6 +1272,7 @@ def hierarchical_pairwise_align(
     unbalanced: bool = True,
     verbose: bool = False,
     return_details: bool = False,
+    use_gpu: bool = True,
     **kwargs,
 ) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], Dict[str, Any]]]:
     """
@@ -1420,7 +1460,7 @@ def hierarchical_pairwise_align(
 
     D_A, D_B, M_fine = _compute_numpy_cell_costs(
         sliceA, sliceB, beta=beta, gamma=gamma, radius=radius, use_rep=use_rep, epsilon=1e-6,
-        spatial_key=spatial_key, label_key=label_key,
+        spatial_key=spatial_key, label_key=label_key, use_gpu=use_gpu
     )
 
     if a_distribution is None:
@@ -1449,6 +1489,7 @@ def hierarchical_pairwise_align(
         min_mass_fraction=init_min_mass_fraction,
         spatial_sigma_scale=init_spatial_sigma_scale,
         feature_tau=init_feature_tau,
+        use_gpu=use_gpu
     )
 
     fine_out = pairwise_align(
@@ -1466,6 +1507,7 @@ def hierarchical_pairwise_align(
         verbose=verbose,
         numItermax=fine_max_iter,
         numItermaxEmd=fine_max_iter_ot,
+        use_gpu=use_gpu,
         **kwargs
     )
 

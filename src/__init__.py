@@ -9,7 +9,8 @@ from .metrices import (
 )
 
 from .visualize import (
-    visualize_alignment
+    visualize_alignment,
+    visualize_cluster_alignment
 )
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     'hierarchical_pairwise_align',
     'calculate_performance_metrics',
     'calculate_forward_reverse_compactness',
-    'visualize_alignment'
+    'visualize_alignment',
+    'visualize_cluster_alignment'
 ]
