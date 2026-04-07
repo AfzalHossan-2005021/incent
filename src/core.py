@@ -23,6 +23,7 @@ def hierarchical_pairwise_align(
     numItermax: int = 100000,
     use_gpu: bool = True,
     resolution: float = 1.0,
+    macro_section_mass_pct: float = 0.85,
     spatial_key: str = "spatial",
     use_rep: Optional[str] = "X_pca",
     label_key: str = "cell_type_annot",
@@ -42,8 +43,8 @@ def hierarchical_pairwise_align(
     Returns the cell-level alignment pi.
     """
     print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method='knn', k=6)
-    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method='knn', k=6)
+    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method='knn', k=6, seed=rand_seed)
+    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method='knn', k=6, seed=rand_seed)
     
     print(f"Slice A: {len(np.unique(labelsA))} clusters")
     print(f"Slice B: {len(np.unique(labelsB))} clusters")
@@ -117,7 +118,7 @@ def hierarchical_pairwise_align(
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
     idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
-        sliceA, sliceB, labelsA, labelsB, Pi_cluster, 
+        sliceA, sliceB, labelsA, labelsB, Pi_cluster, mass_pct=macro_section_mass_pct,
         spatial_key=spatial_key, extension_hops=2
     )
     

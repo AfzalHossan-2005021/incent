@@ -222,7 +222,7 @@ def blockwise_g_init(labels_A, labels_B, Pi_cluster):
     return G_init
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', extension_hops=2):
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, mass_pct=0.85, spatial_key='spatial', extension_hops=2):
     """
     Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
     Returns the cell indices for the extended macro-region in both slices,
@@ -288,12 +288,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     np.fill_diagonal(adj_A, True)
     np.fill_diagonal(adj_B, True)
 
-    # 3. Select ENLARGED subset of transport masses (Top 50%)
+    # 3. Select ENLARGED subset of transport masses (Top {mass_pct} of total mass)
     flat_pi = Pi_cluster.flatten()
     sorted_idx = np.argsort(flat_pi)[::-1]
     sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.5)
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * mass_pct)
     selected_flat_idx = sorted_idx[:cutoff_idx+1]
     
     matches = []
