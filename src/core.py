@@ -81,7 +81,7 @@ def hierarchical_pairwise_align(
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = fused_gromov_wasserstein_incent(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
+    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
     
     if visualize_clusters:
         try:

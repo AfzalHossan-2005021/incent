@@ -331,6 +331,10 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if len(core_cells_A) == 0 or len(core_cells_B) == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
     
+    # Compute initial barycenters of the starting core components
+    bary_A = np.mean(centroids_A[strong_A], axis=0)
+    bary_B = np.mean(centroids_B[strong_B], axis=0)
+
     # 5. Cluster-level Topological Extension
     for _ in range(extension_hops):
         # Find all topological neighbors of the current strong components
@@ -344,11 +348,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         if not candidates_A or not candidates_B:
             break
             
-        # Compute barycenters of the current strong components
-        bary_A = np.mean(centroids_A[strong_A], axis=0)
-        bary_B = np.mean(centroids_B[strong_B], axis=0)
-        
-        # Find the valid matching pair that is closest to the barycenters
+        # Find the valid matching pair that is closest to the initial barycenters
         best_pair = None
         best_dist = float('inf')
         
