@@ -148,13 +148,30 @@ def hierarchical_pairwise_align(
             print(f"Sub-selection visualization failed: {e}")
 
     # Run base OT on the full slices, but use the selection and distances to bias G_init
-    sigma_A = max(1e-5, np.max(dist_A[idx_A]) / 2.0)
-    sigma_B = max(1e-5, np.max(dist_B[idx_B]) / 2.0)
+    # Compute blockwise initial alignment based on cluster transport
+    block_G = blockwise_g_init(labelsA, labelsB, Pi_cluster)
+
+    # Ignore exact zero distances (inside the core) to calculate a sensible deviation for the outliers
+    d_A_nz = dist_A[dist_A > 0]
+    d_B_nz = dist_B[dist_B > 0]
+
+    # Use max distance of non-core cells to set a smooth decay radius . Using percentile to be robust against spurious single-cell outliers.
+    sigma_A = max(1e-2, np.percentile(d_A_nz, 95) / 2.0) if len(d_A_nz) > 0 else 1.0
+    sigma_B = max(1e-2, np.percentile(d_B_nz, 95) / 2.0) if len(d_B_nz) > 0 else 1.0
     
-    weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
-    weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
+    decay_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
+    decay_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
     
-    G_init = np.outer(weight_A, weight_B)
+    spatial_decay = np.outer(decay_A, decay_B)
+
+    # Multiply cluster-level block map by the spatial decay boundary
+    G_init = block_G * spatial_decay
+    G_init += 1e-8  # Prevent complete zeros
+    
+    # Normalize row-wise to give a valid dense uniform-like distribution across the sparse valid matrix
+    N = sliceA.shape[0]
+    row_sums = G_init.sum(axis=1, keepdims=True)
+    G_init = G_init / row_sums / N
     G_init /= np.sum(G_init)
 
     print("--- [HOT] Step 6: Executing Base OT on Full Slices with Biased Initialization ---")
