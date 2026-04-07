@@ -11,7 +11,7 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
 from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init, extract_continuous_macro_section
-from .visualize import visualize_alignment
+
 
 def hierarchical_pairwise_align(
     sliceA: AnnData,
@@ -158,47 +158,42 @@ def hierarchical_pairwise_align(
         except Exception as e:
             print(f"Sub-selection visualization failed: {e}")
 
+    # Only run base OT on the selected continuous matching blocks
+    sub_sliceA = sliceA[idx_A].copy()
+    sub_sliceB = sliceB[idx_B].copy()
+
     # The selected sections will have an initial plan that decays based on distance from the core
-    N, M = sliceA.shape[0], sliceB.shape[0]
-    G_init = None
-    if N > 0 and M > 0:
-        # Avoid division by zero and limit decay strictly
-        dist_A_non_zero = dist_A[dist_A > 0]
-        dist_B_non_zero = dist_B[dist_B > 0]
+    sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
+    G_init_sub = None
+    if sub_N > 0 and sub_M > 0:
+        sigma_A = max(1e-5, np.max(dist_A) / 2.0)
+        sigma_B = max(1e-5, np.max(dist_B) / 2.0)
         
-        sigma_A = max(1e-5, np.percentile(dist_A_non_zero, 95) / 2.0) if len(dist_A_non_zero) > 0 else 1.0
-        sigma_B = max(1e-5, np.percentile(dist_B_non_zero, 95) / 2.0) if len(dist_B_non_zero) > 0 else 1.0
+        weight_A = np.exp(- (dist_A[idx_A]**2) / (2 * sigma_A**2))
+        weight_B = np.exp(- (dist_B[idx_B]**2) / (2 * sigma_B**2))
         
-        weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
-        weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
-        
-        # Prioritize the selected cores
-        weight_A[idx_A] *= 10.0
-        weight_B[idx_B] *= 10.0
-        
-        G_init = np.outer(weight_A, weight_B)
-        # Row normalize
-        row_sums = G_init.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0
-        G_init /= row_sums
-        # Distribution normalize
-        G_init /= np.sum(G_init)
+        G_init_sub = np.outer(weight_A, weight_B)
+        G_init_sub /= np.sum(G_init_sub)
 
-    visualize_alignment(sliceA, sliceB, G_init)
-
-    print("--- [HOT] Step 6: Executing Base OT on Full Sections with G_init Prior ---")
-    pi_full = pairwise_align(
-        sliceA=sliceA,
-        sliceB=sliceB,
+    print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
+    pi_sub = pairwise_align(
+        sliceA=sub_sliceA,
+        sliceB=sub_sliceB,
         alpha=alpha,
         beta=beta,
         gamma=gamma,
         reg_compact=reg_compact,
-        G_init=G_init,
+        G_init=G_init_sub,
         numItermax=numItermax,
         use_gpu=use_gpu,
         **kwargs
     )
+
+    # Rest of the region will have zero initial/final plan
+    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]))
+    if sub_N > 0 and sub_M > 0:
+        grid_A, grid_B = np.ix_(idx_A, idx_B)
+        pi_full[grid_A, grid_B] = pi_sub
 
     return pi_full
 
