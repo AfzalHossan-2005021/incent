@@ -23,6 +23,7 @@ def hierarchical_pairwise_align(
     numItermax: int = 100000,
     use_gpu: bool = True,
     cluster_method: str = 'delaunay',
+    cluster_extension_hops: int = 5,
     resolution: float = 1.0,
     macro_section_mass_pct: float = 0.8,
     spatial_key: str = "spatial",
@@ -119,7 +120,7 @@ def hierarchical_pairwise_align(
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
     idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
         sliceA, sliceB, labelsA, labelsB, Pi_cluster, mass_pct=macro_section_mass_pct,
-        spatial_key=spatial_key, extension_hops=2
+        spatial_key=spatial_key, extension_hops=cluster_extension_hops
     )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
