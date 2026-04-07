@@ -123,10 +123,12 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
     C1_sq = C1 ** 2
     C2_sq = C2 ** 2
 
+    # Precompute constants for general GW (square loss)
+    constC = nx.dot(C1_sq, p)[:, None] + nx.dot(q, C2_sq)[None, :]
+
     def f(G):
-        # Base Gromov-Wasserstein term
-        # Avoid G @ G.T and G.T @ G to save massive memory allocations (O(n x n) and O(m x m))
-        gw_loss = nx.sum(G * nx.dot(C1, G)) + nx.sum(G * nx.dot(G, C2))
+        # General GW loss
+        gw_loss = nx.sum(constC * G) - 2 * nx.sum(nx.dot(C1, nx.dot(G, C2)) * G)
         # Form A Compactness penalty requires squared distances for precise variance
         if reg_compact > 0:
             compact_fwd = 0.5 * nx.sum((p_inv[:, None] * G) @ C2_sq * G)
@@ -135,8 +137,8 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         return gw_loss
 
     def df(G):
-        # Gradient of GW term
-        gw_grad = 2 * (nx.dot(C1, G) + nx.dot(G, C2))
+        # General GW gradient
+        gw_grad = constC - 2 * nx.dot(C1, nx.dot(G, C2))
         # Gradient of Form A Compactness term
         if reg_compact > 0:
             grad_fwd = (p_inv[:, None] * G) @ C2_sq
