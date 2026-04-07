@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union
 from scipy.spatial import cKDTree
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
-from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd, to_backend
+from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
 from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init, extract_continuous_macro_section
 
@@ -166,6 +166,11 @@ def hierarchical_pairwise_align(
 
     # Multiply cluster-level block map by the spatial decay boundary
     G_init = block_G * spatial_decay
+    
+    # Ensure the selected core component receives the absolute highest relative weight
+    if len(idx_A) > 0 and len(idx_B) > 0:
+        G_init[np.ix_(idx_A, idx_B)] *= 10.0
+        
     G_init += 1e-8  # Prevent complete zeros
     
     # Normalize row-wise to give a valid dense uniform-like distribution across the sparse valid matrix
