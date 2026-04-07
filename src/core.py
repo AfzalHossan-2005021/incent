@@ -133,65 +133,67 @@ def hierarchical_pairwise_align(
             ptsA = sliceA.obsm[spatial_key]
             ptsB = sliceB.obsm[spatial_key]
             
-            ax1.scatter(ptsA[:,0], ptsA[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
-            ax1.scatter(ptsA[idx_A,0], ptsA[idx_A,1], c=dist_A[idx_A], cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
-            ax1.set_title("Slice A: Macro Selection")
-            ax1.axis('equal')
+            # Highlight chosen core dynamically
+            core_A_mask = np.zeros(sliceA.shape[0], dtype=bool)
+            core_A_mask[idx_A] = True
+            core_B_mask = np.zeros(sliceB.shape[0], dtype=bool)
+            core_B_mask[idx_B] = True
             
-            ax2.scatter(ptsB[:,0], ptsB[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
-            ax2.scatter(ptsB[idx_B,0], ptsB[idx_B,1], c=dist_B[idx_B], cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
-            ax2.set_title("Slice B: Macro Selection")
+            # Plot distance out from core (distance is 0 inside core)
+            sc1 = ax1.scatter(ptsA[:,0], ptsA[:,1], c=dist_A, cmap='viridis_r', s=4, alpha=0.9)
+            ax1.scatter(ptsA[core_A_mask,0], ptsA[core_A_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
+            ax1.set_title("Slice A: Macro Selection & Distances")
+            ax1.axis('equal')
+            ax1.legend()
+            fig.colorbar(sc1, ax=ax1, label='Distance to Core', fraction=0.046, pad=0.04)
+            
+            sc2 = ax2.scatter(ptsB[:,0], ptsB[:,1], c=dist_B, cmap='viridis_r', s=4, alpha=0.9)
+            ax2.scatter(ptsB[core_B_mask,0], ptsB[core_B_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
+            ax2.set_title("Slice B: Macro Selection & Distances")
             ax2.axis('equal')
+            ax2.legend()
+            fig.colorbar(sc2, ax=ax2, label='Distance to Core', fraction=0.046, pad=0.04)
             
             plt.show()
         except Exception as e:
             print(f"Sub-selection visualization failed: {e}")
 
-    # Run base OT on the full slices, but use the selection and distances to bias G_init
-    # Compute blockwise initial alignment based on cluster transport
-    block_G = blockwise_g_init(labelsA, labelsB, Pi_cluster)
+        # Only run base OT on the selected continuous matching blocks
+    sub_sliceA = sliceA[idx_A].copy()
+    sub_sliceB = sliceB[idx_B].copy()
 
-    # Ignore exact zero distances (inside the core) to calculate a sensible deviation for the outliers
-    d_A_nz = dist_A[dist_A > 0]
-    d_B_nz = dist_B[dist_B > 0]
-
-    # Use max distance of non-core cells to set a smooth decay radius . Using percentile to be robust against spurious single-cell outliers.
-    sigma_A = max(1e-2, np.percentile(d_A_nz, 95) / 2.0) if len(d_A_nz) > 0 else 1.0
-    sigma_B = max(1e-2, np.percentile(d_B_nz, 95) / 2.0) if len(d_B_nz) > 0 else 1.0
-    
-    decay_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
-    decay_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
-    
-    spatial_decay = np.outer(decay_A, decay_B)
-
-    # Multiply cluster-level block map by the spatial decay boundary
-    G_init = block_G * spatial_decay
-    
-    # Ensure the selected core component receives the absolute highest relative weight
-    if len(idx_A) > 0 and len(idx_B) > 0:
-        G_init[np.ix_(idx_A, idx_B)] *= 10.0
+    # The selected sections will have an initial plan that decays based on distance from the core
+    sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
+    G_init_sub = None
+    if sub_N > 0 and sub_M > 0:
+        sigma_A = max(1e-5, np.max(dist_A) / 2.0)
+        sigma_B = max(1e-5, np.max(dist_B) / 2.0)
         
-    G_init += 1e-8  # Prevent complete zeros
-    
-    # Normalize row-wise to give a valid dense uniform-like distribution across the sparse valid matrix
-    N = sliceA.shape[0]
-    row_sums = G_init.sum(axis=1, keepdims=True)
-    G_init = G_init / row_sums / N
-    G_init /= np.sum(G_init)
+        weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
+        weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
+        
+        G_init_sub = np.outer(weight_A, weight_B)
+        G_init_sub /= np.sum(G_init_sub)
 
-    print("--- [HOT] Step 6: Executing Base OT on Full Slices with Biased Initialization ---")
-    pi_full = pairwise_align(
-        sliceA=sliceA,
-        sliceB=sliceB,
+    print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
+    pi_sub = pairwise_align(
+        sliceA=sub_sliceA,
+        sliceB=sub_sliceB,
         alpha=alpha,
         beta=beta,
         gamma=gamma,
         reg_compact=reg_compact,
-        G_init=G_init,
+        G_init=G_init_sub,
         numItermax=numItermax,
         use_gpu=use_gpu,
         **kwargs
     )
+
+    # Rest of the region will have zero initial/final plan
+    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]))
+    if sub_N > 0 and sub_M > 0:
+        grid_A, grid_B = np.ix_(idx_A, idx_B)
+        pi_full[grid_A, grid_B] = pi_sub
 
     return pi_full
 
@@ -201,7 +203,7 @@ def pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    reg_compact: float = 0.0,
+    reg_compact: float = 0.01,
     armijo: bool = True,
     radius: Optional[float] = None,
     use_rep: Optional[str] = None,
