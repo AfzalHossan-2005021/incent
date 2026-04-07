@@ -331,27 +331,49 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if len(core_cells_A) == 0 or len(core_cells_B) == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
     
-    # 5. Cell-level Physical Distance Extension
-    tree_A = cKDTree(coords_A[core_cells_A])
-    tree_B = cKDTree(coords_B[core_cells_B])
+    # 5. Cluster-level Topological Extension
+    for _ in range(extension_hops):
+        # Find all topological neighbors of the current strong components
+        neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
+        neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
+        
+        # Exclude clusters already in the strong set
+        candidates_A = [c for c in neighbors_A if c not in strong_A and valid_A[c]]
+        candidates_B = [c for c in neighbors_B if c not in strong_B and valid_B[c]]
+        
+        if not candidates_A or not candidates_B:
+            break
+            
+        # Find the most confident matching pair among the candidates
+        best_pair = None
+        best_score = -1
+        
+        for pA in candidates_A:
+            for pB in candidates_B:
+                score = Pi_cluster[pA, pB]
+                if score > best_score:
+                    best_score = score
+                    best_pair = (pA, pB)
+                    
+        # Add the best pair if it has any non-zero matching mass
+        if best_pair is not None and best_score > 0:
+            strong_A.append(best_pair[0])
+            strong_B.append(best_pair[1])
+        else:
+            break
+
+    # Extract final cells based strictly on expanded cluster membership
+    idx_A = np.where(np.isin(labels_A, strong_A))[0]
+    idx_B = np.where(np.isin(labels_B, strong_B))[0]
+
+    # Compute physical distances from the newly expanded core to all cells
+    core_coords_A = coords_A[idx_A]
+    core_coords_B = coords_B[idx_B]
+
+    tree_A = cKDTree(core_coords_A)
+    tree_B = cKDTree(core_coords_B)
     
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
-    
-    # Compute dynamic extension radius
-    def compute_radius(coords_core):
-        if len(coords_core) > 1:
-            nn = NearestNeighbors(n_neighbors=min(6, len(coords_core))).fit(coords_core)
-            dists, _ = nn.kneighbors(coords_core)
-            median_dist = np.median(dists[:, 1:])
-            # 1 hop roughly equals the median neighbor distance
-            return median_dist * (extension_hops * 2.0)
-        return 5.0
-            
-    rad_A = compute_radius(coords_A[core_cells_A])
-    rad_B = compute_radius(coords_B[core_cells_B])
-    
-    idx_A = np.where(dist_A <= rad_A)[0]
-    idx_B = np.where(dist_B <= rad_B)[0]
     
     return idx_A, idx_B, dist_A, dist_B
