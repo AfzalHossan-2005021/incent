@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree, Delaunay
@@ -63,7 +65,7 @@ def build_spatial_graph(coords: np.ndarray, method: str = 'knn', k: int = 6, rad
 
 
 def cluster_cells_spatial(adata: AnnData, spatial_key: str = 'spatial', resolution: float = 1.0, 
-                          method: str = 'knn', k: int = 10, radius: float = None) -> np.ndarray:
+                          method: str = 'knn', k: int = 10, radius: float = None, seed: Optional[int] = 2005021) -> np.ndarray:
     """
     Clustering cells into contiguous supercells (mesoregions) using a spatial graph and Leiden.
     
@@ -75,6 +77,8 @@ def cluster_cells_spatial(adata: AnnData, spatial_key: str = 'spatial', resoluti
         resolution: Resolution parameter for Leiden. Higher = more/smaller clusters.
         method: Structure of spatial graph. 'knn', 'radius', or 'delaunay'.
         k: nearest neighbors.
+        radius: Distance threshold for 'radius' method.
+        seed: Random seed for reproducibility.
         
     Returns:
         Cluster labels from 0 to C-1.
@@ -94,7 +98,8 @@ def cluster_cells_spatial(adata: AnnData, spatial_key: str = 'spatial', resoluti
         g,
         leidenalg.RBConfigurationVertexPartition,
         weights='weight',
-        resolution_parameter=resolution
+        resolution_parameter=resolution,
+        seed=seed
     )
 
     labels = np.array(partition.membership)

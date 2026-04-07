@@ -30,8 +30,7 @@ def hierarchical_pairwise_align(
     w_type: float = 0.5,
     w_graph: float = 0.5,
     block_threshold: float = 1e-4,
-    penalty: float = 1e3,
-    use_mask: bool = True,
+    rand_seed: Optional[int] = 2005021,
     use_init: bool = True,
     visualize_clusters: bool = True,
     **kwargs
@@ -362,10 +361,10 @@ def pairwise_align(
                 a_vals[-1] = float(_w_dummy_src) / _budget
                 a = nx.from_numpy(a_vals)
             else:
-                a = nx.ones((ns,), type_as=np.array([1.0], dtype=np.float64)) / _budget
+                a = nx.from_numpy(np.ones(ns, dtype=np.float64) / _budget)
         else:
             # uniform distribution, a = array([1/n, 1/n, ...])
-            a = nx.ones((sliceA.shape[0],))/sliceA.shape[0]
+            a = nx.from_numpy(np.ones(sliceA.shape[0], dtype=np.float64) / sliceA.shape[0])
     else:
         if dummy_cell:
             raise ValueError("Custom a_distribution is not supported with dummy_cell=True.")
@@ -378,9 +377,9 @@ def pairwise_align(
                 b_vals[-1] = float(_w_dummy_tgt) / _budget
                 b = nx.from_numpy(b_vals)
             else:
-                b = nx.ones((nt,), type_as=np.array([1.0], dtype=np.float64)) / _budget
+                b = nx.from_numpy(np.ones(nt, dtype=np.float64) / _budget)
         else:
-            b = nx.ones((sliceB.shape[0],))/sliceB.shape[0]
+            b = nx.from_numpy(np.ones(sliceB.shape[0], dtype=np.float64) / sliceB.shape[0])
     else:
         if dummy_cell:
             raise ValueError("Custom b_distribution is not supported with dummy_cell=True.")
