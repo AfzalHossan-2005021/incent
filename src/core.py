@@ -23,7 +23,7 @@ def hierarchical_pairwise_align(
     numItermax: int = 100000,
     use_gpu: bool = True,
     cluster_method: str = 'delaunay',
-    cluster_extension_hops: int = 5,
+    cluster_extension_hops: int = 3,
     resolution: float = 1.0,
     macro_section_mass_pct: float = 0.8,
     spatial_key: str = "spatial",
@@ -81,7 +81,7 @@ def hierarchical_pairwise_align(
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     
     print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
+    Pi_cluster = fused_gromov_wasserstein_incent(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
     
     if visualize_clusters:
         try:
