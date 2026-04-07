@@ -354,4 +354,4 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     idx_A = np.where(dist_A <= rad_A)[0]
     idx_B = np.where(dist_B <= rad_B)[0]
     
-    return idx_A, idx_B, dist_A[idx_A], dist_B[idx_B]
+    return idx_A, idx_B, dist_A, dist_B

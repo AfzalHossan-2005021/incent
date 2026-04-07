@@ -33,7 +33,6 @@ def hierarchical_pairwise_align(
     w_graph: float = 0.5,
     block_threshold: float = 1e-4,
     rand_seed: Optional[int] = 2005021,
-    use_init: bool = True,
     visualize_clusters: bool = True,
     **kwargs
 ):
@@ -134,12 +133,12 @@ def hierarchical_pairwise_align(
             ptsB = sliceB.obsm[spatial_key]
             
             ax1.scatter(ptsA[:,0], ptsA[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
-            ax1.scatter(ptsA[idx_A,0], ptsA[idx_A,1], c=dist_A, cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
+            ax1.scatter(ptsA[idx_A,0], ptsA[idx_A,1], c=dist_A[idx_A], cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
             ax1.set_title("Slice A: Macro Selection")
             ax1.axis('equal')
             
             ax2.scatter(ptsB[:,0], ptsB[:,1], c='lightgrey', s=2, alpha=0.5, label='Discarded')
-            ax2.scatter(ptsB[idx_B,0], ptsB[idx_B,1], c=dist_B, cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
+            ax2.scatter(ptsB[idx_B,0], ptsB[idx_B,1], c=dist_B[idx_B], cmap='viridis', s=4, alpha=0.9, label='Selected Core+Ext')
             ax2.set_title("Slice B: Macro Selection")
             ax2.axis('equal')
             
@@ -147,42 +146,29 @@ def hierarchical_pairwise_align(
         except Exception as e:
             print(f"Sub-selection visualization failed: {e}")
 
-    # Only run base OT on the selected continuous matching blocks
-    sub_sliceA = sliceA[idx_A].copy()
-    sub_sliceB = sliceB[idx_B].copy()
+    # Run base OT on the full slices, but use the selection and distances to bias G_init
+    sigma_A = max(1e-5, np.max(dist_A[idx_A]) / 2.0)
+    sigma_B = max(1e-5, np.max(dist_B[idx_B]) / 2.0)
+    
+    weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
+    weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
+    
+    G_init = np.outer(weight_A, weight_B)
+    G_init /= np.sum(G_init)
 
-    # The selected sections will have an initial plan that decays based on distance from the core
-    sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
-    G_init_sub = None
-    if use_init and sub_N > 0 and sub_M > 0:
-        sigma_A = max(1e-5, np.max(dist_A) / 2.0)
-        sigma_B = max(1e-5, np.max(dist_B) / 2.0)
-        
-        weight_A = np.exp(- (dist_A**2) / (2 * sigma_A**2))
-        weight_B = np.exp(- (dist_B**2) / (2 * sigma_B**2))
-        
-        G_init_sub = np.outer(weight_A, weight_B)
-        G_init_sub /= np.sum(G_init_sub)
-
-    print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
-    pi_sub = pairwise_align(
-        sliceA=sub_sliceA,
-        sliceB=sub_sliceB,
+    print("--- [HOT] Step 6: Executing Base OT on Full Slices with Biased Initialization ---")
+    pi_full = pairwise_align(
+        sliceA=sliceA,
+        sliceB=sliceB,
         alpha=alpha,
         beta=beta,
         gamma=gamma,
         reg_compact=reg_compact,
-        G_init=G_init_sub,
+        G_init=G_init,
         numItermax=numItermax,
         use_gpu=use_gpu,
         **kwargs
     )
-
-    # Rest of the region will have zero initial/final plan
-    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]))
-    if sub_N > 0 and sub_M > 0:
-        grid_A, grid_B = np.ix_(idx_A, idx_B)
-        pi_full[grid_A, grid_B] = pi_sub
 
     return pi_full
 
