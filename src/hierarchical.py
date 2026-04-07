@@ -344,19 +344,32 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         if not candidates_A or not candidates_B:
             break
             
-        # Find the most confident matching pair among the candidates
+        # Compute barycenters of the current strong components
+        bary_A = np.mean(centroids_A[strong_A], axis=0)
+        bary_B = np.mean(centroids_B[strong_B], axis=0)
+        
+        # Find the valid matching pair that is closest to the barycenters
         best_pair = None
-        best_score = -1
+        best_dist = float('inf')
+        
+        # Threshold to filter out nearly-zero noise entries from FGW
+        min_mass = np.max(Pi_cluster) * 1e-4 
         
         for pA in candidates_A:
             for pB in candidates_B:
-                score = Pi_cluster[pA, pB]
-                if score > best_score:
-                    best_score = score
-                    best_pair = (pA, pB)
+                # The pair must still have valid OT confidence to be aligned together!
+                if Pi_cluster[pA, pB] > min_mass:
+                    dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
+                    dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
                     
-        # Add the best pair if it has any non-zero matching mass
-        if best_pair is not None and best_score > 0:
+                    # We minimize the combined distance to the respective barycenters
+                    total_dist = dist_A + dist_B
+                    if total_dist < best_dist:
+                        best_dist = total_dist
+                        best_pair = (pA, pB)
+                    
+        # Add the best geometrically compact pair
+        if best_pair is not None:
             strong_A.append(best_pair[0])
             strong_B.append(best_pair[1])
         else:
