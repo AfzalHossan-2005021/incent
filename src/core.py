@@ -23,7 +23,7 @@ def hierarchical_pairwise_align(
     numItermax: int = 100000,
     use_gpu: bool = True,
     cluster_method: str = 'delaunay',
-    cluster_extension_hops: int = 10,
+    cluster_extension_hops: int = 5,
     resolution: float = 1.0,
     macro_section_mass_pct: float = 0.8,
     spatial_key: str = "spatial",
