@@ -258,38 +258,42 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             centroids_B[i] = coords_B[mask].mean(axis=0)
             valid_B[i] = True
 
-    # 2. Build Structural Adjacency Matrices for Clusters (k=6)
-    k_A = min(6, np.sum(valid_A))
+    # 2. Build Structural Adjacency Matrices for Clusters based on true spatial borders
+    # Using Delaunay triangulation to find neighboring clusters, then filter by valid clusters and Pi_cluster mass
+    # calculate a spatial graph using Delaunay triangulation on all the cells' coordinates. If a Delaunay triangle contains cells from two different clusters, it guarantees they are physically touching at their borders.
+    from scipy.spatial import Delaunay
+    
     adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
-    if k_A > 0:
-        nn_A = NearestNeighbors(n_neighbors=k_A).fit(centroids_A[valid_A])
-        ind_A = nn_A.kneighbors(centroids_A[valid_A], return_distance=False)
-        valid_idx_A = np.where(valid_A)[0]
-        for i, neighbors in enumerate(ind_A):
-            for n in neighbors:
-                adj_A[valid_idx_A[i], valid_idx_A[n]] = True
-                adj_A[valid_idx_A[n], valid_idx_A[i]] = True
-
-    k_B = min(6, np.sum(valid_B))
+    if N >= 3:
+        tri_A = Delaunay(coords_A)
+        for simplex in tri_A.simplices:
+            lab = labels_A[simplex]
+            for i in range(3):
+                for j in range(i+1, 3):
+                    if lab[i] != lab[j] and valid_A[lab[i]] and valid_A[lab[j]]:
+                        adj_A[lab[i], lab[j]] = True
+                        adj_A[lab[j], lab[i]] = True
+                        
     adj_B = np.zeros((num_clusters_B, num_clusters_B), dtype=bool)
-    if k_B > 0:
-        nn_B = NearestNeighbors(n_neighbors=k_B).fit(centroids_B[valid_B])
-        ind_B = nn_B.kneighbors(centroids_B[valid_B], return_distance=False)
-        valid_idx_B = np.where(valid_B)[0]
-        for i, neighbors in enumerate(ind_B):
-            for n in neighbors:
-                adj_B[valid_idx_B[i], valid_idx_B[n]] = True
-                adj_B[valid_idx_B[n], valid_idx_B[i]] = True
+    if M >= 3:
+        tri_B = Delaunay(coords_B)
+        for simplex in tri_B.simplices:
+            lab = labels_B[simplex]
+            for i in range(3):
+                for j in range(i+1, 3):
+                    if lab[i] != lab[j] and valid_B[lab[i]] and valid_B[lab[j]]:
+                        adj_B[lab[i], lab[j]] = True
+                        adj_B[lab[j], lab[i]] = True
 
     np.fill_diagonal(adj_A, True)
     np.fill_diagonal(adj_B, True)
 
-    # 3. Select ENLARGED subset of transport masses (Top 85%)
+    # 3. Select ENLARGED subset of transport masses (Top 50%)
     flat_pi = Pi_cluster.flatten()
     sorted_idx = np.argsort(flat_pi)[::-1]
     sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.85)
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.5)
     selected_flat_idx = sorted_idx[:cutoff_idx+1]
     
     matches = []
