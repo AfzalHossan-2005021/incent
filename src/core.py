@@ -35,124 +35,150 @@ def hierarchical_pairwise_align(
     block_threshold: float = 1e-4,
     rand_seed: Optional[int] = 2005021,
     visualize_clusters: bool = True,
+    n_ensembles: int = 3,
     **kwargs
 ):
     """
     Performs Hierarchical OT by clustering cells into mesoregions, aligning clusters with Partial FGW,
     and then restricting the cell-level OT matchings to the aligned blocks.
+    Utilizes Ensemble Consensus Alignments to stabilize stochastic clustering boundaries.
     
     Returns the cell-level alignment pi.
     """
-    print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=rand_seed)
-    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=rand_seed)
+    print(f"--- [HOT] Starting Ensemble Consensus Optimization (n_ensembles={n_ensembles}) ---")
     
-    print(f"Slice A: {len(np.unique(labelsA))} clusters")
-    print(f"Slice B: {len(np.unique(labelsB))} clusters")
+    N, M = sliceA.shape[0], sliceB.shape[0]
+    cell_counts_A = np.zeros(N)
+    cell_counts_B = np.zeros(M)
+    sum_dist_A = np.zeros(N)
+    sum_dist_B = np.zeros(M)
     
+    for k in range(n_ensembles):
+        print(f"\n>>> Ensemble Iteration {k+1}/{n_ensembles}")
+        k_seed = (rand_seed + k * 10) if rand_seed is not None else None
+        
+        print(f"--- [HOT] Step 1: Clustering Cells into Mesoregions (seed={k_seed}) ---")
+        labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=k_seed)
+        labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=k_seed)
+        
+        if k == 0:
+            print(f"Slice A: {len(np.unique(labelsA))} clusters")
+            print(f"Slice B: {len(np.unique(labelsB))} clusters")
+        
+        if visualize_clusters and k == 0:
+            try:
+                import matplotlib.pyplot as plt
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+                ptsA = sliceA.obsm[spatial_key]
+                ptsB = sliceB.obsm[spatial_key]
+                cmap = plt.get_cmap('tab20')
+                ax1.scatter(ptsA[:,0], ptsA[:,1], c=labelsA, cmap=cmap, s=2, alpha=0.8)
+                ax1.set_title(f"Slice A: {len(np.unique(labelsA))} Clusters (Run 1)")
+                ax1.axis('equal')
+                ax2.scatter(ptsB[:,0], ptsB[:,1], c=labelsB, cmap=cmap, s=2, alpha=0.8)
+                ax2.set_title(f"Slice B: {len(np.unique(labelsB))} Clusters (Run 1)")
+                ax2.axis('equal')
+                plt.show()
+            except Exception as e:
+                print(f"Cluster visualization failed: {e}")
+        
+        print("--- [HOT] Step 2: Extracting Cluster Features ---")
+        featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key)
+        featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key)
+        
+        p_A, _, _, centroidsA, _ = featA
+        p_B, _, _, centroidsB, _ = featB
+        
+        print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
+        M_cluster = compute_cluster_costs(featA, featB, w_expr, w_type)
+        C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
+        C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
+        
+        print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
+        Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
+        
+        if visualize_clusters and k == 0:
+            try:
+                import matplotlib.pyplot as plt
+                from matplotlib.collections import LineCollection
+                
+                cA_plot = centroidsA - np.mean(centroidsA, axis=0)
+                cB_plot = centroidsB - np.mean(centroidsB, axis=0)
+
+                fig, ax = plt.subplots(figsize=(10, 10))
+                ax.scatter(cA_plot[:,0], cA_plot[:,1], c='blue', s=20, label='Slice A Clusters', zorder=2)
+                ax.scatter(cB_plot[:,0], cB_plot[:,1], c='red', s=20, label='Slice B Clusters', zorder=2)
+
+                max_pi = np.max(Pi_cluster)
+                if max_pi > 0:
+                    lines = []
+                    linewidths = []
+                    for i in range(Pi_cluster.shape[0]):
+                        for j in range(Pi_cluster.shape[1]):
+                            if Pi_cluster[i, j] > block_threshold:
+                                lines.append([(cA_plot[i,0], cA_plot[i,1]), (cB_plot[j,0], cB_plot[j,1])])
+                                linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)      
+
+                    lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
+                    ax.add_collection(lc)
+
+                ax.set_title("Macro-Level Cluster Matching (Run 1)")
+                ax.axis('equal')
+                ax.legend()
+                plt.show()
+            except Exception as e:
+                print(f"Cluster matching visualization failed: {e}")
+
+        print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
+        idx_A_k, idx_B_k, dist_A_k, dist_B_k = extract_continuous_macro_section(
+            sliceA, sliceB, labelsA, labelsB, Pi_cluster, mass_pct=macro_section_mass_pct,
+            spatial_key=spatial_key, extension_hops=cluster_extension_hops
+        )
+        
+        # Accumulate consensus counts and spatial distance fields
+        cell_counts_A[idx_A_k] += 1
+        cell_counts_B[idx_B_k] += 1
+        sum_dist_A += dist_A_k
+        sum_dist_B += dist_B_k
+
+    print("\n--- [HOT] Step 5.bis: Compute Consensus Macro Selection ---")
+    # A cell must be consistently captured in at least half of the runs to be considered core
+    consensus_threshold = max(1, n_ensembles * 0.5)
+    idx_A = np.where(cell_counts_A >= consensus_threshold)[0]
+    idx_B = np.where(cell_counts_B >= consensus_threshold)[0]
+    
+    # Smooth average distance to the multi-run core boundaries
+    dist_A = sum_dist_A / n_ensembles
+    dist_B = sum_dist_B / n_ensembles
+    
+    print(f"Consensus Selected {len(idx_A)}/{N} cells from A, {len(idx_B)}/{M} cells from B.")
+
     if visualize_clusters:
         try:
             import matplotlib.pyplot as plt
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-            ptsA = sliceA.obsm[spatial_key]
-            ptsB = sliceB.obsm[spatial_key]
-            # using categorical cmap
-            cmap = plt.get_cmap('tab20')
-            ax1.scatter(ptsA[:,0], ptsA[:,1], c=labelsA, cmap=cmap, s=2, alpha=0.8)
-            ax1.set_title(f"Slice A: {len(np.unique(labelsA))} Clusters")
-            ax1.axis('equal')
-            ax2.scatter(ptsB[:,0], ptsB[:,1], c=labelsB, cmap=cmap, s=2, alpha=0.8)
-            ax2.set_title(f"Slice B: {len(np.unique(labelsB))} Clusters")
-            ax2.axis('equal')
-            plt.show()
-        except Exception as e:
-            print(f"Cluster visualization failed: {e}")
-    
-    print("--- [HOT] Step 2: Extracting Cluster Features ---")
-    featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key)
-    featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key)
-    
-    p_A, _, _, centroidsA, _ = featA
-    p_B, _, _, centroidsB, _ = featB
-    
-    print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    M_cluster = compute_cluster_costs(featA, featB, w_expr, w_type)
-    C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
-    C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
-    
-    print("--- [HOT] Step 4: Run Coarse Partial FGW ---")
-    Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
-    
-    if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            from matplotlib.collections import LineCollection
-            
-            # Center the coordinates purely for overlap plotting
-            cA_plot = centroidsA - np.mean(centroidsA, axis=0)
-            cB_plot = centroidsB - np.mean(centroidsB, axis=0)
-
-            fig, ax = plt.subplots(figsize=(10, 10))
-            ax.scatter(cA_plot[:,0], cA_plot[:,1], c='blue', s=20, label='Slice A Clusters (Centered)', zorder=2)
-            ax.scatter(cB_plot[:,0], cB_plot[:,1], c='red', s=20, label='Slice B Clusters (Centered)', zorder=2)
-
-            max_pi = np.max(Pi_cluster)
-            if max_pi > 0:
-                lines = []
-                linewidths = []
-                for i in range(Pi_cluster.shape[0]):
-                    for j in range(Pi_cluster.shape[1]):
-                        if Pi_cluster[i, j] > block_threshold:
-                            lines.append([(cA_plot[i,0], cA_plot[i,1]), (cB_plot[j,0], cB_plot[j,1])])
-                            linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)      
-
-                lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
-                ax.add_collection(lc)
-
-            ax.set_title("Macro-Level Cluster Matching ($Pi_{cluster}$)")
-            ax.axis('equal')
-            ax.legend()
-            plt.show()
-        except Exception as e:
-            print(f"Cluster matching visualization failed: {e}")
-
-    # We now prepare the injection into standard cell-level pairwise_align
-    print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
-        sliceA, sliceB, labelsA, labelsB, Pi_cluster, mass_pct=macro_section_mass_pct,
-        spatial_key=spatial_key, extension_hops=cluster_extension_hops
-    )
-    
-    print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
-
-    if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
             
             ptsA = sliceA.obsm[spatial_key]
             ptsB = sliceB.obsm[spatial_key]
             
-            # Highlight chosen core dynamically
             core_A_mask = np.zeros(sliceA.shape[0], dtype=bool)
             core_A_mask[idx_A] = True
             core_B_mask = np.zeros(sliceB.shape[0], dtype=bool)
             core_B_mask[idx_B] = True
             
-            # Plot distance out from core (distance is 0 inside core)
             sc1 = ax1.scatter(ptsA[:,0], ptsA[:,1], c=dist_A, cmap='viridis_r', s=4, alpha=0.9)
-            ax1.scatter(ptsA[core_A_mask,0], ptsA[core_A_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
-            ax1.set_title("Slice A: Macro Selection & Distances")
+            ax1.scatter(ptsA[core_A_mask,0], ptsA[core_A_mask,1], c='red', s=2, alpha=0.5, label='Consensus Core')
+            ax1.set_title(f"Slice A: Consensus Macro Selection (>={consensus_threshold} hits)")
             ax1.axis('equal')
             ax1.legend()
-            fig.colorbar(sc1, ax=ax1, label='Distance to Core', fraction=0.046, pad=0.04)
+            fig.colorbar(sc1, ax=ax1, label='Averaged Distance to Core', fraction=0.046, pad=0.04)
             
             sc2 = ax2.scatter(ptsB[:,0], ptsB[:,1], c=dist_B, cmap='viridis_r', s=4, alpha=0.9)
-            ax2.scatter(ptsB[core_B_mask,0], ptsB[core_B_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
-            ax2.set_title("Slice B: Macro Selection & Distances")
+            ax2.scatter(ptsB[core_B_mask,0], ptsB[core_B_mask,1], c='red', s=2, alpha=0.5, label='Consensus Core')
+            ax2.set_title(f"Slice B: Consensus Macro Selection (>={consensus_threshold} hits)")
             ax2.axis('equal')
             ax2.legend()
-            fig.colorbar(sc2, ax=ax2, label='Distance to Core', fraction=0.046, pad=0.04)
+            fig.colorbar(sc2, ax=ax2, label='Averaged Distance to Core', fraction=0.046, pad=0.04)
             
             plt.show()
         except Exception as e:
