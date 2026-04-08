@@ -146,15 +146,55 @@ def hierarchical_pairwise_align(
     idx_A = np.where(cell_counts_A > 0)[0]
     idx_B = np.where(cell_counts_B > 0)[0]
     
+    # --- Remove smaller disconnected spatial islands ---
+    from scipy.sparse.csgraph import connected_components
+    import scipy.sparse as sp
+
+    def get_largest_spatial_component(adata, idx, spatial_key="spatial"):
+        if len(idx) == 0:
+            return idx
+        sub_coords = adata.obsm[spatial_key][idx]
+        spacing = estimate_characteristic_spacing(adata, k=6, spatial_key=spatial_key)
+        # Adaptive radius: 3.5x median spacing reconnects tissue but cleanly slices off distant islands
+        tree = cKDTree(sub_coords)
+        pairs = tree.query_pairs(r=spacing * 3.5)
+        
+        if not pairs:
+            return np.array([idx[0]])
+            
+        row = [p[0] for p in pairs]
+        col = [p[1] for p in pairs]
+        data = np.ones(len(pairs))
+        adj = sp.coo_matrix((data, (row, col)), shape=(len(idx), len(idx)))
+        adj = adj + adj.T 
+        
+        _, comp_labels = connected_components(adj, directed=False)
+        largest_comp_id = np.bincount(comp_labels).argmax()
+        keep_sub_idx = np.where(comp_labels == largest_comp_id)[0]
+        return idx[keep_sub_idx]
+
+    idx_A_clean = get_largest_spatial_component(sliceA, idx_A, spatial_key)
+    idx_B_clean = get_largest_spatial_component(sliceB, idx_B, spatial_key)
+    
+    removed_A = len(idx_A) - len(idx_A_clean)
+    removed_B = len(idx_B) - len(idx_B_clean)
+    if removed_A > 0 or removed_B > 0:
+        print(f"[Island Filtering] Removed {removed_A} disconnected cells from A, {removed_B} from B.")
+    
+    idx_A, idx_B = idx_A_clean, idx_B_clean
+    
     # Calculate confidence probabilities [0.0, 1.0] based on run frequency
-    conf_A = cell_counts_A / n_ensembles
-    conf_B = cell_counts_B / n_ensembles
+    # We zero out the confidence of any disconnected islands we just removed
+    conf_A = np.zeros(N)
+    conf_B = np.zeros(M)
+    conf_A[idx_A] = cell_counts_A[idx_A] / n_ensembles
+    conf_B[idx_B] = cell_counts_B[idx_B] / n_ensembles
     
     # Smooth average distance to the multi-run core boundaries
     dist_A = sum_dist_A / n_ensembles
     dist_B = sum_dist_B / n_ensembles
     
-    print(f"Union Macro Mask: Selected {len(idx_A)}/{N} cells from A, {len(idx_B)}/{M} cells from B.")
+    print(f"Filtered Union Macro Mask: Selected {len(idx_A)}/{N} cells from A, {len(idx_B)}/{M} cells from B.")
 
     if visualize_clusters:
         try:
