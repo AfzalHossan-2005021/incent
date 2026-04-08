@@ -347,10 +347,8 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     ar_B = compute_aspect_ratio(coords_B[core_cells_B])
     max_ar = max(ar_A, ar_B)
     
-    # Map aspect ratio to hops: 
-    # ~1.0-1.2 (Compact/Round) -> 0 hops
-    # > 2.0 (Thin/Long) -> Scales up iteratively to max extension_hops
-    dynamic_hops = int(np.clip(np.round((max_ar - 1.2) * 2.0), 0, extension_hops))
+    # round aspect ratio to nearest integer to determine number of hops, with a cap at extension_hops
+    dynamic_hops = int(np.round(max_ar))
     print(f"[HOT] Shape Analysis: Max Aspect Ratio = {max_ar:.2f}. Using dynamic_hops = {dynamic_hops} (Max cap: {extension_hops})")
 
     # 6. Cluster-level Topological Extension
