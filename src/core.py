@@ -142,16 +142,19 @@ def hierarchical_pairwise_align(
         sum_dist_B += dist_B_k
 
     print("\n--- [HOT] Step 5.bis: Compute Consensus Macro Selection ---")
-    # A cell must be consistently captured in at least half of the runs to be considered core
-    consensus_threshold = max(1, n_ensembles * 0.5)
-    idx_A = np.where(cell_counts_A >= consensus_threshold)[0]
-    idx_B = np.where(cell_counts_B >= consensus_threshold)[0]
+    # Soft Confidence Extraction: A cell is included if it was matched at least once (Union)
+    idx_A = np.where(cell_counts_A > 0)[0]
+    idx_B = np.where(cell_counts_B > 0)[0]
+    
+    # Calculate confidence probabilities [0.0, 1.0] based on run frequency
+    conf_A = cell_counts_A / n_ensembles
+    conf_B = cell_counts_B / n_ensembles
     
     # Smooth average distance to the multi-run core boundaries
     dist_A = sum_dist_A / n_ensembles
     dist_B = sum_dist_B / n_ensembles
     
-    print(f"Consensus Selected {len(idx_A)}/{N} cells from A, {len(idx_B)}/{M} cells from B.")
+    print(f"Union Macro Mask: Selected {len(idx_A)}/{N} cells from A, {len(idx_B)}/{M} cells from B.")
 
     if visualize_clusters:
         try:
@@ -161,24 +164,15 @@ def hierarchical_pairwise_align(
             ptsA = sliceA.obsm[spatial_key]
             ptsB = sliceB.obsm[spatial_key]
             
-            core_A_mask = np.zeros(sliceA.shape[0], dtype=bool)
-            core_A_mask[idx_A] = True
-            core_B_mask = np.zeros(sliceB.shape[0], dtype=bool)
-            core_B_mask[idx_B] = True
-            
-            sc1 = ax1.scatter(ptsA[:,0], ptsA[:,1], c=dist_A, cmap='viridis_r', s=4, alpha=0.9)
-            ax1.scatter(ptsA[core_A_mask,0], ptsA[core_A_mask,1], c='red', s=2, alpha=0.5, label='Consensus Core')
-            ax1.set_title(f"Slice A: Consensus Macro Selection (>={consensus_threshold} hits)")
+            sc1 = ax1.scatter(ptsA[:,0], ptsA[:,1], c=conf_A, cmap='magma', s=4, alpha=0.9)
+            ax1.set_title("Slice A: Macro Selection Confidence")
             ax1.axis('equal')
-            ax1.legend()
-            fig.colorbar(sc1, ax=ax1, label='Averaged Distance to Core', fraction=0.046, pad=0.04)
+            fig.colorbar(sc1, ax=ax1, label='Match Probability (Confidence)', fraction=0.046, pad=0.04)
             
-            sc2 = ax2.scatter(ptsB[:,0], ptsB[:,1], c=dist_B, cmap='viridis_r', s=4, alpha=0.9)
-            ax2.scatter(ptsB[core_B_mask,0], ptsB[core_B_mask,1], c='red', s=2, alpha=0.5, label='Consensus Core')
-            ax2.set_title(f"Slice B: Consensus Macro Selection (>={consensus_threshold} hits)")
+            sc2 = ax2.scatter(ptsB[:,0], ptsB[:,1], c=conf_B, cmap='magma', s=4, alpha=0.9)
+            ax2.set_title("Slice B: Macro Selection Confidence")
             ax2.axis('equal')
-            ax2.legend()
-            fig.colorbar(sc2, ax=ax2, label='Averaged Distance to Core', fraction=0.046, pad=0.04)
+            fig.colorbar(sc2, ax=ax2, label='Match Probability (Confidence)', fraction=0.046, pad=0.04)
             
             plt.show()
         except Exception as e:
@@ -188,15 +182,16 @@ def hierarchical_pairwise_align(
     sub_sliceA = sliceA[idx_A].copy()
     sub_sliceB = sliceB[idx_B].copy()
 
-    # The selected sections will have an initial plan that decays based on distance from the core
+    # The selected sections will have an initial plan that compounds geometric decay AND structural confidence
     sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
     G_init_sub = None
     if sub_N > 0 and sub_M > 0:
         sigma_A = max(1e-5, np.max(dist_A) / 2.0)
         sigma_B = max(1e-5, np.max(dist_B) / 2.0)
         
-        weight_A = np.exp(- (dist_A[idx_A]**2) / (2 * sigma_A**2))
-        weight_B = np.exp(- (dist_B[idx_B]**2) / (2 * sigma_B**2))
+        # Compound weight = Spatial Gaussian Decay * Empirical Selection Confidence
+        weight_A = conf_A[idx_A] * np.exp(- (dist_A[idx_A]**2) / (2 * sigma_A**2))
+        weight_B = conf_B[idx_B] * np.exp(- (dist_B[idx_B]**2) / (2 * sigma_B**2))
         
         G_init_sub = np.outer(weight_A, weight_B)
         G_init_sub /= np.sum(G_init_sub)
