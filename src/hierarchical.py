@@ -9,7 +9,7 @@ from scipy.spatial import distance_matrix
 from scipy.sparse.csgraph import connected_components
 
 
-def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X", label_key="cell_type_annot", struct_features=None):
+def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X", label_key="cell_type_annot", all_types=None):
     """
     Extract cluster-level features for coarse mapping.
     
@@ -19,7 +19,7 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         spatial_key: key in obsm for coords.
         feature_key: 'X' for adata.X, else obsm key for latent features.
         label_key: key in obs for cell type annotations.
-        struct_features: optional (N, F) array of pre-computed cell-level Fourier multi-scale features.
+        all_types: global list of cell types.
         
     Returns:
         masses: np.ndarray (C,) normalized size of each cluster
@@ -27,7 +27,7 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         hist_types: np.ndarray (C, T) normalized cell-type histograms
         centroids: np.ndarray (C, 2) average spatial coordinate
         unique_labels: np.ndarray (C,)
-        mu_struct: np.ndarray (C, F) average neighborhood features or None
+        mu_struct: np.ndarray (C, T * 3) spatial distribution within the cluster itself, or None
     """
     coords = adata.obsm[spatial_key]
     n_cells = coords.shape[0]
@@ -41,7 +41,11 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         expr = adata.obsm[feature_key]
         
     ctypes = adata.obs[label_key].astype(str).values
-    unique_types = np.unique(ctypes)
+    if all_types is None:
+        unique_types = np.unique(ctypes)
+    else:
+        unique_types = np.array(all_types)
+        
     type_map = {t: i for i, t in enumerate(unique_types)}
     n_types = len(unique_types)
     
@@ -52,7 +56,9 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
     hist_types = np.zeros((n_clusters, n_types))
     centroids = np.zeros((n_clusters, 2))
-    mu_struct = np.zeros((n_clusters, struct_features.shape[1])) if struct_features is not None else None
+    
+    # 3 harmonics (m=0, 1, 2) per cell type
+    mu_struct = np.zeros((n_clusters, n_types * 3))
     
     for c_i, c in enumerate(unique_labels):
         mask = (labels == c)
@@ -64,12 +70,35 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             centroids[c_i, :] = np.mean(coords[mask], axis=0)
             
             c_types = ctypes[mask]
-            counts = np.bincount([type_map[t] for t in c_types], minlength=n_types)
+            # Map types; ignore if they don't exist in target mapping
+            mapped_types = [type_map[t] for t in c_types if t in type_map]
+            counts = np.bincount(mapped_types, minlength=n_types).astype(np.float64)
             hist_types[c_i, :] = counts / float(c_size) # normalized histogram
             
-            if struct_features is not None:
-                mu_struct[c_i, :] = np.mean(struct_features[mask], axis=0)
-                
+            # --- Computed Intrinsic Cluster Fourier Context ---
+            # Evaluates cell localization RELATIVE to the macro-cluster centroid
+            rel_coords = coords[mask] - centroids[c_i]
+            thetas = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
+            
+            local_feat = np.zeros((n_types, 3))
+            c_types_idx = np.array(mapped_types)
+            
+            for h_idx, m in enumerate([0, 1, 2]):
+                if m == 0:
+                    mag = counts
+                else:
+                    ang = m * thetas
+                    real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
+                    imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
+                    mag = np.hypot(real, imag)
+                    
+                local_feat[:, h_idx] = mag
+            
+            flat = local_feat.reshape(-1)
+            if flat.sum() > 0:
+                flat /= flat.sum()
+            mu_struct[c_i, :] = flat
+            
     return masses, mu_expr, hist_types, centroids, unique_labels, mu_struct
 
 

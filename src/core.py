@@ -48,20 +48,8 @@ def hierarchical_pairwise_align(
     labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=rand_seed)
     labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=rand_seed)
     
-    print("--- [HOT] Pre-computing Global Spatial Micro-Environments (Fourier Context) ---")
-    try:
-        # Utilize the native invariant multiscale fourier neighborhood so that macro & micro share the same structural logic
-        all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
-        radii = default_radii_from_spacing(sliceA, sliceB, k=6, multipliers=(2.5, 4.0, 6.0), spatial_key=spatial_key)
-        
-        struct_A = neighborhood_distribution_multiscale(
-            sliceA, radii=radii, cell_types=all_types, spatial_key=spatial_key, label_key=label_key)
-        struct_B = neighborhood_distribution_multiscale(
-            sliceB, radii=radii, cell_types=all_types, spatial_key=spatial_key, label_key=label_key)
-    except Exception as e:
-        print(f"Fourier pre-computation skipped (will run without w_struct): {e}")
-        struct_A, struct_B = None, None
-        w_struct = 0.0
+    # Pre-cache global cell types for cluster structure alignment
+    all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
 
     print(f"Slice A: {len(np.unique(labelsA))} clusters")
     print(f"Slice B: {len(np.unique(labelsB))} clusters")
@@ -85,13 +73,15 @@ def hierarchical_pairwise_align(
             print(f"Cluster visualization failed: {e}")
     
     print("--- [HOT] Step 2: Extracting Cluster Features ---")
-    featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, struct_features=struct_A)
-    featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, struct_features=struct_B)
+    featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, all_types=all_types)
+    featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, all_types=all_types)
     
     p_A, _, _, centroidsA, _, _ = featA
     p_B, _, _, centroidsB, _, _ = featB
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
+    # Note: If w_struct is used, w_type is inherently redundant because the 0th harmonic of the cluster 
+    # structural feature is exactly its cell type composition. User can set w_type=0.0 when w_struct>0.
     M_cluster = compute_cluster_costs(featA, featB, w_expr, w_type, w_struct)
     C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
