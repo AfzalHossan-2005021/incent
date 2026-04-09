@@ -9,7 +9,7 @@ from scipy.spatial import distance_matrix
 from scipy.sparse.csgraph import connected_components
 
 
-def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X", label_key="cell_type_annot"):
+def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X", label_key="cell_type_annot", struct_features=None):
     """
     Extract cluster-level features for coarse mapping.
     
@@ -19,12 +19,15 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         spatial_key: key in obsm for coords.
         feature_key: 'X' for adata.X, else obsm key for latent features.
         label_key: key in obs for cell type annotations.
+        struct_features: optional (N, F) array of pre-computed cell-level Fourier multi-scale features.
         
     Returns:
         masses: np.ndarray (C,) normalized size of each cluster
         mu_expr: np.ndarray (C, D) mean expression/latent vector
         hist_types: np.ndarray (C, T) normalized cell-type histograms
         centroids: np.ndarray (C, 2) average spatial coordinate
+        unique_labels: np.ndarray (C,)
+        mu_struct: np.ndarray (C, F) average neighborhood features or None
     """
     coords = adata.obsm[spatial_key]
     n_cells = coords.shape[0]
@@ -49,6 +52,7 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
     hist_types = np.zeros((n_clusters, n_types))
     centroids = np.zeros((n_clusters, 2))
+    mu_struct = np.zeros((n_clusters, struct_features.shape[1])) if struct_features is not None else None
     
     for c_i, c in enumerate(unique_labels):
         mask = (labels == c)
@@ -63,22 +67,25 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             counts = np.bincount([type_map[t] for t in c_types], minlength=n_types)
             hist_types[c_i, :] = counts / float(c_size) # normalized histogram
             
-    return masses, mu_expr, hist_types, centroids, unique_labels
+            if struct_features is not None:
+                mu_struct[c_i, :] = np.mean(struct_features[mask], axis=0)
+                
+    return masses, mu_expr, hist_types, centroids, unique_labels, mu_struct
 
 
-def compute_cluster_costs(featuresA, featuresB, w_expr=0.5, w_type=0.5):
+def compute_cluster_costs(featuresA, featuresB, w_expr=0.5, w_type=0.5, w_struct=0.0):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
     
     Args:
-        featuresA: Tuple of (masses, mu_expr, hist_types, centroids) from slice A
-        featuresB: Tuple of (masses, mu_expr, hist_types, centroids) from slice B
+        featuresA: Tuple of features from slice A
+        featuresB: Tuple of features from slice B
         
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
     """
-    _, mu_expr_A, hist_types_A, _, _ = featuresA
-    _, mu_expr_B, hist_types_B, _, _ = featuresB
+    _, mu_expr_A, hist_types_A, _, _, mu_struct_A = featuresA
+    _, mu_expr_B, hist_types_B, _, _, mu_struct_B = featuresB
     
     # Cosine distance for continuous expression
     from sklearn.metrics.pairwise import cosine_distances
@@ -92,7 +99,24 @@ def compute_cluster_costs(featuresA, featuresB, w_expr=0.5, w_type=0.5):
             # js returns distance, bounded 0-1. Can square for JS divergence if desired.
             M_type[i, j] = jensenshannon(hist_types_A[i], hist_types_B[j])
             
-    M_cluster = w_expr * M_expr + w_type * M_type
+    # Re-weighting based on provided w_struct
+    total_w = w_expr + w_type + w_struct
+    if total_w == 0: total_w = 1.0
+    w_expr_norm = w_expr / total_w
+    w_type_norm = w_type / total_w
+    w_struct_norm = w_struct / total_w
+    
+    M_cluster = w_expr_norm * M_expr + w_type_norm * M_type
+    
+    if mu_struct_A is not None and mu_struct_B is not None and w_struct > 0:
+        M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
+        for i in range(mu_struct_A.shape[0]):
+            for j in range(mu_struct_B.shape[0]):
+                # Using Jensen-Shannon since the fourier features are normalized probabilistic distributions over space
+                M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
+        
+        M_cluster += w_struct_norm * M_struct
+        
     return M_cluster
 
 
