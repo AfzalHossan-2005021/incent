@@ -397,27 +397,13 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     bary_A = np.mean(centroids_A[strong_A], axis=0)
     bary_B = np.mean(centroids_B[strong_B], axis=0)
 
-    # 5. Calculate Shape-based Dynamic Extension Hops using PCA (Aspect Ratio)
-    def compute_aspect_ratio(pt_coords):
-        if len(pt_coords) < 3: 
-            return 1.0
-        cov = np.cov(pt_coords.T)
-        eigvals = np.linalg.eigvals(cov)
-        eigvals = np.sort(np.real(eigvals))[::-1] # Descending order
-        if eigvals[1] <= 1e-8: 
-            return float(extension_hops)
-        return np.sqrt(eigvals[0] / eigvals[1])
-
-    ar_A = compute_aspect_ratio(coords_A[core_cells_A])
-    ar_B = compute_aspect_ratio(coords_B[core_cells_B])
-    max_ar = max(ar_A, ar_B)
-    
-    # round aspect ratio to nearest integer to determine number of hops, with a cap at extension_hops
-    dynamic_hops = int(np.round(max_ar))
-    print(f"[HOT] Shape Analysis: Max Aspect Ratio = {max_ar:.2f}. Using dynamic_hops = {dynamic_hops} (Max cap: {extension_hops})")
+    # 5. Determine Target Expansion Size
+    # Target is 1/3 of the clusters of the smaller slice
+    target_count = max(1, int(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))
+    print(f"[HOT] Topological Extension: Expanding until {target_count} clusters are in the strong set.")
 
     # 6. Cluster-level Topological Extension
-    for _ in range(dynamic_hops):
+    while min(len(strong_A), len(strong_B)) < target_count:
         # Find all topological neighbors of the current strong components
         neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
         neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
