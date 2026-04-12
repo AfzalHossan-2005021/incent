@@ -310,13 +310,31 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
     # 2. Build Structural Adjacency Matrices for Clusters based on true spatial borders
     # Using Delaunay triangulation to find neighboring clusters, then filter by valid clusters and Pi_cluster mass
-    # calculate a spatial graph using Delaunay triangulation on all the cells' coordinates. If a Delaunay triangle contains cells from two different clusters, it guarantees they are physically touching at their borders.
     from scipy.spatial import Delaunay
+    
+    # Calculate a characteristic spacing to filter false Delaunay bridges over holes/concavities
+    
+    tree_A_est = cKDTree(coords_A)
+    dists_A_est, _ = tree_A_est.query(coords_A, k=2)
+    max_dist_A = np.median(dists_A_est[:, 1]) * 4.0  # 4x median spacing threshold
+    
+    tree_B_est = cKDTree(coords_B)
+    dists_B_est, _ = tree_B_est.query(coords_B, k=2)
+    max_dist_B = np.median(dists_B_est[:, 1]) * 4.0
     
     adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
     if N >= 3:
         tri_A = Delaunay(coords_A)
         for simplex in tri_A.simplices:
+            # Check edge lengths to prevent bridging non-contiguous tissue islands
+            pts = coords_A[simplex]
+            d01 = np.linalg.norm(pts[0] - pts[1])
+            d12 = np.linalg.norm(pts[1] - pts[2])
+            d20 = np.linalg.norm(pts[2] - pts[0])
+            
+            if d01 > max_dist_A or d12 > max_dist_A or d20 > max_dist_A:
+                continue
+                
             lab = labels_A[simplex]
             for i in range(3):
                 for j in range(i+1, 3):
@@ -328,6 +346,14 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if M >= 3:
         tri_B = Delaunay(coords_B)
         for simplex in tri_B.simplices:
+            pts = coords_B[simplex]
+            d01 = np.linalg.norm(pts[0] - pts[1])
+            d12 = np.linalg.norm(pts[1] - pts[2])
+            d20 = np.linalg.norm(pts[2] - pts[0])
+            
+            if d01 > max_dist_B or d12 > max_dist_B or d20 > max_dist_B:
+                continue
+                
             lab = labels_B[simplex]
             for i in range(3):
                 for j in range(i+1, 3):
@@ -394,7 +420,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                             best_pair = (u, v)
                             
         # Terminate if the best neighboring expansion is empty or just numerical noise
-        if best_pair is None or best_mass < min_mass:
+        if best_pair is None:
             break
             
         new_u, new_v = best_pair
