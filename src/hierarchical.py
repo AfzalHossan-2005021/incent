@@ -309,9 +309,17 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             valid_B[i] = True
 
     # 2. Build Structural Adjacency Matrices for Clusters based on true spatial borders
-    # Using Delaunay triangulation to find neighboring clusters, then filter by valid clusters and Pi_cluster mass
-    # calculate a spatial graph using Delaunay triangulation on all the cells' coordinates. If a Delaunay triangle contains cells from two different clusters, it guarantees they are physically touching at their borders.
+    # Using Delaunay triangulation filtered by maximum edge length (Alpha-shape approximation)
+    # This prevents identifying clusters as neighbors if they are separated by empty space/background gaps.
     from scipy.spatial import Delaunay
+    
+    def get_max_edge_len(coords):
+        if len(coords) < 6: return float('inf')
+        d, _ = cKDTree(coords).query(coords, k=6)
+        return np.median(d[:, -1]) * 5.0 # Max boundary edge is 5x natural local density 
+        
+    max_edge_A = get_max_edge_len(coords_A)
+    max_edge_B = get_max_edge_len(coords_B)
     
     adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
     if N >= 3:
@@ -321,8 +329,10 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             for i in range(3):
                 for j in range(i+1, 3):
                     if lab[i] != lab[j] and valid_A[lab[i]] and valid_A[lab[j]]:
-                        adj_A[lab[i], lab[j]] = True
-                        adj_A[lab[j], lab[i]] = True
+                        dist = np.linalg.norm(coords_A[simplex[i]] - coords_A[simplex[j]])
+                        if dist < max_edge_A:
+                            adj_A[lab[i], lab[j]] = True
+                            adj_A[lab[j], lab[i]] = True
                         
     adj_B = np.zeros((num_clusters_B, num_clusters_B), dtype=bool)
     if M >= 3:
@@ -332,8 +342,10 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             for i in range(3):
                 for j in range(i+1, 3):
                     if lab[i] != lab[j] and valid_B[lab[i]] and valid_B[lab[j]]:
-                        adj_B[lab[i], lab[j]] = True
-                        adj_B[lab[j], lab[i]] = True
+                        dist = np.linalg.norm(coords_B[simplex[i]] - coords_B[simplex[j]])
+                        if dist < max_edge_B:
+                            adj_B[lab[i], lab[j]] = True
+                            adj_B[lab[j], lab[i]] = True
 
     np.fill_diagonal(adj_A, True)
     np.fill_diagonal(adj_B, True)
