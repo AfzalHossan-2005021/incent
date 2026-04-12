@@ -338,92 +338,72 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     np.fill_diagonal(adj_A, True)
     np.fill_diagonal(adj_B, True)
 
-    # 3. Select ENLARGED subset of transport masses (Top {mass_pct} of total mass)
+    # 3. Iterative Region Growing (Anchor-based Expansion)
+    # Target size: 1/4 of total valid clusters of the smaller slice
+    target_size = max(1, min(np.sum(valid_A), np.sum(valid_B)) // 4)
+    
+    # Initialize with the most confident global cluster pair
     flat_pi = Pi_cluster.flatten()
-    sorted_idx = np.argsort(flat_pi)[::-1]
-    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
+    best_idx = np.argmax(flat_pi)
+    best_u, best_v = np.unravel_index(best_idx, Pi_cluster.shape)
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * mass_pct)
-    selected_flat_idx = sorted_idx[:cutoff_idx+1]
+    anchor_A = {best_u}
+    anchor_B = {best_v}
+    selected_pairs = set([(best_u, best_v)])
     
-    matches = []
-    for idx in selected_flat_idx:
-        u, v = np.unravel_index(idx, Pi_cluster.shape)
-        if valid_A[u] and valid_B[v]:
-            matches.append((u, v))
-            
-    num_matches = len(matches)
-    if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-        
-    # 4. Enforce Structural Similarity & Continuity via Match-Graph
-    # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
-    match_adj = np.zeros((num_matches, num_matches), dtype=bool)
-    for i in range(num_matches):
-        u1, v1 = matches[i]
-        for j in range(i+1, num_matches):
-            u2, v2 = matches[j]
-            if adj_A[u1, u2] and adj_B[v1, v2]:
-                match_adj[i, j] = True
-                match_adj[j, i] = True
-
-    # Find the largest Structurally Co-Contiguous Component
-    n_comp, comp_labels = connected_components(match_adj, directed=False)
-    largest = np.bincount(comp_labels).argmax()
-    largest_match_indices = np.where(comp_labels == largest)[0]
+    # Threshold to prevent accumulating numerical noise when true mappings are exhausted
+    min_mass = np.max(Pi_cluster) * 1e-4 
     
-    strong_A = list(set([matches[i][0] for i in largest_match_indices]))
-    strong_B = list(set([matches[i][1] for i in largest_match_indices]))
-    
-    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
-    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
-
-    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-    
-    # Compute initial barycenters of the starting core components
-    bary_A = np.mean(centroids_A[strong_A], axis=0)
-    bary_B = np.mean(centroids_B[strong_B], axis=0)
-
-    # 5. Cluster-level Topological Extension
-    for _ in range(extension_hops):
-        # Find all topological neighbors of the current strong components
-        neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
-        neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
-        
-        # Exclude clusters already in the strong set
-        candidates_A = [c for c in neighbors_A if c not in strong_A and valid_A[c]]
-        candidates_B = [c for c in neighbors_B if c not in strong_B and valid_B[c]]
-        
-        if not candidates_A or not candidates_B:
+    # Grow the anchor until we reach the target size or run out of valid contiguous mappings
+    while len(anchor_A) < target_size and len(anchor_B) < target_size:
+        # Find valid direct neighbors of current anchors
+        neighbors_A = set()
+        for a in anchor_A:
+            for n in range(num_clusters_A):
+                if adj_A[a, n] and n not in anchor_A and valid_A[n]:
+                    neighbors_A.add(n)
+                    
+        neighbors_B = set()
+        for b in anchor_B:
+            for n in range(num_clusters_B):
+                if adj_B[b, n] and n not in anchor_B and valid_B[n]:
+                    neighbors_B.add(n)
+                    
+        # If no topological expansion is possible, terminate growth
+        if not neighbors_A and not neighbors_B:
             break
             
-        # Find the valid matching pair that is closest to the initial barycenters
         best_pair = None
-        best_dist = float('inf')
+        best_mass = -1
         
-        # Threshold to filter out nearly-zero noise entries from FGW
-        min_mass = np.max(Pi_cluster) * 1e-4 
+        # Improvement: 1-to-N Mapping Robustness.
+        # We search matching pairs across (Anchor U Neighbors) on both sides.
+        # This handles cases where 1 large cluster in A maps to 2 smaller adjacent clusters in B.
+        # search_A = anchor_A.union(neighbors_A)
+        # search_B = anchor_B.union(neighbors_B)
+        search_A = neighbors_A
+        search_B = neighbors_B
         
-        for pA in candidates_A:
-            for pB in candidates_B:
-                # The pair must still have valid OT confidence to be aligned together!
-                if Pi_cluster[pA, pB] > min_mass:
-                    dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
-                    dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
-                    
-                    # We minimize the combined distance to the respective barycenters
-                    total_dist = dist_A + dist_B
-                    if total_dist < best_dist:
-                        best_dist = total_dist
-                        best_pair = (pA, pB)
-                    
-        # Add the best geometrically compact pair
-        if best_pair is not None:
-            strong_A.append(best_pair[0])
-            strong_B.append(best_pair[1])
-        else:
+        for u in search_A:
+            for v in search_B:
+                # Must introduce at least one new neighbor to expand the defined region
+                if u in neighbors_A or v in neighbors_B:
+                    if (u, v) not in selected_pairs:
+                        if Pi_cluster[u, v] > best_mass:
+                            best_mass = Pi_cluster[u, v]
+                            best_pair = (u, v)
+                            
+        # Terminate if the best neighboring expansion is empty or just numerical noise
+        if best_pair is None or best_mass < min_mass:
             break
+            
+        new_u, new_v = best_pair
+        anchor_A.add(new_u)
+        anchor_B.add(new_v)
+        selected_pairs.add(best_pair)
+        
+    strong_A = list(anchor_A)
+    strong_B = list(anchor_B)
 
     # Extract final cells based strictly on expanded cluster membership
     idx_A = np.where(np.isin(labels_A, strong_A))[0]
