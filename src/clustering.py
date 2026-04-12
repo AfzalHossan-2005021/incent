@@ -64,21 +64,23 @@ def build_spatial_graph(coords: np.ndarray, method: str = 'knn', k: int = 6, rad
     return edges, weights
 
 
+from sklearn.cluster import AgglomerativeClustering
+import scipy.sparse as sp
+
 def cluster_cells_spatial(adata: AnnData, spatial_key: str = 'spatial', resolution: float = 1.0, 
-                          method: str = 'knn', k: int = 10, radius: float = None, seed: Optional[int] = 2005021) -> np.ndarray:
+                          method: str = 'delaunay', k: int = 10, radius: float = None, seed: Optional[int] = 2005021) -> np.ndarray:
     """
-    Clustering cells into contiguous supercells (mesoregions) using a spatial graph and Leiden.
-    
-    We focus purely on the spatial graph structure here initially.
+    Clustering cells into contiguous supercells (mesoregions) using Spatially-Constrained Agglomerative Clustering.
+    This guarantees 100% deterministic, mathematically fixed spatial regions without seed dependency.
     
     Args:
         adata: AnnData object.
         spatial_key: Key in adata.obsm storing spatial coordinates.
-        resolution: Resolution parameter for Leiden. Higher = more/smaller clusters.
+        resolution: Resolution parameter (scales number of clusters).
         method: Structure of spatial graph. 'knn', 'radius', or 'delaunay'.
         k: nearest neighbors.
         radius: Distance threshold for 'radius' method.
-        seed: Random seed for reproducibility.
+        seed: Ignored. Kept for backward compatibility.
         
     Returns:
         Cluster labels from 0 to C-1.
@@ -89,19 +91,26 @@ def cluster_cells_spatial(adata: AnnData, spatial_key: str = 'spatial', resoluti
     # 1. Build Spatial Graph
     edges, weights = build_spatial_graph(coords, method=method, k=k, radius=radius)
     
-    # 2. Convert to igraph
-    g = ig.Graph(n=n_cells, edges=edges, directed=False)
-    g.es['weight'] = weights
+    # 2. Create Connectivity Matrix
+    if not edges:
+        return np.zeros(n_cells, dtype=int)
+        
+    row = np.array([e[0] for e in edges] + [e[1] for e in edges])
+    col = np.array([e[1] for e in edges] + [e[0] for e in edges])
+    data = np.ones(len(row))
+    connectivity = sp.coo_matrix((data, (row, col)), shape=(n_cells, n_cells))
     
-    # 3. Leiden Community Detection
-    partition = leidenalg.find_partition(
-        g,
-        leidenalg.RBConfigurationVertexPartition,
-        weights='weight',
-        resolution_parameter=resolution,
-        seed=seed
+    # 3. Determine Number of Clusters
+    # Scale number of clusters based on total cells and resolution to mimic Leiden behavior
+    n_clusters_target = max(2, int((n_cells / 200.0) * resolution))
+    
+    # 4. Spatially-Constrained Agglomerative Clustering
+    agg = AgglomerativeClustering(
+        n_clusters=n_clusters_target,
+        linkage='ward',
+        connectivity=connectivity
     )
+    labels = agg.fit_predict(coords)
 
-    labels = np.array(partition.membership)
     return labels
 
