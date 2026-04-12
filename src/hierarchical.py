@@ -400,13 +400,19 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             break
             
         best_pair = None
-        best_mass = -1
+        best_score = -1
+        
+        # Compute Barycenters and geometric spread (radii) of the current anchor sets
+        # This ensures we favor dense, compact growth around the core of the anchor
+        bary_A = np.mean(centroids_A[list(anchor_A)], axis=0)
+        bary_B = np.mean(centroids_B[list(anchor_B)], axis=0)
+        
+        r_A = max(1e-4, np.max([np.linalg.norm(centroids_A[a] - bary_A) for a in anchor_A]))
+        r_B = max(1e-4, np.max([np.linalg.norm(centroids_B[b] - bary_B) for b in anchor_B]))
         
         # Improvement: 1-to-N Mapping Robustness.
         # We search matching pairs across (Anchor U Neighbors) on both sides.
         # This handles cases where 1 large cluster in A maps to 2 smaller adjacent clusters in B.
-        # search_A = anchor_A.union(neighbors_A)
-        # search_B = anchor_B.union(neighbors_B)
         search_A = neighbors_A
         search_B = neighbors_B
         
@@ -415,10 +421,19 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 # Must introduce at least one new neighbor to expand the defined region
                 if u in neighbors_A or v in neighbors_B:
                     if (u, v) not in selected_pairs:
-                        if Pi_cluster[u, v] > best_mass:
-                            best_mass = Pi_cluster[u, v]
-                            best_pair = (u, v)
+                        if Pi_cluster[u, v] >= min_mass:
+                            dist_A = np.linalg.norm(centroids_A[u] - bary_A)
+                            dist_B = np.linalg.norm(centroids_B[v] - bary_B)
                             
+                            # Score balances transport confidence vs compactness to the barycenters
+                            # Normalized by current radius to scale dynamically as the anchor grows
+                            compactness_penalty = 1.0 + (dist_A / r_A) + (dist_B / r_B)
+                            score = Pi_cluster[u, v] / compactness_penalty
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_pair = (u, v)
+                                
         # Terminate if the best neighboring expansion is empty or just numerical noise
         if best_pair is None:
             break
