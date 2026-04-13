@@ -253,18 +253,25 @@ def hierarchical_pairwise_align(
         if not np.any(overlap_mask_A): overlap_mask_A[:] = True
         if not np.any(overlap_mask_B): overlap_mask_B[:] = True
         
-        # 3. Apply strict zero-weights to the unmatched (non-overlapping) parts
-        # Weights are exactly 1.0 inside the solid overlap, and 0.0 in the pure tails.
-        weight_A_full = np.zeros(sliceA.shape[0], dtype=np.float64)
-        weight_A_full[overlap_mask_A] = 1.0
+        # 3. Supplying ONLY the shadow slices to the final OT pipeline
+        # Within the shadow, apply decaying weights from the previously matched biological core
+        idx_A_shadow = np.where(overlap_mask_A)[0]
+        idx_B_shadow = np.where(overlap_mask_B)[0]
         
-        weight_B_full = np.zeros(sliceB.shape[0], dtype=np.float64)
-        weight_B_full[overlap_mask_B] = 1.0
+        sliceA_shadow = sliceA[idx_A_shadow].copy()
+        sliceB_shadow = sliceB[idx_B_shadow].copy()
+        
+        # Scaling the decay dynamically based on the width of the shadow
+        sigma_A = max(1e-5, np.max(dist_A[idx_A_shadow]) / 2.0)
+        sigma_B = max(1e-5, np.max(dist_B[idx_B_shadow]) / 2.0)
+        
+        weight_A_shadow = np.exp(- (dist_A[idx_A_shadow]**2) / (2 * sigma_A**2))
+        weight_B_shadow = np.exp(- (dist_B[idx_B_shadow]**2) / (2 * sigma_B**2))
 
-        G_init_final = np.outer(weight_A_full, weight_B_full)
-        G_init_sum = np.sum(G_init_final)
+        G_init_shadow = np.outer(weight_A_shadow, weight_B_shadow)
+        G_init_sum = np.sum(G_init_shadow)
         if G_init_sum > 0:
-            G_init_final /= G_init_sum
+            G_init_shadow /= G_init_sum
 
         if visualize_clusters:
             try:
@@ -274,35 +281,46 @@ def hierarchical_pairwise_align(
                 ptsA_full = sliceA.obsm[spatial_key]
                 ptsB_full = sliceB.obsm[spatial_key]
                 
+                weight_A_full = np.zeros(sliceA.shape[0])
+                weight_A_full[idx_A_shadow] = weight_A_shadow
+                
+                weight_B_full = np.zeros(sliceB.shape[0])
+                weight_B_full[idx_B_shadow] = weight_B_shadow
+                
                 sc1 = ax1.scatter(ptsA_full[:,0], ptsA_full[:,1], c=weight_A_full, cmap='magma', s=2, alpha=0.9)
-                ax1.set_title("Slice A: Native Space Overlap Weights")
+                ax1.set_title("Slice A: Shadow Weights (Core Decaying)")
                 ax1.axis('equal')
-                fig.colorbar(sc1, ax=ax1, label='Weight / Confidence')
+                fig.colorbar(sc1, ax=ax1, label='Init Weight Bias')
                 
                 sc2 = ax2.scatter(ptsB_full[:,0], ptsB_full[:,1], c=weight_B_full, cmap='magma', s=2, alpha=0.9)
-                ax2.set_title("Slice B: Native Space Overlap Weights")
+                ax2.set_title("Slice B: Shadow Weights (Core Decaying)")
                 ax2.axis('equal')
-                fig.colorbar(sc2, ax=ax2, label='Weight / Confidence')
+                fig.colorbar(sc2, ax=ax2, label='Init Weight Bias')
                 
-                plt.suptitle("Global Overlap Projection Weights (Exact Shadow)")
+                plt.suptitle("Global Overlap Projection Weights (Exact Shadow + Core Decay)")
                 plt.show()
             except Exception as e:
                 print(f"Overlap weight visualization failed: {e}")
             
-        print("--- [HOT] Step 8: Executing Final Full-Slice Base OT ---")
-        pi_full_final = pairwise_align(
-            sliceA=sliceA,
-            sliceB=sliceB,
+        print(f"--- [HOT] Step 8: Executing Final Base OT on Shadow Portions (A: {len(idx_A_shadow)}, B: {len(idx_B_shadow)}) ---")
+        pi_shadow_final = pairwise_align(
+            sliceA=sliceA_shadow,
+            sliceB=sliceB_shadow,
             alpha=alpha,
             beta=beta,
             gamma=gamma,
             reg_compact=reg_compact,
-            G_init=G_init_final,
+            G_init=G_init_shadow,
             numItermax=numItermax,
             use_gpu=use_gpu,
             dummy_cell=True,
             **kwargs
         )
+        
+        # Inject the dense output explicitly into the sparse global matrix footprint
+        pi_full_final = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
+        grid_A, grid_B = np.ix_(idx_A_shadow, idx_B_shadow)
+        pi_full_final[grid_A, grid_B] = pi_shadow_final
 
         return pi_full_final
         
