@@ -251,6 +251,29 @@ def hierarchical_pairwise_align(
         G_init_sum = np.sum(G_init_final)
         if G_init_sum > 0:
             G_init_final /= G_init_sum
+
+        if visualize_clusters:
+            try:
+                import matplotlib.pyplot as plt
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+                
+                ptsA_full = sliceA.obsm[spatial_key]
+                ptsB_full = sliceB.obsm[spatial_key]
+                
+                sc1 = ax1.scatter(ptsA_full[:,0], ptsA_full[:,1], c=weight_A_full, cmap='magma', s=2, alpha=0.9)
+                ax1.set_title("Slice A: Native Space Overlap Weights")
+                ax1.axis('equal')
+                fig.colorbar(sc1, ax=ax1, label='Weight / Confidence')
+                
+                sc2 = ax2.scatter(ptsB_full[:,0], ptsB_full[:,1], c=weight_B_full, cmap='magma', s=2, alpha=0.9)
+                ax2.set_title("Slice B: Native Space Overlap Weights")
+                ax2.axis('equal')
+                fig.colorbar(sc2, ax=ax2, label='Weight / Confidence')
+                
+                plt.suptitle("Global Overlap Projection Weights (Decaying from Center)")
+                plt.show()
+            except Exception as e:
+                print(f"Overlap weight visualization failed: {e}")
             
         print("--- [HOT] Step 8: Executing Final Full-Slice Base OT ---")
         pi_full_final = pairwise_align(
