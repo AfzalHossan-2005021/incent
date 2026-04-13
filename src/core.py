@@ -209,34 +209,42 @@ def hierarchical_pairwise_align(
         coords_A_aligned = np.asarray(aligned_slices[0].obsm[spatial_key])
         coords_B_aligned = np.asarray(aligned_slices[1].obsm[spatial_key])
         
-        # 2. Determine overlapping regions based on nearest neighbor distances
+        # 2. Determine overlapping regions based on Mutual Convex Hull Intersection
+        from scipy.spatial import Delaunay
+        
+        # Build spatial triangulations which implicitly model the arbitrary Convex Hull 
+        # (the exact polygonal "shrink-wrap" of the tissue) rather than axis-aligned rectangles.
+        tri_A = Delaunay(coords_A_aligned)
+        tri_B = Delaunay(coords_B_aligned)
+        
+        # A cell is mathematically in the overlap if its coordinate physically 
+        # falls inside the triangulated geometric boundaries of the opposite slice.
+        overlap_mask_A = tri_B.find_simplex(coords_A_aligned) >= 0
+        overlap_mask_B = tri_A.find_simplex(coords_B_aligned) >= 0
+        
+        # Slices with complex concave curves might still flag empty middle space. 
+        # A safety filter checks distance to nearest neighbor to prune out "empty hull" mappings.
         tree_A = cKDTree(coords_A_aligned)
         tree_B = cKDTree(coords_B_aligned)
+        s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
+        s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
+        
+        # Max distance permitted is ~10x local spacing to allow continuity without bridging voids
+        tau = max(s_A, s_B) * 10.0
         
         dist_A_to_B, _ = tree_B.query(coords_A_aligned)
         dist_B_to_A, _ = tree_A.query(coords_B_aligned)
         
-        # Threshold for "overlap" - e.g. 2x characteristic spacing of the slices
-        s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
-        s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
-        tau = max(s_A, s_B) * 2.0
-        
-        overlap_mask_A = dist_A_to_B <= tau
-        overlap_mask_B = dist_B_to_A <= tau
+        # Logical AND: Must be inside the polygon shape AND within reasonable tissue distance
+        overlap_mask_A = overlap_mask_A & (dist_A_to_B <= tau)
+        overlap_mask_B = overlap_mask_B & (dist_B_to_A <= tau)
         
         # Fallback if overlap vanishes perfectly
-        if not np.any(overlap_mask_A): overlap_mask_A[np.argmin(dist_A_to_B)] = True
-        if not np.any(overlap_mask_B): overlap_mask_B[np.argmin(dist_B_to_A)] = True
+        if not np.any(overlap_mask_A): overlap_mask_A[:] = True
+        if not np.any(overlap_mask_B): overlap_mask_B[:] = True
         
-        # 3. Calculate distance from EACH cell to the overlapping region of its OWN slice
-        tree_overlap_A = cKDTree(coords_A_aligned[overlap_mask_A])
-        tree_overlap_B = cKDTree(coords_B_aligned[overlap_mask_B])
-        
-        dist_to_overlap_A, _ = tree_overlap_A.query(coords_A_aligned)
-        dist_to_overlap_B, _ = tree_overlap_B.query(coords_B_aligned)
-        
-        # 4. Calculate strict overlap weights (no exponential decay)
-        # Weights are exactly 1.0 inside the overlap, and 0.0 outside
+        # 3. Apply strict zero-weights to the unmatched (non-overlapping) parts
+        # Weights are exactly 1.0 inside the solid overlap, and 0.0 in the pure tails.
         weight_A_full = np.zeros(sliceA.shape[0], dtype=np.float64)
         weight_A_full[overlap_mask_A] = 1.0
         
