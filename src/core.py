@@ -235,17 +235,13 @@ def hierarchical_pairwise_align(
         dist_to_overlap_A, _ = tree_overlap_A.query(coords_A_aligned)
         dist_to_overlap_B, _ = tree_overlap_B.query(coords_B_aligned)
         
-        # Distance is zero for overlap cells, positive for others
-        dist_to_overlap_A[overlap_mask_A] = 0.0
-        dist_to_overlap_B[overlap_mask_B] = 0.0
+        # 4. Calculate strict overlap weights (no exponential decay)
+        # Weights are exactly 1.0 inside the overlap, and 0.0 outside
+        weight_A_full = np.zeros(sliceA.shape[0], dtype=np.float64)
+        weight_A_full[overlap_mask_A] = 1.0
         
-        # 4. Calculate exponential decay weights
-        # Ensures smooth boundary decay avoiding harsh cutoffs
-        sigma_A_full = max(1e-5, np.max(dist_to_overlap_A) / 3.0)
-        sigma_B_full = max(1e-5, np.max(dist_to_overlap_B) / 3.0)
-        
-        weight_A_full = np.exp(- (dist_to_overlap_A**2) / (2 * sigma_A_full**2))
-        weight_B_full = np.exp(- (dist_to_overlap_B**2) / (2 * sigma_B_full**2))
+        weight_B_full = np.zeros(sliceB.shape[0], dtype=np.float64)
+        weight_B_full[overlap_mask_B] = 1.0
         
         G_init_final = np.outer(weight_A_full, weight_B_full)
         G_init_sum = np.sum(G_init_final)
@@ -286,6 +282,7 @@ def hierarchical_pairwise_align(
             G_init=G_init_final,
             numItermax=numItermax,
             use_gpu=use_gpu,
+            dummy_cell=True,
             **kwargs
         )
         return pi_full_final
