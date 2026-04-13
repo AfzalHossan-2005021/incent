@@ -93,8 +93,11 @@ def generalized_procrustes_analysis(
         a = Wn.sum(axis=1)
         b = Wn.sum(axis=0)
 
-        mx = (a[:, None] * X_).sum(axis=0)
-        my = (b[:, None] * Y_).sum(axis=0)
+        mx = (Wn.sum(axis=1)[:, None] * X_).sum(axis=0) / (a.sum() + eps)
+        my = (Wn.sum(axis=0)[:, None] * Y_).sum(axis=0) / (b.sum() + eps)
+        # Correctly center based on weighted means
+        mx = (X_.T @ a) / (a.sum() + eps)
+        my = (Y_.T @ b) / (b.sum() + eps)
 
         Xc = X_ - mx
         Yc = Y_ - my
@@ -274,47 +277,39 @@ def stack_slices_pairwise(
     """
     Align spatial coordinates of sequential pairwise slices.
 
-    In other words, align:
-
-        slices[0] --> slices[1] --> slices[2] --> ...
-
-    Args:
-        slices: List of slices.
-        pis: List of pi (``pairwise_align()`` output) between consecutive slices.
-        output_params: If ``True``, addtionally return angles of rotation (theta) and translations for each slice.
-        matrix: If ``True`` and output_params is also ``True``, the rotation is
-            return as a matrix instead of an angle for each slice.
-
-    Returns:
-        - List of slices with aligned spatial coordinates.
-
-        If ``output_params = True``, additionally return:
-
-        - List of angles of rotation (theta) for each slice.
-        - List of translations [x_translation, y_translation] for each slice.
+    This function anchors all slices to the coordinate system of slices[0].
+    Transformations are accumulated through the stack sequentially:
+    slices[1] -> slices[0], then slices[2] -> slices[1] (now in 0's space), etc.
     """
     assert len(slices) == len(pis) + 1, "'slices' should have length one more than 'pis'. Please double check."
     assert len(slices) > 1, "You should have at least 2 layers."
-    new_coor = []
+    
+    new_coor = [slices[0].obsm['spatial'].copy()]
     thetas = []
     translations = []
-    if not output_params:
-        S1, S2  = generalized_procrustes_analysis(slices[0].obsm['spatial'], slices[1].obsm['spatial'], pis[0])
-    else:
-        S1, S2,theta,tX,tY  = generalized_procrustes_analysis(slices[0].obsm['spatial'], slices[1].obsm['spatial'], pis[0],output_params=output_params, matrix=matrix)
-        thetas.append(theta)
-        translations.append(tX)
-        translations.append(tY)
-    new_coor.append(S1)
-    new_coor.append(S2)
-    for i in range(1, len(slices) - 1):
+    
+    # We iterate forward, mapping slice i+1 to slice i's newly aligned coordinates
+    for i in range(len(slices) - 1):
+        # pis[i] maps slices[i] -> slices[i+1]
+        # To align i+1 to i, X = slices[i+1], Y = new_coor[i] (which is slices[i] in the global space), pi is transposed!
         if not output_params:
-            x, y = generalized_procrustes_analysis(new_coor[i], slices[i+1].obsm['spatial'], pis[i])
+            X_aligned, _ = generalized_procrustes_analysis(
+                slices[i+1].obsm['spatial'], 
+                new_coor[i], 
+                pis[i].T
+            )
+            new_coor.append(X_aligned)
         else:
-            x, y,theta,tX,tY = generalized_procrustes_analysis(new_coor[i], slices[i+1].obsm['spatial'], pis[i],output_params=output_params, matrix=matrix)
+            X_aligned, _, theta, src_center, t = generalized_procrustes_analysis(
+                slices[i+1].obsm['spatial'], 
+                new_coor[i], 
+                pis[i].T,
+                output_params=output_params, 
+                matrix=matrix
+            )
+            new_coor.append(X_aligned)
             thetas.append(theta)
-            translations.append(tY)
-        new_coor.append(y)
+            translations.append(t) # Only append the translation vector, ignoring src_center to fix output struct
 
     new_slices = []
     for i in range(len(slices)):
@@ -332,20 +327,58 @@ def visualize_alignment(sliceA, sliceB, pi12):
     slices, pis = [sliceA, sliceB], [pi12]
     new_slices = stack_slices_pairwise(slices, pis)
 
-    slice_colors = ['#e41a1c','#377eb8']
+    slice_colors = ['#e41a1c','#377eb8'] # Red (Source), Blue (Target)
 
     xI_new = new_slices[0].obsm['spatial'][:, 0]
     yI_new = new_slices[0].obsm['spatial'][:, 1]
 
     xJ_new = new_slices[1].obsm['spatial'][:, 0]
     yJ_new = new_slices[1].obsm['spatial'][:, 1]
+    
+    # Identify the "Exact Shadow" matched subsets based on transport plan mass
+    matched_src = pi12.sum(axis=1) > 1e-5
+    matched_tgt = pi12.sum(axis=0) > 1e-5
 
     print("====================\nAligned slices")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    plt.scatter(xI_new,yI_new,s=1,alpha=0.5, label='source', c=slice_colors[0])
-    plt.scatter(xJ_new,yJ_new,s=1,alpha=0.5, label = 'target', c=slice_colors[1])
-    plt.axis("off")
-    plt.legend()
+    # --- Plot 1: Global Overlay ---
+    # Unmatched tails in soft gray
+    ax1.scatter(xI_new[~matched_src], yI_new[~matched_src], s=1, alpha=0.2, c='grey')
+    ax1.scatter(xJ_new[~matched_tgt], yJ_new[~matched_tgt], s=1, alpha=0.2, c='lightgrey')
+    
+    # Matched shadow in solid colors
+    ax1.scatter(xI_new[matched_src], yI_new[matched_src], s=1.5, alpha=0.6, label='Source (Matched)', c=slice_colors[0])
+    ax1.scatter(xJ_new[matched_tgt], yJ_new[matched_tgt], s=1.5, alpha=0.6, label='Target (Matched)', c=slice_colors[1])
+    ax1.axis("off")
+    ax1.legend()
+    ax1.set_title("Rigid Overlay (Matched Core Highlighted)")
+
+    # --- Plot 2: Displacement Vector Field (Quiver) ---
+    # To avoid rendering 50,000+ lines, sample up to 1000 matched pairs via argmax
+    ax2.scatter(xJ_new, yJ_new, s=0.5, alpha=0.1, c='lightgrey') # Background target
+    
+    active_rows = np.where(matched_src)[0]
+    if len(active_rows) > 0:
+        # Sample points for the vector field
+        sample_size = min(1000, len(active_rows))
+        sampled_src_idx = np.random.choice(active_rows, sample_size, replace=False)
+        
+        # Find the target cell assignment
+        sampled_tgt_idx = np.argmax(pi12[sampled_src_idx], axis=1)
+        
+        start_x = xI_new[sampled_src_idx]
+        start_y = yI_new[sampled_src_idx]
+        end_x = xJ_new[sampled_tgt_idx]
+        end_y = yJ_new[sampled_tgt_idx]
+        
+        ax2.quiver(start_x, start_y, end_x - start_x, end_y - start_y, 
+                   color='black', alpha=0.4, angles='xy', scale_units='xy', scale=1, width=0.002)
+                   
+    ax2.axis("off")
+    ax2.set_title("Displacement Field (Source to Target)")
+
+    plt.tight_layout()
     plt.show()
 
     return new_slices
