@@ -210,35 +210,44 @@ def hierarchical_pairwise_align(
         coords_A_aligned = np.asarray(aligned_slices[0].obsm[spatial_key])
         coords_B_aligned = np.asarray(aligned_slices[1].obsm[spatial_key])
         
-        # 2. Determine overlapping regions based on Mutual Convex Hull Intersection
-        from scipy.spatial import Delaunay
-        
-        # Build spatial triangulations which implicitly model the arbitrary Convex Hull 
-        # (the exact polygonal "shrink-wrap" of the tissue) rather than axis-aligned rectangles.
-        tri_A = Delaunay(coords_A_aligned)
-        tri_B = Delaunay(coords_B_aligned)
-        
-        # A cell is mathematically in the overlap if its coordinate physically 
-        # falls inside the triangulated geometric boundaries of the opposite slice.
-        overlap_mask_A = tri_B.find_simplex(coords_A_aligned) >= 0
-        overlap_mask_B = tri_A.find_simplex(coords_B_aligned) >= 0
-        
-        # Slices with complex concave curves might still flag empty middle space. 
-        # A safety filter checks distance to nearest neighbor to prune out "empty hull" mappings.
-        tree_A = cKDTree(coords_A_aligned)
-        tree_B = cKDTree(coords_B_aligned)
+        # 2. Determine overlapping regions based on Morphological Rasterization (Exact Shadow)
+        # Replaces soft radius (KDTree) or rigid boundaries (Convex Hull) with a grid footprint
+        # capturing the actual boundaries, contours, and internal holes perfectly.
         s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
         s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
+        grid_size = max(s_A, s_B) * 2.0  # Granularity is roughly 2 cell spaces wide
         
-        # Max distance permitted is ~10x local spacing to allow continuity without bridging voids
-        tau = max(s_A, s_B) * 10.0
+        # Compute common coordinate boundaries
+        min_coords = np.minimum(coords_A_aligned.min(axis=0), coords_B_aligned.min(axis=0))
+
+        # Convert continuous coordinates into discrete grid indices
+        def to_grid(coords):
+            return np.maximum(0, np.floor((coords - min_coords) / grid_size).astype(int))
+            
+        grid_A = to_grid(coords_A_aligned)
+        grid_B = to_grid(coords_B_aligned)
         
-        dist_A_to_B, _ = tree_B.query(coords_A_aligned)
-        dist_B_to_A, _ = tree_A.query(coords_B_aligned)
+        # Build 2D occupancy maps
+        max_idx_A = grid_A.max(axis=0)
+        max_idx_B = grid_B.max(axis=0)
+        grid_bounds = np.maximum(max_idx_A, max_idx_B) + 5  # pad for safety
         
-        # Logical AND: Must be inside the polygon shape AND within reasonable tissue distance
-        overlap_mask_A = overlap_mask_A & (dist_A_to_B <= tau)
-        overlap_mask_B = overlap_mask_B & (dist_B_to_A <= tau)
+        from scipy.ndimage import binary_dilation
+        mask_A = np.zeros(grid_bounds, dtype=bool)
+        mask_B = np.zeros(grid_bounds, dtype=bool)
+        
+        mask_A[tuple(grid_A.T)] = True
+        mask_B[tuple(grid_B.T)] = True
+        
+        # Dilate footprint slightly to connect cellular gaps mathematically without bloating the tissue
+        mask_A_dilated = binary_dilation(mask_A, iterations=1)
+        mask_B_dilated = binary_dilation(mask_B, iterations=1)
+        
+        # The exact, topological shadow intersection of both tissues
+        overlap_mask = mask_A_dilated & mask_B_dilated
+        
+        overlap_mask_A = overlap_mask[tuple(grid_A.T)]
+        overlap_mask_B = overlap_mask[tuple(grid_B.T)]
         
         # Fallback if overlap vanishes perfectly
         if not np.any(overlap_mask_A): overlap_mask_A[:] = True
