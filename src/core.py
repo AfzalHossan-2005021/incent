@@ -308,7 +308,7 @@ def hierarchical_pairwise_align(
             G_init=G_init_matched,
             numItermax=numItermax,
             use_gpu=use_gpu,
-            dummy_cell=True,
+            dummy_cell=False,
             **kwargs
         )
         
