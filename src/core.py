@@ -261,6 +261,11 @@ def hierarchical_pairwise_align(
         weight_B_full = np.zeros(sliceB.shape[0], dtype=np.float64)
         weight_B_full[overlap_mask_B] = 1.0
 
+        G_init_final = np.outer(weight_A_full, weight_B_full)
+        G_init_sum = np.sum(G_init_final)
+        if G_init_sum > 0:
+            G_init_final /= G_init_sum
+
         if visualize_clusters:
             try:
                 import matplotlib.pyplot as plt
@@ -279,42 +284,25 @@ def hierarchical_pairwise_align(
                 ax2.axis('equal')
                 fig.colorbar(sc2, ax=ax2, label='Weight / Confidence')
                 
-                plt.suptitle("Global Overlap Projection Weights (Decaying from Center)")
+                plt.suptitle("Global Overlap Projection Weights (Exact Shadow)")
                 plt.show()
             except Exception as e:
                 print(f"Overlap weight visualization failed: {e}")
             
-        print(f"--- [HOT] Step 8: Executing Final Base OT on Matched Portions (A: {np.sum(overlap_mask_A)}, B: {np.sum(overlap_mask_B)}) ---")
-        
-        idx_A_matched = np.where(overlap_mask_A)[0]
-        idx_B_matched = np.where(overlap_mask_B)[0]
-        
-        sliceA_matched = sliceA[idx_A_matched].copy()
-        sliceB_matched = sliceB[idx_B_matched].copy()
-
-        # In the matched subset, initial bias is uniform
-        G_init_matched = np.outer(np.ones(len(idx_A_matched)), np.ones(len(idx_B_matched)))
-        G_init_sum = np.sum(G_init_matched)
-        if G_init_sum > 0:
-            G_init_matched /= G_init_sum
-
-        pi_matched_final = pairwise_align(
-            sliceA=sliceA_matched,
-            sliceB=sliceB_matched,
+        print("--- [HOT] Step 8: Executing Final Full-Slice Base OT ---")
+        pi_full_final = pairwise_align(
+            sliceA=sliceA,
+            sliceB=sliceB,
             alpha=alpha,
             beta=beta,
             gamma=gamma,
             reg_compact=reg_compact,
-            G_init=G_init_matched,
+            G_init=G_init_final,
             numItermax=numItermax,
             use_gpu=use_gpu,
-            dummy_cell=False,
+            dummy_cell=True,
             **kwargs
         )
-        
-        pi_full_final = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
-        grid_A, grid_B = np.ix_(idx_A_matched, idx_B_matched)
-        pi_full_final[grid_A, grid_B] = pi_matched_final
 
         return pi_full_final
         
