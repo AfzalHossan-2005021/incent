@@ -5,8 +5,11 @@ import numpy as np
 import scipy.sparse as sp
 from tqdm import tqdm
 
-from ot.optim import line_search_armijo, cg
 from ot.gromov import solve_gromov_linesearch
+from ot.lp import emd
+from ot.unbalanced import sinkhorn_unbalanced
+from ot.optim import line_search_armijo, generic_conditional_gradient
+from ot.utils import get_backend
 
 
 def select_backend(use_gpu=False, gpu_verbose=True):
@@ -71,7 +74,7 @@ def to_backend(x, nx, data_type=None, reference=None):
     return x_nx
 
 
-def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, reg_compact=1.0, armijo=True, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
+def fused_gromov_wasserstein_incent(M, C1, C2, p, q, unbalanced=False, G_init = None, alpha = 0.1, reg_compact=1.0, armijo=True, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 
@@ -168,7 +171,138 @@ def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1,
         return res, log
 
     else:
-        return cg(p, q, (1-alpha)*M, alpha, f, df, G0=G0, line_search=line_search, numItermax=numItermax, numItermaxEmd=numItermaxEmd, stopThr=tol_rel, stopThr2=tol_abs, verbose=verbose, log=log, nx=nx, **kwargs)
+        return cg(p, q, (1-alpha)*M, alpha, f, df, unbalanced=unbalanced, G0=G0, line_search=line_search, numItermax=numItermax, numItermaxEmd=numItermaxEmd, stopThr=tol_rel, stopThr2=tol_abs, verbose=verbose, log=log, nx=nx, **kwargs)
+
+
+def cg(
+    a,
+    b,
+    M,
+    reg,
+    f,
+    df,
+    unbalanced=False,
+    G0=None,
+    line_search=None,
+    numItermax=200,
+    numItermaxEmd=100000,
+    stopThr=1e-9,
+    stopThr2=1e-9,
+    verbose=False,
+    log=False,
+    nx=None,
+    **kwargs,
+):
+    r"""
+    Solve the general regularized OT problem with conditional gradient
+
+        The function solves the following optimization problem:
+
+    .. math::
+        \gamma = \mathop{\arg \min}_\gamma \quad \langle \gamma, \mathbf{M} \rangle_F +
+        \mathrm{reg} \cdot f(\gamma)
+
+        s.t. \ \gamma \mathbf{1} &= \mathbf{a}
+
+             \gamma^T \mathbf{1} &= \mathbf{b}
+
+             \gamma &\geq 0
+
+    where :
+
+    - :math:`\mathbf{M}` is the (`ns`, `nt`) metric cost matrix
+    - :math:`f` is the regularization term (and `df` is its gradient)
+    - :math:`\mathbf{a}` and :math:`\mathbf{b}` are source and target weights (sum to 1)
+
+    The algorithm used for solving the problem is conditional gradient as discussed in :ref:`[1] <references-cg>`
+
+
+    Parameters
+    ----------
+    a : array-like, shape (ns,)
+        samples weights in the source domain
+    b : array-like, shape (nt,)
+        samples in the target domain
+    M : array-like, shape (ns, nt)
+        loss matrix
+    reg : float
+        Regularization term >0
+    G0 :  array-like, shape (ns,nt), optional
+        initial guess (default is indep joint density)
+    line_search: function,
+        Function to find the optimal step.
+        Default is None and calls a wrapper to line_search_armijo.
+    numItermax : int, optional
+        Max number of iterations
+    numItermaxEmd : int, optional
+        Max number of iterations for emd
+    stopThr : float, optional
+        Stop threshold on the relative variation (>0)
+    stopThr2 : float, optional
+        Stop threshold on the absolute variation (>0)
+    verbose : bool, optional
+        Print information along iterations
+    log : bool, optional
+        record log if True
+    nx : backend, optional
+        If let to its default value None, the backend will be deduced from other inputs.
+    **kwargs : dict
+             Parameters for linesearch
+
+    Returns
+    -------
+    gamma : (ns x nt) ndarray
+        Optimal transportation matrix for the given parameters
+    log : dict
+        log dictionary return only if log==True in parameters
+
+
+    .. _references-cg:
+    References
+    ----------
+    .. [1] Ferradans, S., Papadakis, N., Peyré, G., & Aujol, J. F. (2014).
+        Regularized discrete optimal transport. SIAM Journal on Imaging Sciences, 7(3), 1853-1882.
+
+    See Also
+    --------
+    ot.lp.emd : Unregularized optimal transport
+    ot.bregman.sinkhorn : Entropic regularized optimal transport
+
+    """
+    if nx is None:
+        if isinstance(M, int) or isinstance(M, float):
+            nx = get_backend(a, b)
+        else:
+            nx = get_backend(a, b, M)
+
+    if line_search is None:
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
+            return line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
+
+    def lp_solver(a, b, M, **kwargs):
+        if unbalanced:
+            return sinkhorn_unbalanced(a, b, M, reg, 0.01, log=True, **kwargs)
+        return emd(a, b, M, numItermaxEmd, log=True)
+
+    return generic_conditional_gradient(
+        a,
+        b,
+        M,
+        f,
+        df,
+        reg,
+        None,
+        lp_solver,
+        line_search,
+        G0=G0,
+        numItermax=numItermax,
+        stopThr=stopThr,
+        stopThr2=stopThr2,
+        verbose=verbose,
+        log=log,
+        nx=nx,
+        **kwargs,
+    )
 
 
 def kl_divergence_corresponding_backend(X, Y):
