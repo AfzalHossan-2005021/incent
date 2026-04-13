@@ -188,7 +188,7 @@ def hierarchical_pairwise_align(
         alpha=alpha,
         beta=beta,
         gamma=gamma,
-        reg_compact=reg_compact,
+        reg_compact=reg_compact*100,
         G_init=G_init_sub,
         numItermax=numItermax,
         use_gpu=use_gpu,
@@ -299,7 +299,7 @@ def hierarchical_pairwise_align(
             G_init=G_init_matched,
             numItermax=numItermax,
             use_gpu=use_gpu,
-            dummy_cell=False,
+            dummy_cell=True,
             **kwargs
         )
         
