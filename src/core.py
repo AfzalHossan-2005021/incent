@@ -502,10 +502,21 @@ def pairwise_align(
     # Run OT
     if G_init is not None:
         if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
-            # Pad user-provided (ns x nt) G_init to augmented dims
+            # Pad user-provided (ns x nt) G_init to augmented dims safely
             _gi = np.array(G_init, dtype=np.float64)
-            _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
-            _gi_aug[:ns, :nt] = _gi
+            _a_np = nx.to_numpy(a)
+            _b_np = nx.to_numpy(b)
+            # Use outer product for safe, strictly positive marginal initialization
+            _gi_aug = np.outer(_a_np, _b_np)
+            
+            # Blend user's G_init into the core cell-to-cell block
+            core_mass = np.sum(_gi_aug[:ns, :nt])
+            if core_mass > 0:
+                _gi_aug[:ns, :nt] = _gi * core_mass
+            else:
+                _gi_aug[:ns, :nt] = _gi
+                
+            _gi_aug /= np.sum(_gi_aug)
             G_init = _gi_aug
         G_init = to_backend(G_init, nx, data_type=data_type)
     
