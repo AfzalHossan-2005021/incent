@@ -191,9 +191,10 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     """
     if m is None:
         m = min(np.sum(p_A), np.sum(p_B)) * 0.999
-        
-    C_A_norm = C_A / (np.max(C_A) + 1e-8)
-    C_B_norm = C_B / (np.max(C_B) + 1e-8)
+
+    scale = max(C_A.max(), C_B.max()) + 1e-8
+    C_A_norm = C_A / scale
+    C_B_norm = C_B / scale
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
     
     logging.info("Running Unbalanced FGW...")
