@@ -201,7 +201,75 @@ def hierarchical_pairwise_align(
         grid_A, grid_B = np.ix_(idx_A, idx_B)
         pi_full[grid_A, grid_B] = pi_sub
 
-    return pi_full
+    print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
+    from .visualize import stack_slices_pairwise
+    try:
+        # 1. Geometrically align full slices using the partial block solution
+        aligned_slices = stack_slices_pairwise([sliceA, sliceB], [pi_full], output_params=False)
+        coords_A_aligned = np.asarray(aligned_slices[0].obsm[spatial_key])
+        coords_B_aligned = np.asarray(aligned_slices[1].obsm[spatial_key])
+        
+        # 2. Determine overlapping regions based on nearest neighbor distances
+        tree_A = cKDTree(coords_A_aligned)
+        tree_B = cKDTree(coords_B_aligned)
+        
+        dist_A_to_B, _ = tree_B.query(coords_A_aligned)
+        dist_B_to_A, _ = tree_A.query(coords_B_aligned)
+        
+        # Threshold for "overlap" - e.g. 2x characteristic spacing of the slices
+        s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
+        s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
+        tau = max(s_A, s_B) * 2.0
+        
+        overlap_mask_A = dist_A_to_B <= tau
+        overlap_mask_B = dist_B_to_A <= tau
+        
+        # Fallback if overlap vanishes perfectly
+        if not np.any(overlap_mask_A): overlap_mask_A[np.argmin(dist_A_to_B)] = True
+        if not np.any(overlap_mask_B): overlap_mask_B[np.argmin(dist_B_to_A)] = True
+        
+        # 3. Calculate distance from EACH cell to the overlapping region of its OWN slice
+        tree_overlap_A = cKDTree(coords_A_aligned[overlap_mask_A])
+        tree_overlap_B = cKDTree(coords_B_aligned[overlap_mask_B])
+        
+        dist_to_overlap_A, _ = tree_overlap_A.query(coords_A_aligned)
+        dist_to_overlap_B, _ = tree_overlap_B.query(coords_B_aligned)
+        
+        # Distance is zero for overlap cells, positive for others
+        dist_to_overlap_A[overlap_mask_A] = 0.0
+        dist_to_overlap_B[overlap_mask_B] = 0.0
+        
+        # 4. Calculate exponential decay weights
+        # Ensures smooth boundary decay avoiding harsh cutoffs
+        sigma_A_full = max(1e-5, np.max(dist_to_overlap_A) / 3.0)
+        sigma_B_full = max(1e-5, np.max(dist_to_overlap_B) / 3.0)
+        
+        weight_A_full = np.exp(- (dist_to_overlap_A**2) / (2 * sigma_A_full**2))
+        weight_B_full = np.exp(- (dist_to_overlap_B**2) / (2 * sigma_B_full**2))
+        
+        G_init_final = np.outer(weight_A_full, weight_B_full)
+        G_init_sum = np.sum(G_init_final)
+        if G_init_sum > 0:
+            G_init_final /= G_init_sum
+            
+        print("--- [HOT] Step 8: Executing Final Full-Slice Base OT ---")
+        pi_full_final = pairwise_align(
+            sliceA=sliceA,
+            sliceB=sliceB,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            reg_compact=reg_compact,
+            G_init=G_init_final,
+            numItermax=numItermax,
+            use_gpu=use_gpu,
+            **kwargs
+        )
+        return pi_full_final
+        
+    except Exception as e:
+        print(f"Global refinement failed: {e}. Returning block-restricted pi_full.")
+        return pi_full
 
 def pairwise_align(
     sliceA: AnnData,
