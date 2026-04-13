@@ -93,11 +93,8 @@ def generalized_procrustes_analysis(
         a = Wn.sum(axis=1)
         b = Wn.sum(axis=0)
 
-        mx = (Wn.sum(axis=1)[:, None] * X_).sum(axis=0) / (a.sum() + eps)
-        my = (Wn.sum(axis=0)[:, None] * Y_).sum(axis=0) / (b.sum() + eps)
-        # Correctly center based on weighted means
-        mx = (X_.T @ a) / (a.sum() + eps)
-        my = (Y_.T @ b) / (b.sum() + eps)
+        mx = (a[:, None] * X_).sum(axis=0)
+        my = (b[:, None] * Y_).sum(axis=0)
 
         Xc = X_ - mx
         Yc = Y_ - my
@@ -145,28 +142,127 @@ def generalized_procrustes_analysis(
         return R_, t_, mx, my
 
     # ------------------------------------------------------------------
-    # 1) Robust Soft Rigid Fit from exact shadow pi
+    # 1) Coarse soft rigid fit from full pi
     # ------------------------------------------------------------------
     pi_mass = float(pi.sum())
     if pi_mass <= eps:
         raise ValueError("The transport plan mass is zero! Cannot align.")
 
-    # Using the continuous soft weighting ensures all points contribute
-    # naturally to the morphology intersection mathematically.
-    # We bypass aggressive Hungarian pruning which forcefully throws away
-    # non-rigid local stretching that causes apparent visual mismatches on boundaries!
     R0, t0, src_center0, _ = _fit_soft_rigid(X, Y, pi, allow_reflection_=allow_reflection)
 
-    X_aligned = X @ R0.T + t0
+    # ------------------------------------------------------------------
+    # 2) Hard partial one-to-one projection of pi
+    # ------------------------------------------------------------------
+    n, m = pi.shape
+    row_mass = pi.sum(axis=1)
+    active_rows = np.where(row_mass > eps)[0]
+
+    if len(active_rows) < 2:
+        # Too little support to do anything more robust than the soft fit
+        X_aligned = X @ R0.T + t0
+        Y_aligned = Y.copy()
+
+        if not output_params:
+            return X_aligned, Y_aligned
+
+        theta = float(np.arctan2(R0[1, 0], R0[0, 0]))
+        if matrix:
+            return X_aligned, Y_aligned, R0, src_center0, t0
+        return X_aligned, Y_aligned, theta, src_center0, t0
+
+    s = _target_scale(Y)
+    topk = _auto_topk(m) if topk is None else max(1, min(int(topk), m))
+
+    all_real_cols = set()
+    cand_cols_per_row = []
+    real_costs_per_row = []
+
+    for i in active_rows:
+        cond = pi[i] / max(row_mass[i], eps)
+
+        cand = np.argsort(-cond)[:topk]
+        cand = cand[cond[cand] > eps]
+
+        if cand.size == 0:
+            cand = np.array([int(np.argmax(pi[i]))], dtype=int)
+
+        x_pred = X[i] @ R0.T + t0
+        resid = np.linalg.norm(Y[cand] - x_pred[None, :], axis=1) / s
+        prob_cost = -np.log(cond[cand] + eps)
+
+        # Both terms are dimensionless:
+        # -log(prob) rewards confident OT mass
+        # residual/s rewards rigid consistency with the coarse transform
+        cost = prob_cost + resid
+
+        cand_cols_per_row.append(cand)
+        real_costs_per_row.append(cost)
+        all_real_cols.update(cand.tolist())
+
+    all_real_cols = np.array(sorted(all_real_cols), dtype=int)
+    real_col_to_idx = {j: idx for idx, j in enumerate(all_real_cols)}
+
+    nr = len(active_rows)
+    nc_real = len(all_real_cols)
+    BIG = 1e9
+    C = np.full((nr, nc_real + nr), BIG, dtype=float)
+
+    for r, (i, cand, cost) in enumerate(zip(active_rows, cand_cols_per_row, real_costs_per_row)):
+        for j, c in zip(cand, cost):
+            C[r, real_col_to_idx[int(j)]] = float(c)
+
+        # Private dummy for this row -> allows unmatched source rows
+        med = float(np.median(cost))
+        mad = float(np.median(np.abs(cost - med)))
+        reject_cost = med + 1.4826 * mad
+        if not np.isfinite(reject_cost):
+            reject_cost = med + 1.0
+        if reject_cost <= float(np.min(cost)):
+            reject_cost = float(np.min(cost) + max(0.5, mad + 0.5))
+
+        C[r, nc_real + r] = reject_cost
+
+    row_ind, col_ind = linear_sum_assignment(C)
+
+    pairs = []
+    weights = []
+
+    for r, c in zip(row_ind, col_ind):
+        if c >= nc_real:
+            continue  # matched to private dummy -> leave row unmatched
+
+        i = int(active_rows[r])
+        j = int(all_real_cols[c])
+        pairs.append((i, j))
+        weights.append(row_mass[i])
+
+    # ------------------------------------------------------------------
+    # 3) Final rigid fit on hard support only
+    # ------------------------------------------------------------------
+    if len(pairs) >= 2:
+        src_idx = np.array([i for i, _ in pairs], dtype=int)
+        tgt_idx = np.array([j for _, j in pairs], dtype=int)
+        w = np.asarray(weights, dtype=float)
+
+        R, t, src_center, _ = _fit_pairs_rigid(
+            X[src_idx],
+            Y[tgt_idx],
+            w=w,
+            allow_reflection_=allow_reflection,
+        )
+    else:
+        R, t, src_center = R0, t0, src_center0
+
+    X_aligned = X @ R.T + t
     Y_aligned = Y.copy()
 
     if not output_params:
         return X_aligned, Y_aligned
 
-    theta = float(np.arctan2(R0[1, 0], R0[0, 0]))
+    theta = float(np.arctan2(R[1, 0], R[0, 0]))
     if matrix:
-        return X_aligned, Y_aligned, R0, src_center0, t0
-    return X_aligned, Y_aligned, theta, src_center0, t0
+        return X_aligned, Y_aligned, R, src_center, t
+    return X_aligned, Y_aligned, theta, src_center, t
 
 
 def stack_slices_pairwise(
