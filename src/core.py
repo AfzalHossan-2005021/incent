@@ -639,9 +639,24 @@ def neighborhood_distribution_fourier(
     n_cells = coords.shape[0]
     n_types = len(cell_types)
     n_shells_eff = len(shell_edges) - 1
-    n_harm = len(harmonics)
+    
+    n_harm = 0
+    for m in harmonics:
+        if m == 0: n_harm += 1
+        else:      n_harm += 2
 
     shell_areas = np.pi * (shell_edges[1:] ** 2 - shell_edges[:-1] ** 2)
+
+    # Compute tissue reference direction once using PCA for phase-coherent chirality
+    def compute_reference_angle(pts):
+        centered = pts - pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        v1 = vh[0]
+        if np.mean((centered @ v1) ** 3) < 0:
+            v1 = -v1
+        return np.arctan2(v1[1], v1[0])
+    
+    ref_angle = compute_reference_angle(coords)
 
     # group index = type * n_shells + shell
     n_groups = n_types * n_shells_eff
@@ -689,20 +704,39 @@ def neighborhood_distribution_fourier(
 
         local = np.zeros((n_groups, n_harm), dtype=np.float64)
 
-        for h_pos, m in enumerate(harmonics):
+        h_pos = 0
+        for m in harmonics:
             if m == 0:
                 mag = np.bincount(group_idx, weights=w, minlength=n_groups).astype(np.float64)
+                if area_normalize:
+                    mag = mag / np.maximum(group_area, 1e-12)
+                mag *= harmonic_weights.get(m, 1.0)
+                local[:, h_pos] = mag
+                h_pos += 1
             else:
                 ang = m * theta
                 real = np.bincount(group_idx, weights=w * np.cos(ang), minlength=n_groups)
                 imag = np.bincount(group_idx, weights=w * np.sin(ang), minlength=n_groups)
-                mag = np.hypot(real, imag)
-
-            if area_normalize:
-                mag = mag / np.maximum(group_area, 1e-12)
-
-            mag *= harmonic_weights.get(m, 1.0)
-            local[:, h_pos] = mag
+                
+                phase_anchor = np.exp(-1j * m * ref_angle)
+                descriptor_complex = (real + 1j * imag) * phase_anchor
+                
+                mag_real = descriptor_complex.real
+                mag_imag = descriptor_complex.imag
+                
+                if area_normalize:
+                    mag_real = mag_real / np.maximum(group_area, 1e-12)
+                    mag_imag = mag_imag / np.maximum(group_area, 1e-12)
+                    
+                mag_real *= harmonic_weights.get(m, 1.0)
+                mag_imag *= harmonic_weights.get(m, 1.0)
+                
+                local[:, h_pos] = mag_real
+                local[:, h_pos+1] = mag_imag
+                h_pos += 2
+                
+        # Make nonnegative for Jensen-Shannon divergence
+        local = local - local.min()
 
         flat = local.reshape(-1)
 
