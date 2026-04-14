@@ -304,103 +304,97 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
     adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
-    # 3. Select ENLARGED subset of transport masses
-    flat_pi = Pi_cluster.flatten()
-    sorted_idx = np.argsort(flat_pi)[::-1]
-    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
+    # 3. Parameter-free statistical expectation for OT plan
+    # Under random/independent transport, mass distributes as the outer product of marginals.
+    marg_A = np.sum(Pi_cluster, axis=1)
+    marg_B = np.sum(Pi_cluster, axis=0)
+    expected_pi = np.outer(marg_A, marg_B) / (total_mass + 1e-8)
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass)
-    selected_flat_idx = sorted_idx[:cutoff_idx+1]
+    # True biological assignments must concentrate mass significantly above this mathematical null expectation.
+    significant_matches = (Pi_cluster > expected_pi) & (Pi_cluster > 0)
     
-    matches = []
-    for idx in selected_flat_idx:
-        u, v = np.unravel_index(idx, Pi_cluster.shape)
-        if valid_A[u] and valid_B[v]:
-            matches.append((u, v))
-            
-    num_matches = len(matches)
-    if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+    valid_masses = Pi_cluster.copy()
+    valid_masses[~significant_matches] = 0.0
+    
+    if np.max(valid_masses) == 0:
+        valid_masses = Pi_cluster # Fallback if null test yields no pairs
         
-    # 4. Enforce Structural Similarity & Continuity via Match-Graph
-    # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
-    match_adj = np.zeros((num_matches, num_matches), dtype=bool)
-    for i in range(num_matches):
-        u1, v1 = matches[i]
-        for j in range(i+1, num_matches):
-            u2, v2 = matches[j]
-            if adj_A[u1, u2] and adj_B[v1, v2]:
-                match_adj[i, j] = True
-                match_adj[j, i] = True
-
-    # Find the largest Structurally Co-Contiguous Component
-    n_comp, comp_labels = connected_components(match_adj, directed=False)
-    largest = np.bincount(comp_labels).argmax()
-    largest_match_indices = np.where(comp_labels == largest)[0]
+    # 4. Region Growing via Contiguous Expansion from Most Confident Seed
+    start_flat = np.argmax(valid_masses)
+    start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
     
-    strong_A = list(set([matches[i][0] for i in largest_match_indices]))
-    strong_B = list(set([matches[i][1] for i in largest_match_indices]))
+    strong_A = {start_A}
+    strong_B = {start_B}
+    visited_pairs = {(start_A, start_B)}
     
-    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
-    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
+    # Precompute individual cluster masses for accurate center-of-mass tracking
+    masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
+    masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
 
-    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-    
-    # Compute initial barycenters of the starting core components
-    bary_A = np.mean(centroids_A[strong_A], axis=0)
-    bary_B = np.mean(centroids_B[strong_B], axis=0)
-
-    # 5. Determine Target Expansion Size
-    # Target is 1/3 of the clusters of the smaller slice
-    target_count = max(1, int(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))
-    print(f"[HOT] Topological Extension: Expanding until {target_count} clusters are in the strong set.")
-
-    # 6. Cluster-level Topological Extension
-    while min(len(strong_A), len(strong_B)) < target_count:
-        # Find all topological neighbors of the current strong components
-        neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
-        neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
+    while True:
+        # The morphological frontier: valid clusters directly touching the current core
+        frontier_A = {i for i in range(num_clusters_A) if np.any(adj_A[i, list(strong_A)]) and valid_A[i] and i not in strong_A}
+        frontier_B = {j for j in range(num_clusters_B) if np.any(adj_B[j, list(strong_B)]) and valid_B[j] and j not in strong_B}
         
-        # Exclude clusters already in the strong set
-        candidates_A = [c for c in neighbors_A if c not in strong_A and valid_A[c]]
-        candidates_B = [c for c in neighbors_B if c not in strong_B and valid_B[c]]
+        # Target candidates can extend the core contiguously in A, B, or both.
+        candidates_A = frontier_A.union(strong_A)
+        candidates_B = frontier_B.union(strong_B)
         
-        if not candidates_A or not candidates_B:
-            break
-            
-        # Find the valid matching pair that is closest to the initial barycenters
+        # Dynamic center of mass of the assembled biological core
+        bary_A = np.average(centroids_A[list(strong_A)], axis=0, weights=masses_A[list(strong_A)])
+        bary_B = np.average(centroids_B[list(strong_B)], axis=0, weights=masses_B[list(strong_B)])
+        
+        # Compute current spatial radius of the core to evaluate isometric scaling
+        rad_A = np.mean([np.linalg.norm(centroids_A[c] - bary_A) for c in strong_A])
+        rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in strong_B])
+        rad_A = rad_A if rad_A > 0 else 1.0
+        rad_B = rad_B if rad_B > 0 else 1.0
+        
         best_pair = None
-        best_dist = float('inf')
+        best_score = -1.0
         
         for pA in candidates_A:
             for pB in candidates_B:
-                dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
-                dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
-                
-                # We minimize the combined distance to the respective barycenters
-                total_dist = dist_A + dist_B
-                if total_dist < best_dist:
-                    best_dist = total_dist
-                    best_pair = (pA, pB)
+                if pA in strong_A and pB in strong_B: continue
+                if (pA, pB) in visited_pairs: continue
                     
-        # Add the best geometrically compact pair
-        if best_pair is not None:
-            strong_A.append(best_pair[0])
-            strong_B.append(best_pair[1])
+                # Must pass null expectation
+                if valid_masses[pA, pB] > 0:
+                    # Geometric Rigidity Penalty: 
+                    # Assesses whether the candidate expands the core isometrically in both slices.
+                    dist_A = np.linalg.norm(centroids_A[pA] - bary_A) / rad_A
+                    dist_B = np.linalg.norm(centroids_B[pB] - bary_B) / rad_B
+                    
+                    # Penalize spatial deformation (0 if perfectly isometric)
+                    geom_penalty = abs(dist_A - dist_B) / max(dist_A, dist_B, 1e-8)
+                    
+                    # Maximize confident OT mass while penalizing shapes that stretch asymmetrically
+                    score = valid_masses[pA, pB] * (1.0 - geom_penalty)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_pair = (pA, pB)
+                        
+        if best_pair is not None and best_score > 0:
+            strong_A.add(best_pair[0])
+            strong_B.add(best_pair[1])
+            visited_pairs.add(best_pair)
         else:
             break
+            
+    strong_A = list(strong_A)
+    strong_B = list(strong_B)
 
-    # Extract final cells based strictly on expanded cluster membership
+    if len(strong_A) == 0 or len(strong_B) == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+        
+    # 5. Extract Final Cell Indices
     idx_A = np.where(np.isin(labels_A, strong_A))[0]
     idx_B = np.where(np.isin(labels_B, strong_B))[0]
 
-    # Compute physical distances from the newly expanded core to all cells
-    core_coords_A = coords_A[idx_A]
-    core_coords_B = coords_B[idx_B]
-
-    tree_A = cKDTree(core_coords_A)
-    tree_B = cKDTree(core_coords_B)
+    # Compute physical distances from the contiguous footprint back to all cells
+    tree_A = cKDTree(coords_A[idx_A])
+    tree_B = cKDTree(coords_B[idx_B])
     
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
