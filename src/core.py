@@ -312,6 +312,51 @@ def hierarchical_pairwise_align(
         print(f"Global refinement failed: {e}. Returning block-restricted pi_full.")
         return pi_full
 
+
+def align_multiple_slices(
+    slices: list[AnnData],
+    spatial_key: str = "spatial",
+) -> list[NDArray]:
+    """
+    Aligns a stack of N spatial transcriptomics slices sequentially (0 <- 1 <- 2 ... <- N).
+    
+    Args:
+        slices: A list of N AnnData objects representing adjacent tissue slices.
+        spatial_key: The key in obsm for the spatial coordinates.
+        visualize_stack: Whether to plot the multi-slice 3D spatial alignment.
+        z_spacing: Distance parameter artificial height injected between slices.
+        **kwargs: Arguments to pass down to hierarchical_pairwise_align.
+        
+    Returns:
+        aligned_slices: List of N AnnData objects with updated spatial coordinates aligned to slice 0.
+        pi_matrices: List of N-1 transport matrices mapping each slice i to i+1.
+    """
+    if len(slices) < 2:
+        raise ValueError("At least 2 slices are required for alignment.")
+        
+    from .visualize import stack_slices_pairwise, visualize_3d_stack
+    
+    pi_matrices = []
+    
+    print(f"Starting Multi-Slice Alignment for {len(slices)} slices...")
+    
+    # Step 1: Compute OT matchings for all consecutive pairs
+    for i in range(len(slices) - 1):
+        print(f"\n{'='*40}")
+        print(f"Aligning Pair {i} and {i+1}")
+        print(f"{'='*40}")
+        
+        pi_pair = hierarchical_pairwise_align(
+            sliceA=slices[i], 
+            sliceB=slices[i+1], 
+            spatial_key=spatial_key,
+            **kwargs
+        )
+        pi_matrices.append(pi_pair)
+    
+    return pi_matrices
+
+
 def pairwise_align(
     sliceA: AnnData,
     sliceB: AnnData,
