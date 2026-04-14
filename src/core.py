@@ -316,6 +316,7 @@ def hierarchical_pairwise_align(
 def align_multiple_slices(
     slices: list[AnnData],
     spatial_key: str = "spatial",
+    **kwargs
 ) -> list[NDArray]:
     """
     Aligns a stack of N spatial transcriptomics slices sequentially (0 <- 1 <- 2 ... <- N).
@@ -333,8 +334,6 @@ def align_multiple_slices(
     """
     if len(slices) < 2:
         raise ValueError("At least 2 slices are required for alignment.")
-        
-    from .visualize import stack_slices_pairwise, visualize_3d_stack
     
     pi_matrices = []
     
