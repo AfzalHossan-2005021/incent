@@ -30,7 +30,6 @@ def hierarchical_pairwise_align(
     use_rep: Optional[str] = "X_pca",
     label_key: str = "cell_type_annot",
     w_expr: float = 0.4,
-    w_type: float = 0.4,
     w_struct: float = 0.2,
     w_graph: float = 0.5,
     visualize_clusters: bool = True,
@@ -56,16 +55,11 @@ def hierarchical_pairwise_align(
         visualize_clustered_slices(sliceA, sliceB, labelsA, labelsB, spatial_key=spatial_key)
     
     print("--- [HOT] Step 2: Extracting Cluster Features ---")
-    featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, all_types=all_types)
-    featB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, all_types=all_types)
-    
-    p_A, _, _, centroidsA, _, _ = featA
-    p_B, _, _, centroidsB, _, _ = featB
+    p_A, centroidsA, mu_exprA, mu_structA  = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, all_types=all_types)
+    p_B, centroidsB, mu_exprB, mu_structB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, all_types=all_types)
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    # Note: If w_struct is used, w_type is inherently redundant because the 0th harmonic of the cluster 
-    # structural feature is exactly its cell type composition. User can set w_type=0.0 when w_struct>0.
-    M_cluster = compute_cluster_costs(featA, featB, w_expr, w_type, w_struct)
+    M_cluster = compute_cluster_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, w_expr, w_struct)
     C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     
@@ -77,10 +71,7 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
-        sliceA, sliceB, labelsA, labelsB, Pi_cluster, mass_pct=macro_section_mass_pct,
-        spatial_key=spatial_key, extension_hops=cluster_extension_hops
-    )
+    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(sliceA, sliceB, labelsA, labelsB, Pi_cluster, spatial_key=spatial_key)
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 

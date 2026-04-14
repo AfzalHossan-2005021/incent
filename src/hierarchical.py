@@ -1,15 +1,17 @@
-import ot
 import logging
 import numpy as np
 import scipy.sparse as sp
 
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
-from scipy.spatial import distance_matrix
+from scipy.spatial import distance_matrix, Delaunay
 from scipy.sparse.csgraph import connected_components
+from sklearn.metrics.pairwise import cosine_distances
+from scipy.spatial.distance import jensenshannon
+from ot.gromov import fused_unbalanced_gromov_wasserstein
 
 
-def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X", label_key="cell_type_annot", all_types=None):
+def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X_pca", label_key="cell_type_annot", all_types=None) -> tuple:
     """
     Extract cluster-level features for coarse mapping.
     
@@ -23,11 +25,9 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         
     Returns:
         masses: np.ndarray (C,) normalized size of each cluster
-        mu_expr: np.ndarray (C, D) mean expression/latent vector
-        hist_types: np.ndarray (C, T) normalized cell-type histograms
         centroids: np.ndarray (C, 2) average spatial coordinate
-        unique_labels: np.ndarray (C,)
-        mu_struct: np.ndarray (C, T * 3) spatial distribution within the cluster itself, or None
+        mu_expr: np.ndarray (C, D) mean expression/latent vector
+        mu_struct: np.ndarray (C, T * 3) spatial distribution within the cluster itself based on 3 Fourier harmonics of the cell type localization
     """
     coords = adata.obsm[spatial_key]
     n_cells = coords.shape[0]
@@ -54,7 +54,6 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     
     masses = np.zeros(n_clusters)
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
-    hist_types = np.zeros((n_clusters, n_types))
     centroids = np.zeros((n_clusters, 2))
     
     # 3 harmonics (m=0, 1, 2) per cell type
@@ -73,7 +72,6 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             # Map types; ignore if they don't exist in target mapping
             mapped_types = [type_map[t] for t in c_types if t in type_map]
             counts = np.bincount(mapped_types, minlength=n_types).astype(np.float64)
-            hist_types[c_i, :] = counts / float(c_size) # normalized histogram
             
             # --- Computed Intrinsic Cluster Fourier Context ---
             # Evaluates cell localization RELATIVE to the macro-cluster centroid
@@ -99,86 +97,83 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
                 flat /= flat.sum()
             mu_struct[c_i, :] = flat
             
-    return masses, mu_expr, hist_types, centroids, unique_labels, mu_struct
+    return masses, centroids, mu_expr, mu_struct
 
 
-def compute_cluster_costs(featuresA, featuresB, w_expr=0.5, w_type=0.5, w_struct=0.0):
+def compute_cluster_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, w_expr=0.25, w_struct=0.75):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
     
     Args:
-        featuresA: Tuple of features from slice A
-        featuresB: Tuple of features from slice B
+        mu_expr_A: np.ndarray (C_A, D) mean expression for slice A
+        mu_struct_A: np.ndarray (C_A, T * 3) structural features for slice A
+        mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
+        mu_struct_B: np.ndarray (C_B, T * 3) structural features for slice B
+        w_expr: weight for expression distance
+        w_struct: weight for structural distance
         
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
     """
-    _, mu_expr_A, hist_types_A, _, _, mu_struct_A = featuresA
-    _, mu_expr_B, hist_types_B, _, _, mu_struct_B = featuresB
     
     # Cosine distance for continuous expression
-    from sklearn.metrics.pairwise import cosine_distances
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
-    
-    # Jensen-Shannon for categorical cell types (histograms are sum=1)
-    from scipy.spatial.distance import jensenshannon
-    M_type = np.zeros((hist_types_A.shape[0], hist_types_B.shape[0]))
-    for i in range(hist_types_A.shape[0]):
-        for j in range(hist_types_B.shape[0]):
-            # js returns distance, bounded 0-1. Can square for JS divergence if desired.
-            M_type[i, j] = jensenshannon(hist_types_A[i], hist_types_B[j])
             
-    # Re-weighting based on provided w_struct
-    total_w = w_expr + w_type + w_struct
+    # Jensen-Shannon for cell type histograms (probability distributions)
+    M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
+    for i in range(mu_struct_A.shape[0]):
+        for j in range(mu_struct_B.shape[0]):
+            # Using Jensen-Shannon since the fourier features are normalized probabilistic distributions over space
+            M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
+    
+    # Combine with weights; normalize to ensure balanced contributions
+    total_w = w_expr + w_struct
     if total_w == 0: total_w = 1.0
+
     w_expr_norm = w_expr / total_w
-    w_type_norm = w_type / total_w
     w_struct_norm = w_struct / total_w
     
-    M_cluster = w_expr_norm * M_expr + w_type_norm * M_type
-    
-    if mu_struct_A is not None and mu_struct_B is not None and w_struct > 0:
-        M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
-        for i in range(mu_struct_A.shape[0]):
-            for j in range(mu_struct_B.shape[0]):
-                # Using Jensen-Shannon since the fourier features are normalized probabilistic distributions over space
-                M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
-        
-        M_cluster += w_struct_norm * M_struct
+    M_cluster = w_expr_norm * M_expr + w_struct_norm * M_struct
         
     return M_cluster
 
 
-def compute_cluster_structural_matrix(centroids, w_euc=1.0, w_graph=0.0):
+def compute_cluster_structural_matrix(centroids, w_euc=0.5, w_graph=0.5):
     """
-    Compute intra-slice structure matrix C.
+    Compute the structural distance matrix C for clusters based on their centroids.
     
     Args:
         centroids: (C, 2) coords of clusters.
+        w_euc: weight for direct euclidean distance.
+        w_graph: weight for graph-based distance.
+    
+    Returns:
+        C: (C, C) combined structural distance matrix.
     """
     # Simple euclidean distance for now if w_graph is 0
     C_euc = distance_matrix(centroids, centroids)
     
     if w_graph > 0:
-        from scipy.spatial import Delaunay
         # build adj matrix
         n = centroids.shape[0]
         adj = np.zeros((n, n))
-        try:
-            tri = Delaunay(centroids)
-            indptr, indices = tri.vertex_neighbor_vertices
-            for i in range(n):
-                for j in indices[indptr[i]:indptr[i+1]]:
-                    adj[i, j] = np.linalg.norm(centroids[i] - centroids[j])
+
+        tri = Delaunay(centroids)
+        indptr, indices = tri.vertex_neighbor_vertices
+        for i in range(n):
+            for j in indices[indptr[i]:indptr[i+1]]:
+                adj[i, j] = np.linalg.norm(centroids[i] - centroids[j])
+        
+        C_graph = dijkstra(sp.csr_matrix(adj), directed=False)
+        # handle infinite dists
+        C_graph[np.isinf(C_graph)] = np.max(C_graph[~np.isinf(C_graph)]) * 2
+        
+        w_total = w_euc + w_graph
+        if w_total == 0: w_total = 1.0
+        w_euc_norm = w_euc / w_total
+        w_graph_norm = w_graph / w_total
             
-            C_graph = dijkstra(sp.csr_matrix(adj), directed=False)
-            # handle infinite dists
-            C_graph[np.isinf(C_graph)] = np.max(C_graph[~np.isinf(C_graph)]) * 2
-        except Exception as e:
-            logging.warning(f"Delaunay failed: {e}. Falling back to 100% euclidean.")
-            C_graph = C_euc
-            
-        C = w_euc * C_euc + w_graph * C_graph
+        C = w_euc_norm * C_euc + w_graph_norm * C_graph
     else:
         C = C_euc
         
@@ -198,90 +193,16 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     
     logging.info("Running Unbalanced FGW...")
     # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
-    pi_samp, pi_feat, log = ot.gromov.fused_unbalanced_gromov_wasserstein(
+    pi_samp, pi_feat, log = fused_unbalanced_gromov_wasserstein(
         Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, log=True, max_iter=500
     )
     
     return pi_samp
 
 
-def build_block_restricted_cost(M_cell, labels_A, labels_B, Pi_cluster, threshold=1e-4, penalty=1e6):
-    """
-    Blocks out cell pairs where their corresponding macro-regions aren't aligned.
-    
-    Args:
-        M_cell: (N, M) original feature cost matrix for cells.
-        labels_A: (N,) macro cluster assignment for A.
-        labels_B: (M,) macro cluster assignment for B.
-        Pi_cluster: (C_A, C_B) soft transport matrix from coarse step.
-        threshold: minimum macro transport to consider the blocks alive.
-        penalty: amount to add to M_cell for blocked pairs.
-        
-    Returns:
-        M_penalty: (N, M) new cost matrix
-        mask: (N, M) boolean mask of active blocks
-    """
-    n, m = M_cell.shape
-    M_penalty = M_cell.copy()
-    mask = np.zeros((n, m), dtype=bool)
-    
-    for i in range(Pi_cluster.shape[0]):
-        for j in range(Pi_cluster.shape[1]):
-            if Pi_cluster[i, j] > threshold:
-                idx_A = np.where(labels_A == i)[0]
-                idx_B = np.where(labels_B == j)[0]
-                if len(idx_A) > 0 and len(idx_B) > 0:
-                    # Mark active
-                    grid_A, grid_B = np.ix_(idx_A, idx_B)
-                    mask[grid_A, grid_B] = True
-                    
-    M_penalty[~mask] += penalty
-    return M_penalty, mask
-
-
-def blockwise_g_init(labels_A, labels_B, Pi_cluster):
-    """
-    Expands the coarse Pi_cluster into an initial transport map G_init for cells.
-    
-    Args:
-        labels_A: (N,)
-        labels_B: (M,)
-        Pi_cluster: (C_A, C_B)
-        
-    Returns:
-        G_init: (N, M)
-    """
-    N = len(labels_A)
-    M = len(labels_B)
-    G_init = np.zeros((N, M))
-    
-    for i in range(Pi_cluster.shape[0]):
-        idx_A = np.where(labels_A == i)[0]
-        nA = len(idx_A)
-        if nA == 0: continue
-            
-        for j in range(Pi_cluster.shape[1]):
-            idx_B = np.where(labels_B == j)[0]
-            nB = len(idx_B)
-            if nB == 0: continue
-                
-            val = Pi_cluster[i, j] / (nA * nB)
-            grid_A, grid_B = np.ix_(idx_A, idx_B)
-            G_init[grid_A, grid_B] = val
-            
-    # normalize row sums to 1/N
-    G_sums = G_init.sum()
-    if G_sums > 0:
-        G_init = G_init / G_sums
-        
-    return G_init
-
-
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, mass_pct=0.85, spatial_key='spatial', extension_hops=2):
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
     """
     Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
-    Returns the cell indices for the extended macro-region in both slices,
-    along with their boundary-distances for weight decay.
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
     
@@ -311,7 +232,6 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # 2. Build Structural Adjacency Matrices for Clusters based on true spatial borders
     # Using Delaunay triangulation filtered by maximum edge length (Alpha-shape approximation)
     # This prevents identifying clusters as neighbors if they are separated by empty space/background gaps.
-    from scipy.spatial import Delaunay
     
     def get_max_edge_len(coords):
         if len(coords) < 6: return float('inf')
@@ -350,12 +270,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     np.fill_diagonal(adj_A, True)
     np.fill_diagonal(adj_B, True)
 
-    # 3. Select ENLARGED subset of transport masses (Top {mass_pct} of total mass)
+    # 3. Select ENLARGED subset of transport masses (Top 50% of total mass)
     flat_pi = Pi_cluster.flatten()
     sorted_idx = np.argsort(flat_pi)[::-1]
     sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * mass_pct)
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.5) # Start with top 50% of mass; can be adjusted
     selected_flat_idx = sorted_idx[:cutoff_idx+1]
     
     matches = []
