@@ -225,46 +225,63 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             centroids_B[i] = coords_B[mask].mean(axis=0)
             valid_B[i] = True
 
-    # 2. Build Structural Adjacency Matrices for Clusters based on true spatial borders
-    # Using Delaunay triangulation filtered by maximum edge length (Alpha-shape approximation)
-    # This prevents identifying clusters as neighbors if they are separated by empty space/background gaps.
-    
-    def get_max_edge_len(coords):
-        if len(coords) < 6: return float('inf')
-        d, _ = cKDTree(coords).query(coords, k=6)
-        return np.median(d[:, -1]) * 5.0 # Max boundary edge is 5x natural local density 
+    # 2. Build Structural Adjacency Matrices for Clusters based on local density interaction radii
+    def build_structural_adjacency(coords, labels, valid_mask):
+        n_clusters = len(valid_mask)
+        adj = np.zeros((n_clusters, n_clusters), dtype=bool)
+        np.fill_diagonal(adj, True)
         
-    max_edge_A = get_max_edge_len(coords_A)
-    max_edge_B = get_max_edge_len(coords_B)
-    
-    adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
-    if N >= 3:
-        tri_A = Delaunay(coords_A)
-        for simplex in tri_A.simplices:
-            lab = labels_A[simplex]
-            for i in range(3):
-                for j in range(i+1, 3):
-                    if lab[i] != lab[j] and valid_A[lab[i]] and valid_A[lab[j]]:
-                        dist = np.linalg.norm(coords_A[simplex[i]] - coords_A[simplex[j]])
-                        if dist < max_edge_A:
-                            adj_A[lab[i], lab[j]] = True
-                            adj_A[lab[j], lab[i]] = True
-                        
-    adj_B = np.zeros((num_clusters_B, num_clusters_B), dtype=bool)
-    if M >= 3:
-        tri_B = Delaunay(coords_B)
-        for simplex in tri_B.simplices:
-            lab = labels_B[simplex]
-            for i in range(3):
-                for j in range(i+1, 3):
-                    if lab[i] != lab[j] and valid_B[lab[i]] and valid_B[lab[j]]:
-                        dist = np.linalg.norm(coords_B[simplex[i]] - coords_B[simplex[j]])
-                        if dist < max_edge_B:
-                            adj_B[lab[i], lab[j]] = True
-                            adj_B[lab[j], lab[i]] = True
+        valid_idx = np.where(valid_mask)[0]
+        if len(valid_idx) < 2:
+            return adj
+            
+        centroids = np.zeros((len(valid_idx), 2))
+        kdtries = {}
+        intra_dists = {}
+        
+        # Determine internal neighborhood spacings per cluster
+        for i, c_id in enumerate(valid_idx):
+            c_coords = coords[labels == c_id]
+            centroids[i] = c_coords.mean(axis=0)
+            
+            tree = cKDTree(c_coords)
+            kdtries[c_id] = tree
+            
+            if len(c_coords) > 1:
+                # 99th percentile of internal 1-NN distances dictates natural maximum spacing
+                d, _ = tree.query(c_coords, k=2)
+                intra_dists[c_id] = np.percentile(d[:, 1], 99)
+            else:
+                intra_dists[c_id] = 0.0
 
-    np.fill_diagonal(adj_A, True)
-    np.fill_diagonal(adj_B, True)
+        # Centroid Delaunay quickly limits our evaluations to macroscopic topological neighbors
+        if len(valid_idx) >= 3:
+            tri = Delaunay(centroids)
+            candidate_edges = set()
+            for simplex in tri.simplices:
+                for i in range(3):
+                    for j in range(i+1, 3):
+                        u, v = valid_idx[simplex[i]], valid_idx[simplex[j]]
+                        candidate_edges.add((min(u, v), max(u, v)))
+        else:
+            u, v = valid_idx[0], valid_idx[1]
+            candidate_edges = {(min(u, v), max(u, v))}
+            
+        # Parameter-free geometric verification
+        for u, v in candidate_edges:
+            # Minimum physical inter-cluster gap via rapid KD-Tree
+            min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
+            min_gap = np.min(min_dists)
+            
+            # Clusters touch if the gap is smaller than their combined local topological spacing
+            if min_gap <= (intra_dists[u] + intra_dists[v]):
+                adj[u, v] = True
+                adj[v, u] = True
+                
+        return adj
+
+    adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
+    adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
     # 3. Select ENLARGED subset of transport masses (Top 50% of total mass)
     flat_pi = Pi_cluster.flatten()
@@ -373,3 +390,4 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     dist_B, _ = tree_B.query(coords_B)
     
     return idx_A, idx_B, dist_A, dist_B
+
