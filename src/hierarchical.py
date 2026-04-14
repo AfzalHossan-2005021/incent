@@ -403,8 +403,61 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         else:
             break
             
-    strong_A = list(strong_A)
-    strong_B = list(strong_B)
+    # --- Final Polish: Shadow Alignment Refinement ---
+    # Re-evaluate all assigned and unassigned clusters using the final converged rigid body projection.
+    # We strip out structurally incoherent clusters that were incorporated early and replace them.
+    sA_list = list(strong_A)
+    sB_list = list(strong_B)
+    bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
+    bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
+    
+    rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list])
+    rad_B = rad_B if rad_B > 0 else 1.0
+
+    P_c = centroids_A[sA_list] - bary_A
+    Q_c = centroids_B[sB_list] - bary_B
+    W_cross = valid_masses[np.ix_(sA_list, sB_list)]
+    H = P_c.T @ W_cross @ Q_c
+
+    U, _, Vt = np.linalg.svd(H)
+    R_final = U @ Vt
+    if np.linalg.det(R_final) < 0:
+        Vt[-1, :] *= -1
+        R_final = U @ Vt
+        
+    # Project all valid_A nodes into B's space using the converged global rigid rotation
+    proj_A = (centroids_A - bary_A) @ R_final + bary_B
+    
+    new_strong_A = set()
+    new_strong_B = set()
+    
+    # Bipartite Assignment over the entire valid field based on the computed geometrical structural shadow
+    for pA in range(num_clusters_A):
+        if not valid_A[pA]: continue
+        
+        # Only evaluate valid B clusters
+        valid_B_idx = np.where(valid_B)[0]
+        
+        best_pB = None
+        best_score = -1.0
+        
+        for pB in valid_B_idx:
+            if valid_masses[pA, pB] > 0:
+                shadow_dist = np.linalg.norm(proj_A[pA] - centroids_B[pB])
+                shadow_penalty = shadow_dist / rad_B
+                score = valid_masses[pA, pB] * np.exp(-shadow_penalty)
+                
+                # Only accept pairs with score heavily aligned to the actual shadow (> 10% of pure valid OT mass)
+                if score > best_score and score > (valid_masses[pA, pB] * 0.1):
+                    best_score = score
+                    best_pB = pB
+                    
+        if best_pB is not None:
+            new_strong_A.add(pA)
+            new_strong_B.add(best_pB)
+            
+    strong_A = list(new_strong_A)
+    strong_B = list(new_strong_B)
 
     if len(strong_A) == 0 or len(strong_B) == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
