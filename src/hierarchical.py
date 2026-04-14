@@ -201,15 +201,17 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     """
     if m is None:
         m = min(np.sum(p_A), np.sum(p_B)) * 0.999
+
+    scale = max(C_A.max(), C_B.max()) + 1e-8
         
-    C_A_norm = C_A / (np.max(C_A) + 1e-8)
-    C_B_norm = C_B / (np.max(C_B) + 1e-8)
+    C_A_norm = C_A / scale
+    C_B_norm = C_B / scale
     M_norm = M_cluster / (np.max(M_cluster) + 1e-8)
     
     logging.info("Running Unbalanced FGW...")
     # reg_marginals controls how much marginal relaxation is allowed (lower = more mass can be dropped)
-    pi_samp, pi_feat, log = fused_unbalanced_gromov_wasserstein(
-        Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, log=True, max_iter=500
+    pi_samp, pi_feat = fused_unbalanced_gromov_wasserstein(
+        Cx=C_A_norm, Cy=C_B_norm, wx=p_A, wy=p_B, M=M_norm, alpha=alpha, reg_marginals=reg_m, max_iter=5000
     )
     
     return pi_samp
@@ -302,12 +304,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
     adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
-    # 3. Select ENLARGED subset of transport masses (Top 50% of total mass)
+    # 3. Select ENLARGED subset of transport masses
     flat_pi = Pi_cluster.flatten()
     sorted_idx = np.argsort(flat_pi)[::-1]
     sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
     
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.5) # Start with top 50% of mass; can be adjusted
+    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass)
     selected_flat_idx = sorted_idx[:cutoff_idx+1]
     
     matches = []
@@ -371,21 +373,16 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         best_pair = None
         best_dist = float('inf')
         
-        # Threshold to filter out nearly-zero noise entries from FGW
-        min_mass = np.max(Pi_cluster) * 1e-4 
-        
         for pA in candidates_A:
             for pB in candidates_B:
-                # The pair must still have valid OT confidence to be aligned together!
-                if Pi_cluster[pA, pB] > min_mass:
-                    dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
-                    dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
-                    
-                    # We minimize the combined distance to the respective barycenters
-                    total_dist = dist_A + dist_B
-                    if total_dist < best_dist:
-                        best_dist = total_dist
-                        best_pair = (pA, pB)
+                dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
+                dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
+                
+                # We minimize the combined distance to the respective barycenters
+                total_dist = dist_A + dist_B
+                if total_dist < best_dist:
+                    best_dist = total_dist
+                    best_pair = (pA, pB)
                     
         # Add the best geometrically compact pair
         if best_pair is not None:
