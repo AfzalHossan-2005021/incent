@@ -325,20 +325,20 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     
     strong_A = {start_A}
     strong_B = {start_B}
-    visited_pairs = {(start_A, start_B)}
     
     # Precompute individual cluster masses for accurate center-of-mass tracking
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
     masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
 
-    while True:
-        # The morphological frontier: valid clusters directly touching the current core
+    # Stop when the smaller slice is fully incorporated into the core
+    while len(strong_A) < np.sum(valid_A) and len(strong_B) < np.sum(valid_B):
+        # The morphological frontier: valid clusters directly touching the current core but NOT inside it
         frontier_A = {i for i in range(num_clusters_A) if np.any(adj_A[i, list(strong_A)]) and valid_A[i] and i not in strong_A}
         frontier_B = {j for j in range(num_clusters_B) if np.any(adj_B[j, list(strong_B)]) and valid_B[j] and j not in strong_B}
         
-        # Target candidates can extend the core contiguously in A, B, or both.
-        candidates_A = frontier_A.union(strong_A)
-        candidates_B = frontier_B.union(strong_B)
+        # If we cannot contiguously expand simultaneously in both slices, stop.
+        if not frontier_A or not frontier_B:
+            break
         
         # Dynamic center of mass of the assembled biological core
         bary_A = np.average(centroids_A[list(strong_A)], axis=0, weights=masses_A[list(strong_A)])
@@ -353,12 +353,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         best_pair = None
         best_score = -1.0
         
-        for pA in candidates_A:
-            for pB in candidates_B:
-                if pA in strong_A and pB in strong_B: continue
-                if (pA, pB) in visited_pairs: continue
-                    
-                # Must pass null expectation
+        # Strictly evaluate 1-to-1 candidates from the unused frontiers
+        # This guarantees "one cluster considered only once" and balanced increments
+        for pA in frontier_A:
+            for pB in frontier_B:
+                # Must pass null expectation threshold mapping
                 if valid_masses[pA, pB] > 0:
                     # Geometric Rigidity Penalty: 
                     # Assesses whether the candidate expands the core isometrically in both slices.
@@ -378,7 +377,6 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         if best_pair is not None and best_score > 0:
             strong_A.add(best_pair[0])
             strong_B.add(best_pair[1])
-            visited_pairs.add(best_pair)
         else:
             break
             
