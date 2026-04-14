@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
+from .hierarchical import extract_cluster_features, compute_cluster_feature_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
 from .visualize import visualize_clustered_slices, visualize_cluster_mapping, visualize_selected_anchors
 
 
@@ -23,14 +23,10 @@ def hierarchical_pairwise_align(
     reg_compact: float = 0.001,
     numItermax: int = 100000,
     use_gpu: bool = True,
-    cluster_extension_hops: int = 5,
     resolution: float = 1.0,
-    macro_section_mass_pct: float = 0.8,
     spatial_key: str = "spatial",
     use_rep: Optional[str] = "X_pca",
     label_key: str = "cell_type_annot",
-    w_expr: float = 0.4,
-    w_struct: float = 0.2,
     w_graph: float = 0.5,
     visualize_clusters: bool = True,
     **kwargs
@@ -59,7 +55,7 @@ def hierarchical_pairwise_align(
     p_B, centroidsB, mu_exprB, mu_structB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, all_types=all_types)
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
-    M_cluster = compute_cluster_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, w_expr, w_struct)
+    M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, beta=beta)
     C_A = compute_cluster_structural_matrix(centroidsA, 1.0 - w_graph, w_graph)
     C_B = compute_cluster_structural_matrix(centroidsB, 1.0 - w_graph, w_graph)
     

@@ -100,7 +100,7 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     return masses, centroids, mu_expr, mu_struct
 
 
-def compute_cluster_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, w_expr=0.25, w_struct=0.75):
+def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, beta=0.75):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
     
@@ -109,12 +109,14 @@ def compute_cluster_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, w_expr
         mu_struct_A: np.ndarray (C_A, T * 3) structural features for slice A
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
         mu_struct_B: np.ndarray (C_B, T * 3) structural features for slice B
-        w_expr: weight for expression distance
-        w_struct: weight for structural distance
+        beta: weight for structural distance (expression distance is 1 - beta)
         
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
     """
+
+    if(beta > 1.0 or beta < 0.0):
+        raise ValueError("Beta must be between 0 and 1.")
     
     # Cosine distance for continuous expression
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
@@ -125,15 +127,9 @@ def compute_cluster_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, w_expr
         for j in range(mu_struct_B.shape[0]):
             # Using Jensen-Shannon since the fourier features are normalized probabilistic distributions over space
             M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
-    
-    # Combine with weights; normalize to ensure balanced contributions
-    total_w = w_expr + w_struct
-    if total_w == 0: total_w = 1.0
 
-    w_expr_norm = w_expr / total_w
-    w_struct_norm = w_struct / total_w
     
-    M_cluster = w_expr_norm * M_expr + w_struct_norm * M_struct
+    M_cluster = (1.0 - beta) * M_expr + beta * M_struct
         
     return M_cluster
 
