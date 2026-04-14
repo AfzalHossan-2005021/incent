@@ -320,63 +320,116 @@ def stack_slices_pairwise(
         return new_slices, thetas, translations
 
 
-def visualize_alignment(sliceA, sliceB, pi12):
-    slices, pis = [sliceA, sliceB], [pi12]
+def visualize_alignment(
+    slices: List[AnnData],
+    pis: List[np.ndarray],
+    spatial_key: str = "spatial",
+    alpha: float = 0.5,
+    s: float = 1.0,
+    colors: list = None
+):
+    """
+    Visualizes the 2D alignment of multiple sequential slices after Procrustes refinement.
+    """
     new_slices = stack_slices_pairwise(slices, pis)
+    n_slices = len(new_slices)
 
-    slice_colors = ['#e41a1c','#377eb8'] # Red (Source), Blue (Target)
+    if colors is None:
+        if n_slices == 2:
+            colors = ['#e41a1c', '#377eb8']  # Red (Source/0), Blue (Target/1)
+        else:
+            cmap = plt.get_cmap('tab20')
+            colors = [cmap(i % 20) for i in range(n_slices)]
+    elif len(colors) < n_slices:
+        colors = [colors[i % len(colors)] for i in range(n_slices)]
 
-    xI_new = new_slices[0].obsm['spatial'][:, 0]
-    yI_new = new_slices[0].obsm['spatial'][:, 1]
+    print(f"====================\nAligned {n_slices} slices")
+    fig = plt.figure(figsize=(8, 8))
 
-    xJ_new = new_slices[1].obsm['spatial'][:, 0]
-    yJ_new = new_slices[1].obsm['spatial'][:, 1]
-    
-    # Identify the "Exact Shadow" matched subsets based on transport plan mass
-    matched_src = pi12.sum(axis=1) > 1e-5
-    matched_tgt = pi12.sum(axis=0) > 1e-5
+    for idx, (slice_obj, color) in enumerate(zip(new_slices, colors)):
+        coords = slice_obj.obsm[spatial_key]
+        label = f'Slice {idx} (Anchor)' if idx == 0 else f'Slice {idx}'
+        plt.scatter(coords[:, 0], coords[:, 1], s=s, alpha=alpha, label=label, c=[color]*len(coords))
 
-    print("====================\nAligned slices")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-
-    # --- Plot 1: Global Overlay ---
-    # Unmatched tails in soft gray
-    ax1.scatter(xI_new[~matched_src], yI_new[~matched_src], s=1, alpha=0.2, c='grey')
-    ax1.scatter(xJ_new[~matched_tgt], yJ_new[~matched_tgt], s=1, alpha=0.2, c='lightgrey')
-    
-    # Matched shadow in solid colors
-    ax1.scatter(xI_new[matched_src], yI_new[matched_src], s=1.5, alpha=0.6, label='Source (Matched)', c=slice_colors[0])
-    ax1.scatter(xJ_new[matched_tgt], yJ_new[matched_tgt], s=1.5, alpha=0.6, label='Target (Matched)', c=slice_colors[1])
-    ax1.axis("off")
-    ax1.legend()
-    ax1.set_title("Rigid Overlay (Matched Core Highlighted)")
-
-    # --- Plot 2: Displacement Vector Field (Quiver) ---
-    # To avoid rendering 50,000+ lines, sample up to 1000 matched pairs via argmax
-    ax2.scatter(xJ_new, yJ_new, s=0.5, alpha=0.1, c='lightgrey') # Background target
-    
-    active_rows = np.where(matched_src)[0]
-    if len(active_rows) > 0:
-        # Sample points for the vector field
-        sample_size = min(1000, len(active_rows))
-        sampled_src_idx = np.random.choice(active_rows, sample_size, replace=False)
-        
-        # Find the target cell assignment
-        sampled_tgt_idx = np.argmax(pi12[sampled_src_idx], axis=1)
-        
-        start_x = xI_new[sampled_src_idx]
-        start_y = yI_new[sampled_src_idx]
-        end_x = xJ_new[sampled_tgt_idx]
-        end_y = yJ_new[sampled_tgt_idx]
-        
-        ax2.quiver(start_x, start_y, end_x - start_x, end_y - start_y, 
-                   color='black', alpha=0.4, angles='xy', scale_units='xy', scale=1, width=0.002)
-                   
-    ax2.axis("off")
-    ax2.set_title("Displacement Field (Source to Target)")
-
+    plt.axis("equal")
+    plt.axis("off")
+    if n_slices <= 10:
+        plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0))
     plt.tight_layout()
     plt.show()
 
     return new_slices
+
+
+def visualize_3d_stack(
+    slices: list,
+    pi_matrices: list,
+    spatial_key: str = "spatial",
+    z_spacing: float = 10.0,
+    point_size: float = 2.0,
+    alpha: float = 0.5,
+    colors: list = None
+):
+    """
+    Renders a 3D scatter plot of sequentially aligned spatial transcriptomics slices.
+    
+    Args:
+        aligned_ slices: List of AnnData objects already aligned to a common coordinate system.
+        spatial_key: Key in `.obsm` storing the spatial coordinates.
+        z_spacing: Artificial Z-gap distance placed between each sequential slice.
+        point_size: Global scatter plot point size.
+        alpha: Transparency of the points.
+        colors: Optional list of hex/named colors for each slice. If None, uses a colorful colormap.
+    """
+    import matplotlib.pyplot as plt
+    try:
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        print("To plot in 3D, mpl_toolkits.mplot3d must be installed.")
+        return
+    
+        # Step 2: Global geometric assembly using the Procrustes chain
+    print("\n--- Assembling Global Coordinate Stack ---")
+    aligned_slices = stack_slices_pairwise(slices, pi_matrices, output_params=False)
+
+    n_slices = len(aligned_slices)
+    if n_slices < 1:
+        print("No slices to visualize in 3D.")
+        return
+
+    # Auto-generate colors if not provided
+    if colors is None:
+        cmap = plt.get_cmap('tab20')
+        colors = [cmap(i % 20) for i in range(n_slices)]
+    elif len(colors) < n_slices:
+        print(f"Warning: Only {len(colors)} colors provided for {n_slices} slices. Repeating colors.")
+        colors = [colors[i % len(colors)] for i in range(n_slices)]
+
+    fig = plt.figure(figsize=(10, 8))
+    # 'add_subplot' with projection='3d' automatically invokes the imported Axes3D
+    ax = fig.add_subplot(111, projection='3d')
+
+    for idx, (s, c) in enumerate(zip(aligned_slices, colors)):
+        coords = s.obsm[spatial_key]
+        x = coords[:, 0]
+        y = coords[:, 1]
+        # Generate artificial Z coordinate spacing
+        z = np.full(x.shape, float(idx * z_spacing))
+
+        ax.scatter(x, y, z, c=[c]*len(x), s=point_size, alpha=alpha, label=f"Slice {idx}")
+
+    ax.set_xlabel('Global X')
+    ax.set_ylabel('Global Y')
+    ax.set_zlabel(f'Z-Stack (Spacing={z_spacing})')
+    ax.set_title(f'3D Reconstruction of {n_slices} Aligned Slices')
+
+    # Improve view angles
+    ax.view_init(elev=20., azim=45)
+    
+    # Legend max limited to prevent huge unreadable labels inside plot
+    if n_slices <= 10:
+        ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
+        
+    plt.tight_layout()
+    plt.show()
 
