@@ -164,43 +164,27 @@ def hierarchical_pairwise_align(
         except Exception as e:
             print(f"Sub-selection visualization failed: {e}")
 
-    # Only run base OT on the selected continuous matching blocks
-    sub_sliceA = sliceA[idx_A].copy()
-    sub_sliceB = sliceB[idx_B].copy()
-
-    # The selected sections will have an initial plan that decays based on distance from the core
-    sub_N, sub_M = sub_sliceA.shape[0], sub_sliceB.shape[0]
-    G_init_sub = None
-    if sub_N > 0 and sub_M > 0:
-        sigma_A = max(1e-5, np.max(dist_A) / 2.0)
-        sigma_B = max(1e-5, np.max(dist_B) / 2.0)
+    print("--- [HOT] Step 6: Synthesizing Cell-Level Footprint from Macro Clusters ---")
+    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
+    
+    if len(idx_A) > 0 and len(idx_B) > 0:
+        # Restrict labels to the matched core
+        core_labels_A = labelsA[idx_A]
+        core_labels_B = labelsB[idx_B]
         
-        weight_A = np.exp(- (dist_A[idx_A]**2) / (2 * sigma_A**2))
-        weight_B = np.exp(- (dist_B[idx_B]**2) / (2 * sigma_B**2))
-        
-        G_init_sub = np.outer(weight_A, weight_B)
-        G_init_sub /= np.sum(G_init_sub)
-
-    print("--- [HOT] Step 6: Executing Base OT on Selected Sections ---")
-    pi_sub = pairwise_align(
-        sliceA=sub_sliceA,
-        sliceB=sub_sliceB,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        reg_compact=reg_compact,
-        G_init=G_init_sub,
-        numItermax=numItermax,
-        use_gpu=use_gpu,
-        dummy_cell=False,
-        **kwargs
-    )
-
-    # Rest of the region will have zero initial/final plan
-    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]))
-    if sub_N > 0 and sub_M > 0:
-        grid_A, grid_B = np.ix_(idx_A, idx_B)
-        pi_full[grid_A, grid_B] = pi_sub
+        for cA in range(Pi_cluster.shape[0]):
+            for cB in range(Pi_cluster.shape[1]):
+                mass = Pi_cluster[cA, cB]
+                if mass > 0:
+                    # Find cells in the core that belong to these clusters
+                    cells_A = idx_A[core_labels_A == cA]
+                    cells_B = idx_B[core_labels_B == cB]
+                    
+                    if len(cells_A) > 0 and len(cells_B) > 0:
+                        # Distribute mass uniformly across the block
+                        block_mass = mass / (len(cells_A) * len(cells_B))
+                        grid_A, grid_B = np.ix_(cells_A, cells_B)
+                        pi_full[grid_A, grid_B] += block_mass
 
     print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
     from .visualize import stack_slices_pairwise
