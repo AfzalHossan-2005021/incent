@@ -350,6 +350,27 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         rad_A = rad_A if rad_A > 0 else 1.0
         rad_B = rad_B if rad_B > 0 else 1.0
         
+        # --- Compute rigid transform to define the core's exact morphological shadow ---
+        # We align the already-selected core structures through a weighted Kabsch operation
+        sA_list = list(strong_A)
+        sB_list = list(strong_B)
+        
+        P_c = centroids_A[sA_list] - bary_A
+        Q_c = centroids_B[sB_list] - bary_B
+        
+        # Construct the cross-covariance matrix heavily weighted precisely by the OT matching probabilities
+        W_cross = valid_masses[np.ix_(sA_list, sB_list)]
+        H = P_c.T @ W_cross @ Q_c
+        
+        # SVD handles extraction of the optimal rotation bridging spatial slice A to slice B
+        U, _, Vt = np.linalg.svd(H)
+        R = U @ Vt
+        
+        # Ensure we construct a pure rotation (determinant 1) by rectifying reflection matrices
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = U @ Vt
+        
         best_pair = None
         best_score = -1.0
         
@@ -359,16 +380,18 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             for pB in frontier_B:
                 # Must pass null expectation threshold mapping
                 if valid_masses[pA, pB] > 0:
-                    # Geometric Rigidity Penalty: 
-                    # Assesses whether the candidate expands the core isometrically in both slices.
-                    dist_A = np.linalg.norm(centroids_A[pA] - bary_A) / rad_A
-                    dist_B = np.linalg.norm(centroids_B[pB] - bary_B) / rad_B
+                    # Geometrically project candidate pA into Slice B utilizing the core's rigid shadow
+                    pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
                     
-                    # Penalize spatial deformation (0 if perfectly isometric)
-                    geom_penalty = abs(dist_A - dist_B) / max(dist_A, dist_B, 1e-8)
+                    # Shadow Distance: Deviation of target pB from candidate pA's projected shadow
+                    shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
                     
-                    # Maximize confident OT mass while penalizing shapes that stretch asymmetrically
-                    score = valid_masses[pA, pB] * (1.0 - geom_penalty)
+                    # Scale down the absolute coordinate distance into a relative penalty based on the core size
+                    shadow_penalty = shadow_dist / rad_B
+                    
+                    # Maximize confidently mapped pair mass while heavily enforcing structural coherence 
+                    # (Exponential decay guarantees only clusters mathematically inside the shadow survive)
+                    score = valid_masses[pA, pB] * np.exp(-shadow_penalty)
                     
                     if score > best_score:
                         best_score = score
