@@ -434,8 +434,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # Pass 1: Grow the initial core contiguously
     strong_A, strong_B = contiguous_expansion_pass(strong_A, strong_B)
 
-    # Polish: Eliminate structurally incoherent clusters added during unstable early growth
-    if len(strong_A) >= 3 and len(strong_B) >= 3:
+    # Polish: Iterative Maximum-Residual Pruning (Greedy Shadow Shedding)
+    # Single-pass pruning fails because outliers drag the barycenter & rotation matrix with them.
+    # By iteratively removing the single worst outlier and recomputing SVD, the geometric "shadow" 
+    # steadily snaps back and contracts around the true biological core.
+    while len(strong_A) >= 3 and len(strong_B) >= 3:
         sA_list, sB_list = list(strong_A), list(strong_B)
         bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
         bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
@@ -453,22 +456,38 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         except:
             pass
 
-        # Remove clusters falling outside 2 sigma boundaries of the learned Gaussian shadow
-        thresh = rad_B * 1.5
-        pruned_A = {pA for pA in strong_A if np.min(np.linalg.norm((centroids_A[pA] - bary_A) @ R_final + bary_B - centroids_B[sB_list], axis=1)) < thresh}
-        pruned_B = {pB for pB in strong_B if np.min(np.linalg.norm((centroids_B[pB] - bary_B) @ R_final.T + bary_A - centroids_A[sA_list], axis=1)) < thresh}
+        # Compute projection residuals for all current clusters
+        residuals_A = {pA: np.min(np.linalg.norm((centroids_A[pA] - bary_A) @ R_final + bary_B - centroids_B[sB_list], axis=1)) for pA in strong_A}
+        residuals_B = {pB: np.min(np.linalg.norm((centroids_B[pB] - bary_B) @ R_final.T + bary_A - centroids_A[sA_list], axis=1)) for pB in strong_B}
 
-        # Prevent scatter: Re-extract largest connected component using the Delaunay topological graph
-        # This fixes topological 'Holes' naturally
-        if pruned_A:
-            strong_A = get_largest_connected_component(pruned_A, adj_A)
-        if not strong_A and len(valid_A_idx) > 0:
-            strong_A = {best_edge[0][0]} if best_edge else {np.where(valid_A)[0][0]}
+        # Identify the single worst structural outlier
+        max_res_A = max(residuals_A.values()) if residuals_A else 0
+        max_res_B = max(residuals_B.values()) if residuals_B else 0
+        worst_res = max(max_res_A, max_res_B)
+        
+        # Threshold: 1.5x the mean core radius
+        thresh = rad_B * 1.5
+
+        if worst_res < thresh:
+            break  # Convergence: All clusters are safely inside the shifting shadow!
             
-        if pruned_B:
-            strong_B = get_largest_connected_component(pruned_B, adj_B)
-        if not strong_B and len(valid_B_idx) > 0:
-            strong_B = {best_edge[0][1]} if best_edge else {np.where(valid_B)[0][0]}
+        # Remove only the worst cluster, shifting the shadow back towards the valid consensus
+        if max_res_A >= max_res_B:
+            strong_A.remove(max(residuals_A, key=residuals_A.get))
+        else:
+            strong_B.remove(max(residuals_B, key=residuals_B.get))
+
+    # Prevent scatter: Re-extract largest connected component using the Delaunay topological graph
+    # This prevents 'holes' or disjoint islands from surviving the pruning process.
+    if strong_A:
+        strong_A = get_largest_connected_component(strong_A, adj_A)
+    if not strong_A and len(valid_A_idx) > 0:
+        strong_A = {best_edge[0][0]} if best_edge else {np.where(valid_A)[0][0]}
+        
+    if strong_B:
+        strong_B = get_largest_connected_component(strong_B, adj_B)
+    if not strong_B and len(valid_B_idx) > 0:
+        strong_B = {best_edge[0][1]} if best_edge else {np.where(valid_B)[0][0]}
 
     # Pass 2: Fill in pruned contiguous gaps strictly from the topological frontier
     strong_A, strong_B = contiguous_expansion_pass(strong_A, strong_B)
