@@ -319,145 +319,162 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if np.max(valid_masses) == 0:
         valid_masses = Pi_cluster # Fallback if null test yields no pairs
         
-    # 4. Region Growing via Contiguous Expansion from Most Confident Seed
-    start_flat = np.argmax(valid_masses)
-    start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
+    # 4. Region Growing via Contiguous Expansion from Most Confident Edge
+    # Seeding by Edge: A single point has undefined rotation, which can cause erratic early growth.
+    # We find the highest-confidence paired adjacency (an edge) to lock an initial translation and rotation vector.
+    best_edge_score = -1.0
+    best_edge = None
     
-    strong_A = {start_A}
-    strong_B = {start_B}
+    valid_A_idx = np.where(valid_A)[0]
+    valid_B_idx = np.where(valid_B)[0]
+    
+    for uA in valid_A_idx:
+        for vA in valid_A_idx:
+            if uA >= vA or not adj_A[uA, vA]: continue
+            
+            for uB in valid_B_idx:
+                for vB in valid_B_idx:
+                    if uB == vB or not adj_B[uB, vB]: continue
+                    
+                    # Match can be (uA->uB, vA->vB) or (uA->vB, vA->uB)
+                    score1 = valid_masses[uA, uB] * valid_masses[vA, vB]
+                    score2 = valid_masses[uA, vB] * valid_masses[vA, uB]
+                    
+                    if score1 > best_edge_score:
+                        best_edge_score = score1
+                        best_edge = ((uA, uB), (vA, vB))
+                    if score2 > best_edge_score:
+                        best_edge_score = score2
+                        best_edge = ((uA, vB), (vA, uB))
+                        
+    if best_edge is None or best_edge_score <= 0.0:
+        # Fallback to single point if no valid edges exist
+        start_flat = np.argmax(valid_masses)
+        start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
+        strong_A = {start_A}
+        strong_B = {start_B}
+    else:
+        strong_A = {best_edge[0][0], best_edge[1][0]}
+        strong_B = {best_edge[0][1], best_edge[1][1]}
     
     # Precompute individual cluster masses for accurate center-of-mass tracking
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
     masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
 
-    # Stop when the smaller slice is fully incorporated into the core
-    while len(strong_A) < np.sum(valid_A) and len(strong_B) < np.sum(valid_B):
-        # The morphological frontier: valid clusters directly touching the current core but NOT inside it
-        frontier_A = {i for i in range(num_clusters_A) if np.any(adj_A[i, list(strong_A)]) and valid_A[i] and i not in strong_A}
-        frontier_B = {j for j in range(num_clusters_B) if np.any(adj_B[j, list(strong_B)]) and valid_B[j] and j not in strong_B}
-        
-        # If we cannot contiguously expand simultaneously in both slices, stop.
-        if not frontier_A or not frontier_B:
-            break
-        
-        # Dynamic center of mass of the assembled biological core
-        bary_A = np.average(centroids_A[list(strong_A)], axis=0, weights=masses_A[list(strong_A)])
-        bary_B = np.average(centroids_B[list(strong_B)], axis=0, weights=masses_B[list(strong_B)])
-        
-        # Compute current spatial radius of the core to evaluate isometric scaling
-        rad_A = np.mean([np.linalg.norm(centroids_A[c] - bary_A) for c in strong_A])
-        rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in strong_B])
-        rad_A = rad_A if rad_A > 0 else 1.0
-        rad_B = rad_B if rad_B > 0 else 1.0
-        
-        # --- Compute rigid transform to define the core's exact morphological shadow ---
-        # We align the already-selected core structures through a weighted Kabsch operation
-        sA_list = list(strong_A)
-        sB_list = list(strong_B)
-        
-        P_c = centroids_A[sA_list] - bary_A
-        Q_c = centroids_B[sB_list] - bary_B
-        
-        # Construct the cross-covariance matrix heavily weighted precisely by the OT matching probabilities
-        W_cross = valid_masses[np.ix_(sA_list, sB_list)]
-        H = P_c.T @ W_cross @ Q_c
-        
-        # SVD handles extraction of the optimal rotation bridging spatial slice A to slice B
-        U, _, Vt = np.linalg.svd(H)
-        R = U @ Vt
-        
-        # Ensure we construct a pure rotation (determinant 1) by rectifying reflection matrices
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = U @ Vt
-        
-        best_pair = None
-        best_score = -1.0
-        
-        # Strictly evaluate 1-to-1 candidates from the unused frontiers
-        # This guarantees "one cluster considered only once" and balanced increments
-        for pA in frontier_A:
-            for pB in frontier_B:
-                # Must pass null expectation threshold mapping
-                if valid_masses[pA, pB] > 0:
-                    # Geometrically project candidate pA into Slice B utilizing the core's rigid shadow
-                    pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
-                    
-                    # Shadow Distance: Deviation of target pB from candidate pA's projected shadow
-                    shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
-                    
-                    # Scale down the absolute coordinate distance into a relative penalty based on the core size
-                    shadow_penalty = shadow_dist / rad_B
-                    
-                    # Maximize confidently mapped pair mass while heavily enforcing structural coherence 
-                    # (Exponential decay guarantees only clusters mathematically inside the shadow survive)
-                    score = valid_masses[pA, pB] * np.exp(-shadow_penalty)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_pair = (pA, pB)
-                        
-        if best_pair is not None and best_score > 0:
-            strong_A.add(best_pair[0])
-            strong_B.add(best_pair[1])
-        else:
-            break
+    def get_largest_connected_component(node_set, full_adj):
+        nodes = list(node_set)
+        if not nodes: return set()
+        sub_adj = full_adj[np.ix_(nodes, nodes)]
+        n_comp, comp_labels = connected_components(sub_adj, directed=False)
+        largest = np.bincount(comp_labels).argmax()
+        return set([nodes[i] for i in np.where(comp_labels == largest)[0]])
+
+    def contiguous_expansion_pass(curr_A, curr_B):
+        sA, sB = set(curr_A), set(curr_B)
+        while len(sA) < np.sum(valid_A) and len(sB) < np.sum(valid_B):
+            # Strict topological frontier: ONLY direct neighbors, excluding current elements
+            frontier_A = {i for i in range(num_clusters_A) if valid_A[i] and i not in sA and np.any(adj_A[i, list(sA)])}
+            frontier_B = {j for j in range(num_clusters_B) if valid_B[j] and j not in sB and np.any(adj_B[j, list(sB)])}
             
-    # --- Final Polish: Shadow Alignment Refinement ---
-    # Re-evaluate all assigned and unassigned clusters using the final converged rigid body projection.
-    # We strip out structurally incoherent clusters that were incorporated early and replace them.
-    sA_list = list(strong_A)
-    sB_list = list(strong_B)
-    bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
-    bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
-    
-    rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list])
-    rad_B = rad_B if rad_B > 0 else 1.0
-
-    P_c = centroids_A[sA_list] - bary_A
-    Q_c = centroids_B[sB_list] - bary_B
-    W_cross = valid_masses[np.ix_(sA_list, sB_list)]
-    H = P_c.T @ W_cross @ Q_c
-
-    U, _, Vt = np.linalg.svd(H)
-    R_final = U @ Vt
-    if np.linalg.det(R_final) < 0:
-        Vt[-1, :] *= -1
-        R_final = U @ Vt
-        
-    # Project all valid_A nodes into B's space using the converged global rigid rotation
-    proj_A = (centroids_A - bary_A) @ R_final + bary_B
-    
-    new_strong_A = set()
-    new_strong_B = set()
-    
-    # Bipartite Assignment over the entire valid field based on the computed geometrical structural shadow
-    for pA in range(num_clusters_A):
-        if not valid_A[pA]: continue
-        
-        # Only evaluate valid B clusters
-        valid_B_idx = np.where(valid_B)[0]
-        
-        best_pB = None
-        best_score = -1.0
-        
-        for pB in valid_B_idx:
-            if valid_masses[pA, pB] > 0:
-                shadow_dist = np.linalg.norm(proj_A[pA] - centroids_B[pB])
-                shadow_penalty = shadow_dist / rad_B
-                score = valid_masses[pA, pB] * np.exp(-shadow_penalty)
+            if not frontier_A or not frontier_B:
+                break
                 
-                # Only accept pairs with score heavily aligned to the actual shadow (> 10% of pure valid OT mass)
-                if score > best_score and score > (valid_masses[pA, pB] * 0.1):
-                    best_score = score
-                    best_pB = pB
-                    
-        if best_pB is not None:
-            new_strong_A.add(pA)
-            new_strong_B.add(best_pB)
+            sA_list, sB_list = list(sA), list(sB)
+            bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
+            bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
+            rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list])
+            rad_B = max(rad_B, 1e-3)
             
-    strong_A = list(new_strong_A)
-    strong_B = list(new_strong_B)
+            # Rigid alignment requires at least 3 points to stabilize rotation
+            if len(sA_list) >= 3 and len(sB_list) >= 3:
+                P_c = centroids_A[sA_list] - bary_A
+                Q_c = centroids_B[sB_list] - bary_B
+                W_cross = valid_masses[np.ix_(sA_list, sB_list)]
+                try:
+                    U, _, Vt = np.linalg.svd(P_c.T @ W_cross @ Q_c)
+                    R = U @ Vt
+                    if np.linalg.det(R) < 0:
+                        Vt[-1, :] *= -1
+                        R = U @ Vt
+                except:
+                    R = np.eye(2)
+            else:
+                R = np.eye(2) # Fallback to pure translation for early seed growth
+
+            best_pair = None
+            best_score = 0.0 # Strict null-expectation requirement
+            
+            # Robust, Gaussian Probability shadow width
+            # Standard deviation scales with the median size of the tissue core to allow flexibility,
+            # ensuring deformation limits aren't excessively brittle early on.
+            sigma = rad_B * 0.5 if rad_B > 0 else 1.0
+            
+            for pA in frontier_A:
+                for pB in frontier_B:
+                    if valid_masses[pA, pB] > 0:
+                        pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
+                        shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
+                        
+                        # Probabilistic soft-shadow instead of a strict hard crop
+                        score = valid_masses[pA, pB] * np.exp(- (shadow_dist**2) / (2 * sigma**2))
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_pair = (pA, pB)
+                            
+            if best_pair is not None:
+                sA.add(best_pair[0])
+                sB.add(best_pair[1])
+            else:
+                # Dynamic Stopping Criterion: Halts when the highest scoring neighbor
+                # within the topological boundary drops below the expected null probability threshold.
+                break
+        return sA, sB
+
+    # Pass 1: Grow the initial core contiguously
+    strong_A, strong_B = contiguous_expansion_pass(strong_A, strong_B)
+
+    # Polish: Eliminate structurally incoherent clusters added during unstable early growth
+    if len(strong_A) >= 3 and len(strong_B) >= 3:
+        sA_list, sB_list = list(strong_A), list(strong_B)
+        bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
+        bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
+        rad_B = max(np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list]), 1e-3)
+
+        R_final = np.eye(2)
+        try:
+            P_c = centroids_A[sA_list] - bary_A
+            Q_c = centroids_B[sB_list] - bary_B
+            U, _, Vt = np.linalg.svd(P_c.T @ valid_masses[np.ix_(sA_list, sB_list)] @ Q_c)
+            R_final = U @ Vt
+            if np.linalg.det(R_final) < 0:
+                Vt[-1, :] *= -1
+                R_final = U @ Vt
+        except:
+            pass
+
+        # Remove clusters falling outside 2 sigma boundaries of the learned Gaussian shadow
+        thresh = rad_B * 1.5
+        pruned_A = {pA for pA in strong_A if np.min(np.linalg.norm((centroids_A[pA] - bary_A) @ R_final + bary_B - centroids_B[sB_list], axis=1)) < thresh}
+        pruned_B = {pB for pB in strong_B if np.min(np.linalg.norm((centroids_B[pB] - bary_B) @ R_final.T + bary_A - centroids_A[sA_list], axis=1)) < thresh}
+
+        # Prevent scatter: Re-extract largest connected component using the Delaunay topological graph
+        # This fixes topological 'Holes' naturally
+        if pruned_A:
+            strong_A = get_largest_connected_component(pruned_A, adj_A)
+        if not strong_A and len(valid_A_idx) > 0:
+            strong_A = {best_edge[0][0]} if best_edge else {np.where(valid_A)[0][0]}
+            
+        if pruned_B:
+            strong_B = get_largest_connected_component(pruned_B, adj_B)
+        if not strong_B and len(valid_B_idx) > 0:
+            strong_B = {best_edge[0][1]} if best_edge else {np.where(valid_B)[0][0]}
+
+    # Pass 2: Fill in pruned contiguous gaps strictly from the topological frontier
+    strong_A, strong_B = contiguous_expansion_pass(strong_A, strong_B)
+
+    strong_A = list(strong_A)
+    strong_B = list(strong_B)
 
     if len(strong_A) == 0 or len(strong_B) == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
