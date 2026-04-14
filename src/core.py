@@ -10,7 +10,8 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, build_block_restricted_cost, blockwise_g_init, extract_continuous_macro_section
+from .hierarchical import extract_cluster_features, compute_cluster_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
+from .visualize import visualize_clustered_slices, visualize_cluster_mapping, visualize_selected_anchors
 
 
 def hierarchical_pairwise_align(
@@ -22,7 +23,6 @@ def hierarchical_pairwise_align(
     reg_compact: float = 0.001,
     numItermax: int = 100000,
     use_gpu: bool = True,
-    cluster_method: str = 'delaunay',
     cluster_extension_hops: int = 5,
     resolution: float = 1.0,
     macro_section_mass_pct: float = 0.8,
@@ -33,8 +33,6 @@ def hierarchical_pairwise_align(
     w_type: float = 0.4,
     w_struct: float = 0.2,
     w_graph: float = 0.5,
-    block_threshold: float = 1e-4,
-    rand_seed: Optional[int] = 2005021,
     visualize_clusters: bool = True,
     **kwargs
 ):
@@ -45,8 +43,8 @@ def hierarchical_pairwise_align(
     Returns the cell-level alignment pi.
     """
     print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=rand_seed)
-    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution, method=cluster_method, k=6, seed=rand_seed)
+    labelsA = cluster_cells_spatial(sliceA, spatial_key=spatial_key, resolution=resolution)
+    labelsB = cluster_cells_spatial(sliceB, spatial_key=spatial_key, resolution=resolution)
     
     # Pre-cache global cell types for cluster structure alignment
     all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
@@ -55,22 +53,7 @@ def hierarchical_pairwise_align(
     print(f"Slice B: {len(np.unique(labelsB))} clusters")
     
     if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-            ptsA = sliceA.obsm[spatial_key]
-            ptsB = sliceB.obsm[spatial_key]
-            # using categorical cmap
-            cmap = plt.get_cmap('tab20')
-            ax1.scatter(ptsA[:,0], ptsA[:,1], c=labelsA, cmap=cmap, s=2, alpha=0.8)
-            ax1.set_title(f"Slice A: {len(np.unique(labelsA))} Clusters")
-            ax1.axis('equal')
-            ax2.scatter(ptsB[:,0], ptsB[:,1], c=labelsB, cmap=cmap, s=2, alpha=0.8)
-            ax2.set_title(f"Slice B: {len(np.unique(labelsB))} Clusters")
-            ax2.axis('equal')
-            plt.show()
-        except Exception as e:
-            print(f"Cluster visualization failed: {e}")
+        visualize_clustered_slices(sliceA, sliceB, labelsA, labelsB, spatial_key=spatial_key)
     
     print("--- [HOT] Step 2: Extracting Cluster Features ---")
     featA = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, all_types=all_types)
@@ -90,37 +73,7 @@ def hierarchical_pairwise_align(
     Pi_cluster = run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=alpha)
     
     if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            from matplotlib.collections import LineCollection
-            
-            # Center the coordinates purely for overlap plotting
-            cA_plot = centroidsA - np.mean(centroidsA, axis=0)
-            cB_plot = centroidsB - np.mean(centroidsB, axis=0)
-
-            fig, ax = plt.subplots(figsize=(10, 10))
-            ax.scatter(cA_plot[:,0], cA_plot[:,1], c='blue', s=20, label='Slice A Clusters (Centered)', zorder=2)
-            ax.scatter(cB_plot[:,0], cB_plot[:,1], c='red', s=20, label='Slice B Clusters (Centered)', zorder=2)
-
-            max_pi = np.max(Pi_cluster)
-            if max_pi > 0:
-                lines = []
-                linewidths = []
-                for i in range(Pi_cluster.shape[0]):
-                    for j in range(Pi_cluster.shape[1]):
-                        if Pi_cluster[i, j] > block_threshold:
-                            lines.append([(cA_plot[i,0], cA_plot[i,1]), (cB_plot[j,0], cB_plot[j,1])])
-                            linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)      
-
-                lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
-                ax.add_collection(lc)
-
-            ax.set_title("Macro-Level Cluster Matching ($Pi_{cluster}$)")
-            ax.axis('equal')
-            ax.legend()
-            plt.show()
-        except Exception as e:
-            print(f"Cluster matching visualization failed: {e}")
+        visualize_cluster_mapping(centroidsA, centroidsB, Pi_cluster)
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
@@ -132,37 +85,7 @@ def hierarchical_pairwise_align(
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
     if visualize_clusters:
-        try:
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-            
-            ptsA = sliceA.obsm[spatial_key]
-            ptsB = sliceB.obsm[spatial_key]
-            
-            # Highlight chosen core dynamically
-            core_A_mask = np.zeros(sliceA.shape[0], dtype=bool)
-            core_A_mask[idx_A] = True
-            core_B_mask = np.zeros(sliceB.shape[0], dtype=bool)
-            core_B_mask[idx_B] = True
-            
-            # Plot distance out from core (distance is 0 inside core)
-            sc1 = ax1.scatter(ptsA[:,0], ptsA[:,1], c=dist_A, cmap='viridis_r', s=4, alpha=0.9)
-            ax1.scatter(ptsA[core_A_mask,0], ptsA[core_A_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
-            ax1.set_title("Slice A: Macro Selection & Distances")
-            ax1.axis('equal')
-            ax1.legend()
-            fig.colorbar(sc1, ax=ax1, label='Distance to Core', fraction=0.046, pad=0.04)
-            
-            sc2 = ax2.scatter(ptsB[:,0], ptsB[:,1], c=dist_B, cmap='viridis_r', s=4, alpha=0.9)
-            ax2.scatter(ptsB[core_B_mask,0], ptsB[core_B_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
-            ax2.set_title("Slice B: Macro Selection & Distances")
-            ax2.axis('equal')
-            ax2.legend()
-            fig.colorbar(sc2, ax=ax2, label='Distance to Core', fraction=0.046, pad=0.04)
-            
-            plt.show()
-        except Exception as e:
-            print(f"Sub-selection visualization failed: {e}")
+        visualize_selected_anchors(sliceA, sliceB, idx_A, idx_B, spatial_key=spatial_key, dist_A=dist_A, dist_B=dist_B)
 
     print("--- [HOT] Step 6: Synthesizing Cell-Level Footprint from Macro Clusters ---")
     pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)

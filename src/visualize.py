@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional
 
 from scipy.optimize import linear_sum_assignment
 from sklearn.neighbors import NearestNeighbors
+from matplotlib.collections import LineCollection
 
 
 def generalized_procrustes_analysis(
@@ -431,5 +432,122 @@ def visualize_3d_stack(
         ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
         
     plt.tight_layout()
+    plt.show()
+
+
+def visualize_clustered_slices(sliceA, sliceB, labelsA, labelsB, spatial_key="spatial"):
+    """
+    Visualizes the spatial clusters of two aligned slices side by side.
+    
+    Args:
+        sliceA: First AnnData slice (already aligned).
+        sliceB: Second AnnData slice (already aligned).
+        labelsA: Cluster labels for sliceA (array-like).
+        labelsB: Cluster labels for sliceB (array-like).
+        spatial_key: Key in .obsm where spatial coordinates are stored.
+    """
+        
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    ptsA = sliceA.obsm[spatial_key]
+    ptsB = sliceB.obsm[spatial_key]
+    # using categorical cmap
+    cmap = plt.get_cmap('tab20')
+    ax1.scatter(ptsA[:,0], ptsA[:,1], c=labelsA, cmap=cmap, s=2, alpha=0.8)
+    ax1.set_title(f"Slice A: {len(np.unique(labelsA))} Clusters")
+    ax1.axis('equal')
+    ax2.scatter(ptsB[:,0], ptsB[:,1], c=labelsB, cmap=cmap, s=2, alpha=0.8)
+    ax2.set_title(f"Slice B: {len(np.unique(labelsB))} Clusters")
+    ax2.axis('equal')
+    plt.show()
+
+
+def visualize_cluster_mapping(
+    centroidsA,
+    centroidsB,
+    Pi_cluster,
+    block_threshold=1e-4
+):
+    """
+    Visualizes the macro-level cluster matching between two slices using centroids and the Pi_cluster matrix.
+    Args:
+        centroidsA: (C_A, 2) array of cluster centroids for slice A.
+        centroidsB: (C_B, 2) array of cluster centroids for slice B.
+        Pi_cluster: (C_A, C_B) array of cluster-level transport plan values.
+        block_threshold: Minimum Pi_cluster value to draw a connection line between clusters.
+    """
+    # Center the coordinates purely for overlap plotting
+    cA_plot = centroidsA - np.mean(centroidsA, axis=0)
+    cB_plot = centroidsB - np.mean(centroidsB, axis=0)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.scatter(cA_plot[:,0], cA_plot[:,1], c='blue', s=20, label='Slice A Clusters (Centered)', zorder=2)
+    ax.scatter(cB_plot[:,0], cB_plot[:,1], c='red', s=20, label='Slice B Clusters (Centered)', zorder=2)
+
+    max_pi = np.max(Pi_cluster)
+    if max_pi > 0:
+        lines = []
+        linewidths = []
+        for i in range(Pi_cluster.shape[0]):
+            for j in range(Pi_cluster.shape[1]):
+                if Pi_cluster[i, j] > block_threshold:
+                    lines.append([(cA_plot[i,0], cA_plot[i,1]), (cB_plot[j,0], cB_plot[j,1])])
+                    linewidths.append((Pi_cluster[i, j] / max_pi) * 2.0)      
+
+        lc = LineCollection(lines, colors='k', linewidths=linewidths, alpha=0.5, zorder=1)
+        ax.add_collection(lc)
+
+    ax.set_title("Macro-Level Cluster Matching ($Pi_{cluster}$)")
+    ax.axis('equal')
+    ax.legend()
+    plt.show()
+
+
+def visualize_selected_anchors(
+    sliceA,
+    sliceB,
+    idx_A,
+    idx_B,
+    dist_A,
+    dist_B,
+    spatial_key="spatial"
+):
+    """
+    Visualizes the selected anchor clusters and their distance gradients in two aligned slices.
+    Args:
+        sliceA: First AnnData slice (already aligned).
+        sliceB: Second AnnData slice (already aligned).
+        idx_A: Index of the selected core in sliceA.
+        idx_B: Index of the selected core in sliceB.
+        dist_A: Array of distances from the selected core for all points in sliceA.
+        dist_B: Array of distances from the selected core for all points in sliceB.
+        spatial_key: Key in .obsm where spatial coordinates are stored.
+    """
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    
+    ptsA = sliceA.obsm[spatial_key]
+    ptsB = sliceB.obsm[spatial_key]
+    
+    # Highlight chosen core dynamically
+    core_A_mask = np.zeros(sliceA.shape[0], dtype=bool)
+    core_A_mask[idx_A] = True
+    core_B_mask = np.zeros(sliceB.shape[0], dtype=bool)
+    core_B_mask[idx_B] = True
+    
+    # Plot distance out from core (distance is 0 inside core)
+    sc1 = ax1.scatter(ptsA[:,0], ptsA[:,1], c=dist_A, cmap='viridis_r', s=4, alpha=0.9)
+    ax1.scatter(ptsA[core_A_mask,0], ptsA[core_A_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
+    ax1.set_title("Slice A: Macro Selection & Distances")
+    ax1.axis('equal')
+    ax1.legend()
+    fig.colorbar(sc1, ax=ax1, label='Distance to Core', fraction=0.046, pad=0.04)
+    
+    sc2 = ax2.scatter(ptsB[:,0], ptsB[:,1], c=dist_B, cmap='viridis_r', s=4, alpha=0.9)
+    ax2.scatter(ptsB[core_B_mask,0], ptsB[core_B_mask,1], c='red', s=2, alpha=0.5, label='Selected Core')
+    ax2.set_title("Slice B: Macro Selection & Distances")
+    ax2.axis('equal')
+    ax2.legend()
+    fig.colorbar(sc2, ax=ax2, label='Distance to Core', fraction=0.046, pad=0.04)
+    
     plt.show()
 
