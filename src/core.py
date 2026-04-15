@@ -29,6 +29,7 @@ def hierarchical_pairwise_align(
     label_key: str = "cell_type_annot",
     w_graph: float = 0.5,
     visualize_clusters: bool = True,
+    debug_macro_section: bool = False,
     **kwargs
 ):
     """
@@ -67,7 +68,15 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(sliceA, sliceB, labelsA, labelsB, Pi_cluster, spatial_key=spatial_key)
+    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(
+        sliceA,
+        sliceB,
+        labelsA,
+        labelsB,
+        Pi_cluster,
+        spatial_key=spatial_key,
+        debug_report=debug_macro_section,
+    )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 

@@ -217,14 +217,42 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     return pi_samp
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', debug_report=False):
     """
     Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
+
+    debug_lines = []
+    debug_emitted = False
+
+    def add_debug_line(message):
+        if debug_report:
+            debug_lines.append(message)
+
+    def emit_debug_report():
+        nonlocal debug_emitted
+        if not debug_report or debug_emitted:
+            return
+        print("--- [HOT DEBUG] Macro-section Report ---")
+        for line in debug_lines:
+            print(line)
+        debug_emitted = True
+
+    def summarize_degrees(adj, valid_mask):
+        valid_idx = np.where(valid_mask)[0]
+        if len(valid_idx) == 0:
+            return "none"
+        deg = np.sum(adj[np.ix_(valid_idx, valid_idx)], axis=1).astype(int) - 1
+        return (
+            f"min/med/max={int(np.min(deg))}/{float(np.median(deg)):.1f}/{int(np.max(deg))}, "
+            f"isolated={int(np.sum(deg == 0))}"
+        )
     
     total_mass = np.sum(Pi_cluster)
     if total_mass == 0:
+        add_debug_line("Pi_cluster total mass is zero; returning all cells.")
+        emit_debug_report()
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
@@ -304,6 +332,16 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
     adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
+    add_debug_line(
+        f"Clusters A/B: {num_clusters_A}/{num_clusters_B} total Pi mass={float(total_mass):.6f}"
+    )
+    add_debug_line(
+        f"Adjacency A degrees {summarize_degrees(adj_A, valid_A)}"
+    )
+    add_debug_line(
+        f"Adjacency B degrees {summarize_degrees(adj_B, valid_B)}"
+    )
+
     # 3. Parameter-free statistical expectation for OT plan
     # Under random/independent transport, mass distributes as the outer product of marginals.
     marg_A = np.sum(Pi_cluster, axis=1)
@@ -318,6 +356,18 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     
     if np.max(valid_masses) == 0:
         valid_masses = Pi_cluster # Fallback if null test yields no pairs
+
+    add_debug_line(
+        "Pi pairs: "
+        f"nonzero={int(np.count_nonzero(Pi_cluster > 0))}, "
+        f"above_null={int(np.count_nonzero(significant_matches))}, "
+        f"retained_mass={float(np.sum(valid_masses)) / float(total_mass + 1e-8):.3f}"
+    )
+    add_debug_line(
+        "Active rows/cols after filtering: "
+        f"{int(np.count_nonzero(np.sum(valid_masses > 0, axis=1)))} / "
+        f"{int(np.count_nonzero(np.sum(valid_masses > 0, axis=0)))}"
+    )
         
     # 4. Region Growing via Contiguous Expansion from Most Confident Edge
     # Seeding by Edge: A single point has undefined rotation, which can cause erratic early growth.
@@ -352,8 +402,14 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         start_flat = np.argmax(valid_masses)
         start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
         mapped_pairs = [(start_A, start_B)]
+        add_debug_line(
+            f"Seed fallback to single pair {(start_A, start_B)} with mass={float(valid_masses[start_A, start_B]):.6f}"
+        )
     else:
         mapped_pairs = [(best_edge[0][0], best_edge[0][1]), (best_edge[1][0], best_edge[1][1])]
+        add_debug_line(
+            f"Seed edge {mapped_pairs} with score={float(best_edge_score):.6f}"
+        )
     
     # Precompute individual cluster masses for accurate center-of-mass tracking
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
@@ -395,8 +451,13 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         return enforce_one_to_one_pairs(largest_component)
 
     def contiguous_expansion_pass(current_pairs):
+        nonlocal growth_pass_counter
         pairs = list(current_pairs)
+        growth_pass_counter += 1
+        pass_id = growth_pass_counter
+        iteration_id = 0
         while True:
+            iteration_id += 1
             sA = {p[0] for p in pairs}
             sB = {p[1] for p in pairs}
             
@@ -407,6 +468,9 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             frontier_B = {j for j in range(num_clusters_B) if valid_B[j] and j not in sB and np.any(adj_B[j, list(sB)])}
             
             if not frontier_A or not frontier_B:
+                add_debug_line(
+                    f"Growth pass {pass_id} iter {iteration_id}: stop, frontier sizes A/B={len(frontier_A)}/{len(frontier_B)}"
+                )
                 break
             
             sA_list, sB_list = list(sA), list(sB)
@@ -433,12 +497,15 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
             shadow_candidates = []
             fallback_candidates = []
+            mass_positive_candidates = 0
+            paired_neighbor_candidates = 0
             
             for pA in frontier_A:
                 for pB in frontier_B:
                     pair_mass = float(valid_masses[pA, pB])
                     if pair_mass <= 0:
                         continue
+                    mass_positive_candidates += 1
 
                     pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
                     pB_proj = (centroids_B[pB] - bary_B) @ R.T + bary_A
@@ -450,6 +517,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     paired_neighbors = [(a, b) for (a, b) in pairs if adj_A[pA, a] and adj_B[pB, b]]
                     if not paired_neighbors:
                         continue
+                    paired_neighbor_candidates += 1
                     paired_neighbor_mass = float(sum(valid_masses[a, b] for (a, b) in paired_neighbors))
 
                     # Fallback preference: if the exact shadow misses, pick the frontier
@@ -495,7 +563,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         shadow_candidates.append(candidate)
 
             if shadow_candidates:
-                best_pair = max(
+                best_candidate = max(
                     shadow_candidates,
                     key=lambda c: (
                         c['paired_neighbor_count'],
@@ -503,11 +571,20 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         c['pair_mass'],
                         -c['shadow_dist_max'],
                     ),
-                )['pair']
+                )
+                best_pair = best_candidate['pair']
                 pairs.append(best_pair)
                 pairs = enforce_one_to_one_pairs(pairs)
+                add_debug_line(
+                    f"Growth pass {pass_id} iter {iteration_id}: "
+                    f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
+                    f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
+                    f"shadow={len(shadow_candidates)}, fallback={len(fallback_candidates)} -> "
+                    f"choose shadow {best_pair} mass={best_candidate['pair_mass']:.6f} "
+                    f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
+                )
             elif fallback_candidates:
-                best_pair = min(
+                best_candidate = min(
                     fallback_candidates,
                     key=lambda c: (
                         c['bary_shift_total'],
@@ -518,11 +595,27 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         -c['pair_mass'],
                         c['shadow_dist_max'],
                     ),
-                )['pair']
+                )
+                best_pair = best_candidate['pair']
                 pairs.append(best_pair)
                 pairs = enforce_one_to_one_pairs(pairs)
+                add_debug_line(
+                    f"Growth pass {pass_id} iter {iteration_id}: "
+                    f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
+                    f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
+                    f"shadow={len(shadow_candidates)}, fallback={len(fallback_candidates)} -> "
+                    f"choose fallback {best_pair} mass={best_candidate['pair_mass']:.6f} "
+                    f"bary_shift={best_candidate['bary_shift_total']:.4f} "
+                    f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
+                )
             else:
                 # Stop only when no frontier neighbor pair carries admissible OT mass.
+                add_debug_line(
+                    f"Growth pass {pass_id} iter {iteration_id}: "
+                    f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
+                    f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
+                    "no admissible candidates"
+                )
                 break
         return pairs
 
@@ -564,9 +657,16 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 residuals_pairs[(pA, pB)] = max(res_A, res_B)
                 
         if not residuals_pairs:
+            add_debug_line(
+                f"Trim check on {len(current_pairs)} pairs: no outliers removed"
+            )
             return current_pairs, False
             
         worst_pair = max(residuals_pairs, key=residuals_pairs.get)
+        add_debug_line(
+            f"Trim removed {worst_pair} residual={float(residuals_pairs[worst_pair]):.4f} "
+            f"from {len(current_pairs)} current pairs"
+        )
         current_pairs.remove(worst_pair)
         return current_pairs, True
 
@@ -575,6 +675,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # By interleaving trimming and expansion, removing a bad cluster corrects the shadow (rotation matrix).
     # This frequently un-warps the projection, suddenly revealing/aligning new valid clusters 
     # that were previously hidden from the shadow because of the outlier's distortion!
+    growth_pass_counter = 0
     
     # 1. Initial Growth
     mapped_pairs = enforce_one_to_one_pairs(mapped_pairs)
@@ -595,10 +696,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             # (e.g., Trim removes cluster X -> Shadow shifts -> Expand picks up cluster X -> Shadow shifts back -> Trim removes X)
             current_state = frozenset(mapped_pairs)
             if current_state in visited_states:
+                add_debug_line("Active polish terminated due to repeated mapped-pair state.")
                 break # We have entered a cyclic loop; the manifold has reached maximum stable equilibrium.
             visited_states.add(current_state)
         else:
             # Convergence: No outliers, and no more clusters physically fit on the frontier.
+            add_debug_line("Active polish converged: no more outliers to trim.")
             break
 
     # Prevent scatter: Re-extract largest connected component treating pairs strictly as 1:1 atomic units
@@ -609,11 +712,14 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     if not mapped_pairs:
         # Fallback if mapping destroyed
         mapped_pairs = [(best_edge[0][0], best_edge[0][1])] if best_edge else [(np.where(valid_A)[0][0], np.where(valid_B)[0][0])]
+        add_debug_line(f"Mapping collapsed; fallback pairs={mapped_pairs}")
 
     strong_A = [p[0] for p in mapped_pairs]
     strong_B = [p[1] for p in mapped_pairs]
 
     if len(strong_A) == 0 or len(strong_B) == 0:
+        add_debug_line("No strong clusters remained after refinement; returning all cells.")
+        emit_debug_report()
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
         
     # 5. Extract Final Cell Indices
@@ -626,6 +732,15 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
+
+    add_debug_line(
+        f"Final pairs={len(mapped_pairs)} strong clusters A/B={len(strong_A)}/{len(strong_B)} "
+        f"cells A/B={len(idx_A)}/{len(idx_B)}"
+    )
+    add_debug_line(
+        f"Final matched pairs={mapped_pairs}"
+    )
+    emit_debug_report()
     
     return idx_A, idx_B, dist_A, dist_B
 
