@@ -522,9 +522,16 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         if not residuals_pairs:
             return current_pairs, False  # No structural tears found
 
-    # This frequently un-warps the projection, suddenly revealing/aligning new valid clusters 
+        worst_pair = max(residuals_pairs, key=residuals_pairs.get)
+        current_pairs.remove(worst_pair)
+        return current_pairs, True
+        
+    # ---------------- Active Contour Refinement Loop ---------------- #        
+    # Dynamic "Grow-Trim-Grow" (Trimmed Iterative Closest Point using Dynamic Overlapping Subsets)
+    # By interleaving trimming and expansion, removing a bad cluster corrects the shadow (rotation matrix).
+    # This frequently un-warps the projection, suddenly revealing/aligning new valid clusters
     # that were previously hidden from the shadow because of the outlier's distortion!
-    
+
     # 1. Initial Growth
     mapped_pairs = contiguous_expansion_pass(mapped_pairs)
     
