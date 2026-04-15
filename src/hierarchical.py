@@ -381,6 +381,19 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         largest = np.bincount(comp_labels).argmax()
         return [pairs[i] for i in np.where(comp_labels == largest)[0]]
 
+    def get_shape_distortion(pA, pB, core_A_list, core_B_list):
+        if not core_A_list or not core_B_list:
+            return 0.0, 0.0, 0.0
+
+        # Compute all pairwise distances from candidate to the established mapped core
+        dist_A = np.linalg.norm(centroids_A[core_A_list] - centroids_A[pA], axis=1) / spacing_A
+        dist_B = np.linalg.norm(centroids_B[core_B_list] - centroids_B[pB], axis=1) / spacing_B
+        
+        # Mean absolute difference in pairwise distances captures full topology/shape scaling
+        # independent of rotation and translation
+        shape_match_err = np.mean(np.abs(dist_A - dist_B))
+        return shape_match_err, np.mean(dist_A), np.mean(dist_B)
+
     def contiguous_expansion_pass(current_pairs):
         pairs = list(current_pairs)
         while True:
@@ -405,19 +418,13 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             for pA in frontier_A:
                 for pB in frontier_B:
                     if valid_masses[pA, pB] > 0:
-                        norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
-                        norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
-                        
                         # Parameter-free scale-normalized expansion criterion:
-                        # 1. Structural Match: abs(norm_dA - norm_dB) ensures the pair represents the same 
-                        #    relative topological radial distance from the biological core.
-                        # 2. Radial Growth: + 1e-3 * (norm_dA + norm_dB) ensures we grow radially outwards 
-                        #    organically rather than randomly jumping across the frontier.
-                        match_error = abs(norm_dA - norm_dB)
-                        score = match_error + 1e-3 * (norm_dA + norm_dB)
+                        # 1. Structural Match: shape_err evaluates distances to ALL mapped points
+                        #    ensuring both SHAPE and SIZE of the contour bounds are identical.
+                        # 2. Radial Growth: mean distance ensures we grow organically adjacent.
+                        shape_err, mean_dist_A, mean_dist_B = get_shape_distortion(pA, pB, sA_list, sB_list)
                         
-                        if score < best_score:
-                            best_score = score
+                        score = shape_err + 1e-3 * (mean_dist_A + mean_dist_B)
                             best_pair = (pA, pB)
                             
             if best_pair is not None:
@@ -444,47 +451,36 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             mapped_B = {p[1]: p for p in pairs}
             
             for i, (pA, pB) in enumerate(pairs):
-                # How perfectly does the current locked pair map?
-                curr_err = abs(
-                    (np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A) - 
-                    (np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B)
-                )
+                # We exclude this node itself to perform a LOO (Leave-One-Out) shape distortion evaluate
+                rest_sA = [x for j, x in enumerate(sA_list) if j != i]
+                rest_sB = [x for j, x in enumerate(sB_list) if j != i]
                 
+                curr_err, _, _ = get_shape_distortion(pA, pB, rest_sA, rest_sB)
+
                 best_new_pair = None
                 best_err = curr_err
-                
-                # Check if pA could map to an unmapped pB closer to the core
+
+                # Check if pA could map to an unmapped pB that improves SHAPE adherence
                 for pB_alt in range(num_clusters_B):
                     if valid_B[pB_alt] and pB_alt not in mapped_B and valid_masses[pA, pB_alt] > 0:
-                        alt_err = abs(
-                            (np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A) - 
-                            (np.linalg.norm(centroids_B[pB_alt] - bary_B) / spacing_B)
-                        )
-                        # We demand a structurally tighter fit without using arbitrary parameters
-                        # We also demand it resolves closer to the barycenter (norm is smaller)
-                        norm_dB_alt = np.linalg.norm(centroids_B[pB_alt] - bary_B) / spacing_B
-                        norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
+                        alt_err, _, alt_dist_B = get_shape_distortion(pA, pB_alt, rest_sA, rest_sB)
                         
-                        if alt_err < best_err and norm_dB_alt < norm_dB:
-                            # Verify physical adjacency isn't totally shattered
-                            rest_sB = [x for x in sB_list if x != pB]
+                        _, _, orig_dist_B = get_shape_distortion(pA, pB, rest_sA, rest_sB)
+
+                        # Must tighten shape constraints entirely, and pull inward topologically
+                        if alt_err < best_err and alt_dist_B < orig_dist_B:
                             if np.any(adj_B[pB_alt, rest_sB]):
                                 best_err = alt_err
                                 best_new_pair = (pA, pB_alt)
-                
-                # Check if pB could map to an unmapped pA closer to the core
+
+                # Check if pB could map to an unmapped pA that improves SHAPE adherence
                 for pA_alt in range(num_clusters_A):
                     if valid_A[pA_alt] and pA_alt not in mapped_A and valid_masses[pA_alt, pB] > 0:
-                        alt_err = abs(
-                            (np.linalg.norm(centroids_A[pA_alt] - bary_A) / spacing_A) - 
-                            (np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B)
-                        )
-                        norm_dA_alt = np.linalg.norm(centroids_A[pA_alt] - bary_A) / spacing_A
-                        norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
+                        alt_err, alt_dist_A, _ = get_shape_distortion(pA_alt, pB, rest_sA, rest_sB)
                         
-                        if alt_err < best_err and norm_dA_alt < norm_dA:
-                            rest_sA = [x for x in sA_list if x != pA]
-                            if np.any(adj_A[pA_alt, rest_sA]):
+                        _, orig_dist_A, _ = get_shape_distortion(pA, pB, rest_sA, rest_sB)
+
+                        if alt_err < best_err and alt_dist_A < orig_dist_A:
                                 best_err = alt_err
                                 best_new_pair = (pA_alt, pB)
                                 
@@ -504,60 +500,25 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         sA_list = [p[0] for p in current_pairs]
         sB_list = [p[1] for p in current_pairs]
         
-        # Calculate full weighted sums to efficiently compute Leave-One-Out (LOO) barycenters
-        weights_A = masses_A[sA_list]
-        weights_B = masses_B[sB_list]
-        
-        sum_pos_A = np.sum(centroids_A[sA_list] * weights_A[:, None], axis=0)
-        sum_mass_A = np.sum(weights_A)
-        
-        sum_pos_B = np.sum(centroids_B[sB_list] * weights_B[:, None], axis=0)
-        sum_mass_B = np.sum(weights_B)
-
         residuals_pairs = {}
-        for (pA, pB) in current_pairs:
-            # Leave-One-Out (LOO) Barycenter Computation:
-            # Preventing "Self-Masking / Leverage Skew". If we use the full barycenter, an extreme outlier 
-            # pulls the center of mass toward itself. This artificially shrinks its own discrepancy while 
-            # inflating the discrepancy of perfectly healthy points on the opposite side of the tissue, 
-            # causing the exact wrong pairs to be trimmed! By evaluating against the core EXCLUDING itself, 
-            # true outliers are mathematically exposed.
+        for i, (pA, pB) in enumerate(current_pairs):
+            # Compute purely shape-based structural distortion (implicitly Leave-One-Out)
+            rest_sA = [x for j, x in enumerate(sA_list) if j != i]
+            rest_sB = [x for j, x in enumerate(sB_list) if j != i]
             
-            m_pA = masses_A[pA]
-            loo_mass_A = sum_mass_A - m_pA
-            if loo_mass_A <= 0: continue
-            loo_bary_A = (sum_pos_A - centroids_A[pA] * m_pA) / loo_mass_A
-            
-            m_pB = masses_B[pB]
-            loo_mass_B = sum_mass_B - m_pB
-            if loo_mass_B <= 0: continue
-            loo_bary_B = (sum_pos_B - centroids_B[pB] * m_pB) / loo_mass_B
+            discrepancy, _, _ = get_shape_distortion(pA, pB, rest_sA, rest_sB)
 
-            # Scale-normalized LOO barycenter mismatch
-            norm_dA = np.linalg.norm(centroids_A[pA] - loo_bary_A) / spacing_A  
-            norm_dB = np.linalg.norm(centroids_B[pB] - loo_bary_B) / spacing_B  
-
-            # An outlier shows severe dimensional discrepancy from the LOO core center
-            discrepancy = abs(norm_dA - norm_dB)
-            
-            # Parameter-free biological bound: The discrepancy is scaled by the median cluster spacing.
-            # A discrepancy > 1.0 means the radial stretch offset between the source and target 
-            # is physically larger than 1 entire neighboring cluster. This is the exact mathematical 
-            # definition of a "topological fold" (mapping jumping over a valid adjacent neighbor).
+            # Geometric Shape Disruption Threshold
+            # A discrepancy > 1.0 means the addition of this mapping distorts the 
+            # entire structural contour envelope of the core by more than an entire biological
+            # cluster unit on average. This represents a massive geometric bulge or tear 
+            # across the shape's boundary.
             if discrepancy > 1.0:
                 residuals_pairs[(pA, pB)] = discrepancy
 
         if not residuals_pairs:
-            return current_pairs, False  # No outliers found
+            return current_pairs, False  # No structural tears found
 
-        # Trim the single highest outlier
-        worst_pair = max(residuals_pairs, key=residuals_pairs.get)
-        current_pairs.remove(worst_pair)
-        return current_pairs, True
-
-    # ---------------- Active Contour Refinement Loop ---------------- #
-    # Dynamic "Grow-Trim-Grow" (Trimmed Iterative Closest Point using Dynamic Overlapping Subsets)
-    # By interleaving trimming and expansion, removing a bad cluster corrects the shadow (rotation matrix).
     # This frequently un-warps the projection, suddenly revealing/aligning new valid clusters 
     # that were previously hidden from the shadow because of the outlier's distortion!
     
