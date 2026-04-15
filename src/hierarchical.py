@@ -386,12 +386,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             
             if not frontier_A or not frontier_B:
                 break
-                
+            
             sA_list, sB_list = list(sA), list(sB)
             bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
             bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
-            rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list])
-            rad_B = max(rad_B, 1e-3)
+            selected_mass_A = float(np.sum(masses_A[sA_list]))
+            selected_mass_B = float(np.sum(masses_B[sB_list]))
             
             # Rigid alignment requires at least 3 points to stabilize rotation
             if len(sA_list) >= 3 and len(sB_list) >= 3:
@@ -409,27 +409,86 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             else:
                 R = np.eye(2) # Fallback to pure translation for early seed growth
 
-            best_pair = None
-            best_physical_match = float('inf')
+            shadow_candidates = []
+            fallback_candidates = []
             
             for pA in frontier_A:
                 for pB in frontier_B:
-                    if valid_masses[pA, pB] > 0:
-                        pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
-                        shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
-                        
-                        # Parameter-free EXACT shadow: The projection error must be strictly smaller 
-                        # than the physical distance to its nearest already-selected neighbor.
-                        min_dist_to_core = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[c]) for c in sB_list if adj_B[pB, c]] or [float('inf')])
-                        
-                        if shadow_dist < min_dist_to_core and shadow_dist < best_physical_match:
-                            best_physical_match = shadow_dist
-                            best_pair = (pA, pB)
-                            
-            if best_pair is not None:
+                    pair_mass = float(valid_masses[pA, pB])
+                    if pair_mass <= 0:
+                        continue
+
+                    pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
+                    shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
+
+                    # Favor extensions that preserve local matched topology, not just any
+                    # two frontier nodes that happen to have nonzero OT mass.
+                    paired_neighbors = [(a, b) for (a, b) in pairs if adj_A[pA, a] and adj_B[pB, b]]
+                    paired_neighbor_mass = float(sum(valid_masses[a, b] for (a, b) in paired_neighbors))
+
+                    # Fallback preference: if the exact shadow misses, pick the frontier
+                    # neighbor that perturbs the already-selected cell barycenter the least.
+                    new_bary_A = (
+                        (bary_A * selected_mass_A) + (centroids_A[pA] * masses_A[pA])
+                    ) / max(selected_mass_A + masses_A[pA], 1e-8)
+                    new_bary_B = (
+                        (bary_B * selected_mass_B) + (centroids_B[pB] * masses_B[pB])
+                    ) / max(selected_mass_B + masses_B[pB], 1e-8)
+                    bary_shift_A = np.linalg.norm(new_bary_A - bary_A)
+                    bary_shift_B = np.linalg.norm(new_bary_B - bary_B)
+                    bary_shift_total = bary_shift_A + bary_shift_B
+
+                    # Parameter-free EXACT shadow: The projection error must be strictly
+                    # smaller than the physical distance to its nearest already-selected
+                    # neighbor. If nothing lands in this shadow, we will fall back to the
+                    # best neighbor-supported frontier pair instead of stopping early.
+                    min_dist_to_core = np.min(
+                        [np.linalg.norm(centroids_B[pB] - centroids_B[c]) for c in sB_list if adj_B[pB, c]]
+                        or [float('inf')]
+                    )
+
+                    candidate = {
+                        'pair': (pA, pB),
+                        'pair_mass': pair_mass,
+                        'shadow_dist': shadow_dist,
+                        'paired_neighbor_count': len(paired_neighbors),
+                        'paired_neighbor_mass': paired_neighbor_mass,
+                        'bary_shift_A': bary_shift_A,
+                        'bary_shift_B': bary_shift_B,
+                        'bary_shift_total': bary_shift_total,
+                    }
+                    fallback_candidates.append(candidate)
+
+                    if shadow_dist < min_dist_to_core:
+                        shadow_candidates.append(candidate)
+
+            if shadow_candidates:
+                best_pair = max(
+                    shadow_candidates,
+                    key=lambda c: (
+                        c['paired_neighbor_count'],
+                        c['paired_neighbor_mass'],
+                        c['pair_mass'],
+                        -c['shadow_dist'],
+                    ),
+                )['pair']
+                pairs.append(best_pair)
+            elif fallback_candidates:
+                best_pair = min(
+                    fallback_candidates,
+                    key=lambda c: (
+                        c['bary_shift_total'],
+                        c['bary_shift_A'],
+                        c['bary_shift_B'],
+                        -c['paired_neighbor_count'],
+                        -c['paired_neighbor_mass'],
+                        -c['pair_mass'],
+                        c['shadow_dist'],
+                    ),
+                )['pair']
                 pairs.append(best_pair)
             else:
-                # Dynamic Stopping Criterion: Halts when NO neighbors fall inside the exact geometry
+                # Stop only when no frontier neighbor pair carries admissible OT mass.
                 break
         return pairs
 
