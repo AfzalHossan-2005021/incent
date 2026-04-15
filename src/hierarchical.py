@@ -359,6 +359,27 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
     masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
 
+    def enforce_one_to_one_pairs(pairs):
+        if not pairs:
+            return []
+
+        ranked_pairs = sorted(
+            pairs,
+            key=lambda p: valid_masses[p[0], p[1]],
+            reverse=True,
+        )
+        keep_set = set()
+        used_A, used_B = set(), set()
+
+        for pA, pB in ranked_pairs:
+            if pA in used_A or pB in used_B:
+                continue
+            keep_set.add((pA, pB))
+            used_A.add(pA)
+            used_B.add(pB)
+
+        return [pair for pair in pairs if pair in keep_set]
+
     def get_largest_connected_pair_component(pairs):
         # Prevent scatter: ensure the mapping graph itself is contiguous
         if not pairs: return []
@@ -366,11 +387,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         adj_pairs = np.zeros((n_pairs, n_pairs), dtype=bool)
         for i, (uA, uB) in enumerate(pairs):
             for j, (vA, vB) in enumerate(pairs):
-                if i != j and (adj_A[uA, vA] or adj_B[uB, vB]):
+                if i != j and adj_A[uA, vA] and adj_B[uB, vB]:
                     adj_pairs[i, j] = True
         n_comp, comp_labels = connected_components(adj_pairs, directed=False)
         largest = np.bincount(comp_labels).argmax()
-        return [pairs[i] for i in np.where(comp_labels == largest)[0]]
+        largest_component = [pairs[i] for i in np.where(comp_labels == largest)[0]]
+        return enforce_one_to_one_pairs(largest_component)
 
     def contiguous_expansion_pass(current_pairs):
         pairs = list(current_pairs)
@@ -419,11 +441,15 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         continue
 
                     pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
-                    shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
+                    pB_proj = (centroids_B[pB] - bary_B) @ R.T + bary_A
+                    shadow_dist_B = np.linalg.norm(pA_proj - centroids_B[pB])
+                    shadow_dist_A = np.linalg.norm(pB_proj - centroids_A[pA])
 
                     # Favor extensions that preserve local matched topology, not just any
                     # two frontier nodes that happen to have nonzero OT mass.
                     paired_neighbors = [(a, b) for (a, b) in pairs if adj_A[pA, a] and adj_B[pB, b]]
+                    if not paired_neighbors:
+                        continue
                     paired_neighbor_mass = float(sum(valid_masses[a, b] for (a, b) in paired_neighbors))
 
                     # Fallback preference: if the exact shadow misses, pick the frontier
@@ -442,15 +468,21 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     # smaller than the physical distance to its nearest already-selected
                     # neighbor. If nothing lands in this shadow, we will fall back to the
                     # best neighbor-supported frontier pair instead of stopping early.
-                    min_dist_to_core = np.min(
+                    min_dist_to_core_B = np.min(
                         [np.linalg.norm(centroids_B[pB] - centroids_B[c]) for c in sB_list if adj_B[pB, c]]
+                        or [float('inf')]
+                    )
+                    min_dist_to_core_A = np.min(
+                        [np.linalg.norm(centroids_A[pA] - centroids_A[c]) for c in sA_list if adj_A[pA, c]]
                         or [float('inf')]
                     )
 
                     candidate = {
                         'pair': (pA, pB),
                         'pair_mass': pair_mass,
-                        'shadow_dist': shadow_dist,
+                        'shadow_dist_A': shadow_dist_A,
+                        'shadow_dist_B': shadow_dist_B,
+                        'shadow_dist_max': max(shadow_dist_A, shadow_dist_B),
                         'paired_neighbor_count': len(paired_neighbors),
                         'paired_neighbor_mass': paired_neighbor_mass,
                         'bary_shift_A': bary_shift_A,
@@ -459,7 +491,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     }
                     fallback_candidates.append(candidate)
 
-                    if shadow_dist < min_dist_to_core:
+                    if shadow_dist_A < min_dist_to_core_A and shadow_dist_B < min_dist_to_core_B:
                         shadow_candidates.append(candidate)
 
             if shadow_candidates:
@@ -469,10 +501,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         c['paired_neighbor_count'],
                         c['paired_neighbor_mass'],
                         c['pair_mass'],
-                        -c['shadow_dist'],
+                        -c['shadow_dist_max'],
                     ),
                 )['pair']
                 pairs.append(best_pair)
+                pairs = enforce_one_to_one_pairs(pairs)
             elif fallback_candidates:
                 best_pair = min(
                     fallback_candidates,
@@ -483,10 +516,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         -c['paired_neighbor_count'],
                         -c['paired_neighbor_mass'],
                         -c['pair_mass'],
-                        c['shadow_dist'],
+                        c['shadow_dist_max'],
                     ),
                 )['pair']
                 pairs.append(best_pair)
+                pairs = enforce_one_to_one_pairs(pairs)
             else:
                 # Stop only when no frontier neighbor pair carries admissible OT mass.
                 break
@@ -543,6 +577,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # that were previously hidden from the shadow because of the outlier's distortion!
     
     # 1. Initial Growth
+    mapped_pairs = enforce_one_to_one_pairs(mapped_pairs)
     mapped_pairs = contiguous_expansion_pass(mapped_pairs)
     
     visited_states = set()
@@ -569,6 +604,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # Prevent scatter: Re-extract largest connected component treating pairs strictly as 1:1 atomic units
     if mapped_pairs:
         mapped_pairs = get_largest_connected_pair_component(mapped_pairs)
+        mapped_pairs = enforce_one_to_one_pairs(mapped_pairs)
     
     if not mapped_pairs:
         # Fallback if mapping destroyed
