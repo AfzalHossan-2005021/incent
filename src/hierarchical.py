@@ -358,6 +358,15 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # Precompute individual cluster masses for accurate center-of-mass tracking
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
     masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
+    
+    # Scale parameters for dimensionless geometric comparisons
+    tree_A = cKDTree(centroids_A[valid_A])
+    d_A, _ = tree_A.query(centroids_A[valid_A], k=2)
+    spacing_A = np.median(d_A[:, 1]) if len(d_A) > 0 else 1.0
+
+    tree_B = cKDTree(centroids_B[valid_B])
+    d_B, _ = tree_B.query(centroids_B[valid_B], k=2)
+    spacing_B = np.median(d_B[:, 1]) if len(d_B) > 0 else 1.0
 
     def get_largest_connected_pair_component(pairs):
         # Prevent scatter: ensure the mapping graph itself is contiguous
@@ -380,7 +389,6 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             
             if len(sA) >= np.sum(valid_A) or len(sB) >= np.sum(valid_B): break
             
-            # Strict topological frontier: ONLY direct neighbors, excluding current elements
             frontier_A = {i for i in range(num_clusters_A) if valid_A[i] and i not in sA and np.any(adj_A[i, list(sA)])}
             frontier_B = {j for j in range(num_clusters_B) if valid_B[j] and j not in sB and np.any(adj_B[j, list(sB)])}
             
@@ -390,46 +398,27 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             sA_list, sB_list = list(sA), list(sB)
             bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
             bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
-            rad_B = np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list])
-            rad_B = max(rad_B, 1e-3)
-            
-            # Rigid alignment requires at least 3 points to stabilize rotation
-            if len(sA_list) >= 3 and len(sB_list) >= 3:
-                P_c = centroids_A[sA_list] - bary_A
-                Q_c = centroids_B[sB_list] - bary_B
-                W_cross = valid_masses[np.ix_(sA_list, sB_list)]
-                try:
-                    U, _, Vt = np.linalg.svd(P_c.T @ W_cross @ Q_c)
-                    R = U @ Vt
-                    if np.linalg.det(R) < 0:
-                        Vt[-1, :] *= -1
-                        R = U @ Vt
-                except:
-                    R = np.eye(2)
-            else:
-                R = np.eye(2) # Fallback to pure translation for early seed growth
 
             best_pair = None
-            best_physical_match = float('inf')
+            best_score = float('inf')
             
             for pA in frontier_A:
                 for pB in frontier_B:
                     if valid_masses[pA, pB] > 0:
-                        pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
-                        shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
+                        norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
+                        norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
                         
-                        # Parameter-free EXACT shadow: The projection error must be strictly smaller 
-                        # than the physical distance to its nearest already-selected neighbor.
-                        min_dist_to_core = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[c]) for c in sB_list if adj_B[pB, c]] or [float('inf')])
+                        # Parameter-free scale-normalized expansion criterion
+                        # Replaces rigid SVD tracking and favors biologically contiguous pairs
+                        score = norm_dA + norm_dB
                         
-                        if shadow_dist < min_dist_to_core and shadow_dist < best_physical_match:
-                            best_physical_match = shadow_dist
+                        if score < best_score:
+                            best_score = score
                             best_pair = (pA, pB)
                             
             if best_pair is not None:
                 pairs.append(best_pair)
             else:
-                # Dynamic Stopping Criterion: Halts when NO neighbors fall inside the exact geometry
                 break
         return pairs
 
@@ -442,33 +431,24 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
         bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
 
-        R_final = np.eye(2)
-        try:
-            P_c = centroids_A[sA_list] - bary_A
-            Q_c = centroids_B[sB_list] - bary_B
-            W_cross = valid_masses[np.ix_(sA_list, sB_list)]
-            U, _, Vt = np.linalg.svd(P_c.T @ W_cross @ Q_c)
-            R_final = U @ Vt
-            if np.linalg.det(R_final) < 0:
-                Vt[-1, :] *= -1
-                R_final = U @ Vt
-        except:
-            pass
-
         residuals_pairs = {}
         for (pA, pB) in current_pairs:
+            # Scale-normalized barycenter mismatch as structural outlier detection
+            norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
+            norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
+            
+            # An outlier shows severe dimensional discrepancy from the core center
+            discrepancy = abs(norm_dA - norm_dB)
+            
             neighbors_A = [c for c in sA_list if c != pA and adj_A[pA, c]]
-            min_dist_A = np.min([np.linalg.norm(centroids_A[pA] - centroids_A[n]) for n in neighbors_A]) if neighbors_A else float('inf')
-            res_A = np.linalg.norm((centroids_A[pA] - bary_A) @ R_final + bary_B - centroids_B[pB])
+            min_dist_A = np.min([np.linalg.norm(centroids_A[pA] - centroids_A[n]) for n in neighbors_A]) / spacing_A if neighbors_A else float('inf')
             
             neighbors_B = [c for c in sB_list if c != pB and adj_B[pB, c]]
-            min_dist_B = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[n]) for n in neighbors_B]) if neighbors_B else float('inf')
-            res_B = np.linalg.norm((centroids_B[pB] - bary_B) @ R_final.T + bary_A - centroids_A[pA])
+            min_dist_B = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[n]) for n in neighbors_B]) / spacing_B if neighbors_B else float('inf')
             
-            # If the projection error exceeds the physical boundary of the Voronoi cell, it's a topological fold
-            worst_err = max(res_A - min_dist_A, res_B - min_dist_B)
-            if worst_err > 0:
-                residuals_pairs[(pA, pB)] = max(res_A, res_B)
+            # Parameter-free check: The radial mapping stretch must not exceed its own local topological step size
+            if discrepancy > max(min_dist_A, min_dist_B):
+                residuals_pairs[(pA, pB)] = discrepancy
                 
         if not residuals_pairs:
             return current_pairs, False
