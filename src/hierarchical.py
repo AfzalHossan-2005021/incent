@@ -411,7 +411,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         
         return shape_match_err, np.mean(dist_A), np.mean(dist_B)
 
-    def contiguous_expansion_pass(current_pairs):
+    def anneal_suboptimal_pairs(current_pairs):
         # Topological "Sliding": Replaces mapped peripheral nodes with unmapped nodes 
         # that are physically closer to the barycenter and strictly provide a tighter mapping.
         pairs = list(current_pairs)
@@ -471,6 +471,48 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         
         return pairs
 
+    def contiguous_expansion_pass(current_pairs):
+        # 1. Topologically Grows the active contour outwards from the current mapped core
+        pairs = list(current_pairs)
+        improved = True
+        
+        while improved:
+            improved = False
+            sA_list = [p[0] for p in pairs]
+            sB_list = [p[1] for p in pairs]
+            
+            mapped_A = {p[0]: p for p in pairs}
+            mapped_B = {p[1]: p for p in pairs}
+            
+            best_pair = None
+            best_score = -1.0
+            
+            for uA in range(num_clusters_A):
+                if not valid_A[uA] or uA in mapped_A: continue
+                # Must be topologically adjacent to the growing footprint
+                if not np.any(adj_A[uA, sA_list]): continue
+                
+                for uB in range(num_clusters_B):
+                    if not valid_B[uB] or uB in mapped_B: continue
+                    if not np.any(adj_B[uB, sB_list]): continue
+                    
+                    if valid_masses[uA, uB] == 0: continue
+                    
+                    err, _, _ = get_shape_distortion(uA, uB, sA_list, sB_list)
+                    
+                    # Parameter-Free Threshold: Deformation must remain within 1 full biological cluster density
+                    if err <= 1.0:
+                        score = valid_masses[uA, uB] / (err + 1e-3)
+                        if score > best_score:
+                            best_score = score
+                            best_pair = (uA, uB)
+                            
+            if best_pair:
+                pairs.append(best_pair)
+                improved = True
+                
+        return pairs
+
     def trim_worst_outlier(current_pairs):
         if len(current_pairs) < 3:
             return current_pairs, False
@@ -517,7 +559,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     while len(mapped_pairs) >= 3:
         # Annealing Sliding Pass: Break sub-optimal peripheral locks 
         # and recruit geometrically tighter unmapped nodes closer to the barycenter
-        mapped_pairs = contiguous_expansion_pass(mapped_pairs)
+        mapped_pairs = anneal_suboptimal_pairs(mapped_pairs)
 
         mapped_pairs, trimmed = trim_worst_outlier(mapped_pairs)
         if trimmed:
