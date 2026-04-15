@@ -425,6 +425,9 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         shape_err, mean_dist_A, mean_dist_B = get_shape_distortion(pA, pB, sA_list, sB_list)
                         
                         score = shape_err + 1e-3 * (mean_dist_A + mean_dist_B)
+
+                        if score < best_score:
+                            best_score = score
                             best_pair = (pA, pB)
                             
             if best_pair is not None:
