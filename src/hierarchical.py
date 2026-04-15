@@ -358,26 +358,43 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         largest = np.bincount(comp_labels).argmax()
         return [pairs[i] for i in np.where(comp_labels == largest)[0]]
 
-    def get_shape_distortion(pA, pB, core_A_list, core_B_list):
-        if not core_A_list or not core_B_list:
-            return 0.0
-
-        # Topological Geodesic Hop Discrepancy natively captures biological tissue bending/manifold structure
-        dist_A = geo_A[pA, core_A_list]
-        dist_B = geo_B[pB, core_B_list]
-        
-        hop_err = np.abs(dist_A - dist_B)
-        
-        # Penalize severely if mapping crosses disconnected tissue boundaries
-        inf_mask = np.isinf(dist_A) | np.isinf(dist_B)
-        if np.any(inf_mask):
-            max_val_A = np.max(geo_A[~np.isinf(geo_A)]) if np.any(~np.isinf(geo_A)) else 10.0
-            max_val_B = np.max(geo_B[~np.isinf(geo_B)]) if np.any(~np.isinf(geo_B)) else 10.0
-            hop_err[inf_mask] = max(max_val_A, max_val_B) * 2.0
+    def get_procrustes_transform(sA_list, sB_list):
+        # 2D Rigid Registration (Procrustes) enforces exact size (scale=1.0) and shape (rotation only).
+        # Unlike internal geodesics, this strictly prevents tissue from bending/warping.
+        if len(sA_list) < 2:
+            return np.eye(2), np.zeros(2), np.zeros(2), np.zeros(len(sA_list))
             
-        return float(np.mean(hop_err))
+        ptsA = centroids_A[sA_list]
+        ptsB = centroids_B[sB_list]
+        
+        # Center points via physical masses to prevent barycenter drift
+        cA = np.average(ptsA, axis=0, weights=masses_A[sA_list])
+        cB = np.average(ptsB, axis=0, weights=masses_B[sB_list])
+        
+        A_centered = ptsA - cA
+        B_centered = ptsB - cB
+        
+        # Kabsch Algorithm for optimal biological orientation
+        H = A_centered.T @ np.diag(masses_A[sA_list]) @ B_centered
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        
+        # Eliminate non-biological reflections (tissue cannot flip)
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+            
+        # Predict physical position of A mapped onto B
+        ptsA_aligned = A_centered @ R.T + cB
+        
+        # Absolute Euclidean displacement mismatch
+        residuals = np.linalg.norm(ptsA_aligned - ptsB, axis=1)
+        
+        return R, cA, cB, residuals
 
     def anneal_suboptimal_pairs(current_pairs):
+        # Topological "Sliding": Replaces mapped peripheral nodes with unmapped nodes 
+        # strictly if they offer a computationally tighter 2D Rigid fit.
         pairs = list(current_pairs)
         improved = True
         
@@ -386,42 +403,54 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             sA_list = [p[0] for p in pairs]
             sB_list = [p[1] for p in pairs]
             
-            mapped_A = {p[0]: p for p in pairs}
-            mapped_B = {p[1]: p for p in pairs}
+            if len(pairs) < 3: 
+                break
+                
+            R, cA, cB, residuals = get_procrustes_transform(sA_list, sB_list)
+            
+            mapped_A = {p[0]: True for p in pairs}
+            mapped_B = {p[1]: True for p in pairs}
             
             for i, (pA, pB) in enumerate(pairs):
+                # Temporarily remove pair i to test alternatives against the fixed core
                 rest_sA = [x for j, x in enumerate(sA_list) if j != i]
                 rest_sB = [x for j, x in enumerate(sB_list) if j != i]
                 
-                best_err = get_shape_distortion(pA, pB, rest_sA, rest_sB)
+                # Transform vector from rest core to the candidate point
+                pred_pB = (centroids_A[pA] - cA) @ R.T + cB
+                pred_pA = (centroids_B[pB] - cB) @ R + cA
+                
                 best_new_pair = None
-
-                for pB_alt in range(num_clusters_B):
-                    if valid_B[pB_alt] and pB_alt not in mapped_B and valid_masses[pA, pB_alt] > 0:
-                        if np.any(adj_B[pB_alt, rest_sB]):
-                            alt_err = get_shape_distortion(pA, pB_alt, rest_sA, rest_sB)
+                best_err = residuals[i]
+                
+                # Can pA map to a better unmapped B?
+                for alt_B in range(num_clusters_B):
+                    if valid_B[alt_B] and alt_B not in mapped_B and valid_masses[pA, alt_B] > 0:
+                        if adj_B[alt_B, pB] > 0: # Must physically sit nearby
+                            alt_err = np.linalg.norm(pred_pB - centroids_B[alt_B])
                             if alt_err < best_err:
                                 best_err = alt_err
-                                best_new_pair = (pA, pB_alt)
-
-                for pA_alt in range(num_clusters_A):
-                    if valid_A[pA_alt] and pA_alt not in mapped_A and valid_masses[pA_alt, pB] > 0:
-                        if np.any(adj_A[pA_alt, rest_sA]):
-                            alt_err = get_shape_distortion(pA_alt, pB, rest_sA, rest_sB)
+                                best_new_pair = (pA, alt_B)
+                                
+                # Can pB map to a better unmapped A?
+                for alt_A in range(num_clusters_A):
+                    if valid_A[alt_A] and alt_A not in mapped_A and valid_masses[alt_A, pB] > 0:
+                        if adj_A[alt_A, pA] > 0:
+                            alt_err = np.linalg.norm(pred_pA - centroids_A[alt_A])
                             if alt_err < best_err:
                                 best_err = alt_err
-                                best_new_pair = (pA_alt, pB)
+                                best_new_pair = (alt_A, pB)
                                 
                 if best_new_pair:
                     pairs[i] = best_new_pair
-                    mapped_A = {p[0]: p for p in pairs}
-                    mapped_B = {p[1]: p for p in pairs}
                     improved = True
                     break
         
         return pairs
 
     def contiguous_expansion_pass(current_pairs):
+        # 1. 2D Euclidean Growth: Expand the active contour layer by layer 
+        # strictly maintaining the rigid shape constraints of the core.
         pairs = list(current_pairs)
         improved = True
         
@@ -430,28 +459,40 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             sA_list = [p[0] for p in pairs]
             sB_list = [p[1] for p in pairs]
             
-            mapped_A = {p[0]: p for p in pairs}
-            mapped_B = {p[1]: p for p in pairs}
+            mapped_A = {p[0]: True for p in pairs}
+            mapped_B = {p[1]: True for p in pairs}
+            
+            R, cA, cB, _ = get_procrustes_transform(sA_list, sB_list)
             
             best_pair = None
             best_score = -1.0
             
             for uA in range(num_clusters_A):
                 if not valid_A[uA] or uA in mapped_A: continue
-                if not np.any(adj_A[uA, sA_list]): continue
+                
+                # Must be topologically adjacent to the growing footprint
+                if not np.any(adj_A[uA, sA_list] > 0): continue
+                
+                pred_uB = (centroids_A[uA] - cA) @ R.T + cB
                 
                 for uB in range(num_clusters_B):
                     if not valid_B[uB] or uB in mapped_B: continue
-                    if not np.any(adj_B[uB, sB_list]): continue
+                    if not np.any(adj_B[uB, sB_list] > 0): continue
                     
                     if valid_masses[uA, uB] == 0: continue
                     
-                    err = get_shape_distortion(uA, uB, sA_list, sB_list)
+                    err = np.linalg.norm(pred_uB - centroids_B[uB])
                     
-                    score = valid_masses[uA, uB] / (err + 1e-3)
-                    if score > best_score:
-                        best_score = score
-                        best_pair = (uA, uB)
+                    # Parameter-Free Biological Ground: Limit deformation
+                    # Two matched clusters are a biological size/shape anomaly if their rigidly 
+                    # predicted overlap deviates by more than their intrinsic tissue cellular spread.
+                    allowed_tolerance = intra_A[uA] + intra_B[uB] + (char_gap_A + char_gap_B) / 2.0
+                    
+                    if err <= allowed_tolerance:
+                        score = valid_masses[uA, uB] / (err + 1e-3)
+                        if score > best_score:
+                            best_score = score
+                            best_pair = (uA, uB)
                             
             if best_pair:
                 pairs.append(best_pair)
@@ -466,33 +507,23 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         sA_list = [p[0] for p in current_pairs]
         sB_list = [p[1] for p in current_pairs]
         
-        residuals = {}
-        for i, (pA, pB) in enumerate(current_pairs):
-            rest_sA = [x for j, x in enumerate(sA_list) if j != i]
-            rest_sB = [x for j, x in enumerate(sB_list) if j != i]
-            
-            err = get_shape_distortion(pA, pB, rest_sA, rest_sB)
-            residuals[(pA, pB)] = err
+        R, cA, cB, residuals = get_procrustes_transform(sA_list, sB_list)
 
-        worst_pair = max(residuals, key=residuals.get)
-        worst_err = residuals[worst_pair]
+        worst_idx = int(np.argmax(residuals))
+        worst_err = residuals[worst_idx]
+        worst_pair = current_pairs[worst_idx]
+        pA, pB = worst_pair
         
-        # Parameter-Free Biological Ground: 
-        # A node represents a cross-manifold mapping tear if its inclusion 
-        # creates a spatial distortion strictly larger than the maximal native 
-        # internal structural variance (diameter) of the core itself.
-        coreA_dists = geo_A[np.ix_(sA_list, sA_list)]
-        coreB_dists = geo_B[np.ix_(sB_list, sB_list)]
+        # Parameter-Free Biological Ground:
+        # A rigidly aligned structure implies same size and same shape natively.
+        # If the worst residual exceeds the biological cellular radii combo, it's a structural tear.
+        allowed_tolerance = intra_A[pA] + intra_B[pB] + (char_gap_A + char_gap_B) / 2.0
         
-        # The true biological flexibility of this specific sub-tissue
-        native_flexibility = np.max(np.abs(coreA_dists - coreB_dists))
-        
-        if worst_err > native_flexibility + 1e-5:
-            current_pairs.remove(worst_pair)
+        if worst_err > allowed_tolerance:
+            current_pairs.pop(worst_idx)
             return current_pairs, True
             
         return current_pairs, False
-
     # ---------------- Active Contour Refinement Loop ---------------- #
     # Dynamic "Grow-Trim-Grow" (Trimmed Iterative Closest Point using Dynamic Overlapping Subsets)
     # By interleaving trimming and expansion, removing a bad cluster corrects the shadow (rotation matrix).
