@@ -233,17 +233,25 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     num_clusters_A, num_clusters_B = Pi_cluster.shape
     centroids_A, centroids_B = np.zeros((num_clusters_A, 2)), np.zeros((num_clusters_B, 2))
     valid_A, valid_B = np.zeros(num_clusters_A, dtype=bool), np.zeros(num_clusters_B, dtype=bool)
+    intra_A, intra_B = np.zeros(num_clusters_A), np.zeros(num_clusters_B)
 
     for i in range(num_clusters_A):
         mask = (labels_A == i)
         if np.any(mask):
-            centroids_A[i] = coords_A[mask].mean(axis=0)
+            pts = coords_A[mask]
+            c = pts.mean(axis=0)
+            centroids_A[i] = c
+            # Average distance from centroid as intrinsic cellular spread
+            intra_A[i] = np.mean(np.linalg.norm(pts - c, axis=1)) if len(pts) > 1 else 0.0
             valid_A[i] = True
 
     for i in range(num_clusters_B):
         mask = (labels_B == i)
         if np.any(mask):
-            centroids_B[i] = coords_B[mask].mean(axis=0)
+            pts = coords_B[mask]
+            c = pts.mean(axis=0)
+            centroids_B[i] = c
+            intra_B[i] = np.mean(np.linalg.norm(pts - c, axis=1)) if len(pts) > 1 else 0.0
             valid_B[i] = True
 
     # Calculate characteristic global spacing for tissue continuity
