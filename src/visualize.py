@@ -502,6 +502,64 @@ def visualize_cluster_mapping(
     plt.show()
 
 
+def visualize_cluster_adjacency(
+    centroidsA,
+    centroidsB,
+    adj_A,
+    adj_B,
+    valid_A=None,
+    valid_B=None,
+):
+    """
+    Visualizes the within-slice cluster adjacency graphs using edges between
+    cluster barycenters/centroids.
+
+    Args:
+        centroidsA: (C_A, 2) centroid array for slice A clusters.
+        centroidsB: (C_B, 2) centroid array for slice B clusters.
+        adj_A: (C_A, C_A) boolean adjacency matrix for slice A.
+        adj_B: (C_B, C_B) boolean adjacency matrix for slice B.
+        valid_A: optional boolean mask of valid slice A clusters.
+        valid_B: optional boolean mask of valid slice B clusters.
+    """
+    if valid_A is None:
+        valid_A = np.ones(len(centroidsA), dtype=bool)
+    if valid_B is None:
+        valid_B = np.ones(len(centroidsB), dtype=bool)
+
+    def collect_edges(centroids, adj, valid_mask):
+        lines = []
+        valid_idx = np.where(valid_mask)[0]
+        for i_pos, u in enumerate(valid_idx):
+            for v in valid_idx[i_pos + 1:]:
+                if adj[u, v]:
+                    lines.append([
+                        (centroids[u, 0], centroids[u, 1]),
+                        (centroids[v, 0], centroids[v, 1]),
+                    ])
+        return lines, valid_idx
+
+    lines_A, valid_idx_A = collect_edges(centroidsA, adj_A, valid_A)
+    lines_B, valid_idx_B = collect_edges(centroidsB, adj_B, valid_B)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    if lines_A:
+        ax1.add_collection(LineCollection(lines_A, colors='steelblue', linewidths=1.0, alpha=0.45, zorder=1))
+    ax1.scatter(centroidsA[valid_idx_A, 0], centroidsA[valid_idx_A, 1], c='navy', s=20, zorder=2)
+    ax1.set_title(f"Slice A Cluster Adjacency ({len(lines_A)} edges)")
+    ax1.axis('equal')
+
+    if lines_B:
+        ax2.add_collection(LineCollection(lines_B, colors='indianred', linewidths=1.0, alpha=0.45, zorder=1))
+    ax2.scatter(centroidsB[valid_idx_B, 0], centroidsB[valid_idx_B, 1], c='darkred', s=20, zorder=2)
+    ax2.set_title(f"Slice B Cluster Adjacency ({len(lines_B)} edges)")
+    ax2.axis('equal')
+
+    plt.tight_layout()
+    plt.show()
+
+
 def visualize_selected_anchors(
     sliceA,
     sliceB,

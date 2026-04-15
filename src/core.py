@@ -30,6 +30,7 @@ def hierarchical_pairwise_align(
     w_graph: float = 0.5,
     visualize_clusters: bool = True,
     debug_macro_section: bool = False,
+    visualize_macro_adjacency: bool = False,
     **kwargs
 ):
     """
@@ -76,6 +77,7 @@ def hierarchical_pairwise_align(
         Pi_cluster,
         spatial_key=spatial_key,
         debug_report=debug_macro_section,
+        visualize_adjacency=visualize_macro_adjacency,
     )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")

@@ -218,7 +218,16 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     return pi_samp
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial', debug_report=False):
+def extract_continuous_macro_section(
+    sliceA,
+    sliceB,
+    labels_A,
+    labels_B,
+    Pi_cluster,
+    spatial_key='spatial',
+    debug_report=False,
+    visualize_adjacency=False,
+):
     """
     Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
     """
@@ -332,6 +341,17 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
     adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
     adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
+
+    if visualize_adjacency:
+        from .visualize import visualize_cluster_adjacency
+        visualize_cluster_adjacency(
+            centroids_A,
+            centroids_B,
+            adj_A,
+            adj_B,
+            valid_A=valid_A,
+            valid_B=valid_B,
+        )
 
     add_debug_line(
         f"Clusters A/B: {num_clusters_A}/{num_clusters_B} total Pi mass={float(total_mass):.6f}"
@@ -850,7 +870,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     
     if not mapped_pairs:
         # Fallback if mapping destroyed
-        mapped_pairs = [(best_edge[0][0], best_edge[0][1])] if best_edge else [(np.where(valid_A)[0][0], np.where(valid_B)[0][0])]
+        if best_triangle is not None:
+            mapped_pairs = list(best_triangle)
+        elif best_edge:
+            mapped_pairs = [(best_edge[0][0], best_edge[0][1])]
+        else:
+            mapped_pairs = [(np.where(valid_A)[0][0], np.where(valid_B)[0][0])]
         add_debug_line(f"Mapping collapsed; fallback pairs={mapped_pairs}")
 
     strong_A = [p[0] for p in mapped_pairs]
