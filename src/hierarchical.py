@@ -385,58 +385,43 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         if not core_A_list or not core_B_list:
             return 0.0, 0.0, 0.0
 
-        # Compute all pairwise distances from candidate to the established mapped core
-        dist_A = np.linalg.norm(centroids_A[core_A_list] - centroids_A[pA], axis=1) / spacing_A
-        dist_B = np.linalg.norm(centroids_B[core_B_list] - centroids_B[pB], axis=1) / spacing_B
+        # Vector displacement from the candidate point to the established mapped core
+        vec_A = centroids_A[core_A_list] - centroids_A[pA]
+        vec_B = centroids_B[core_B_list] - centroids_B[pB]
         
-        # Mean absolute difference in pairwise distances captures full topology/shape scaling
-        # independent of rotation and translation
-        shape_match_err = np.mean(np.abs(dist_A - dist_B))
+        norm_A = np.linalg.norm(vec_A, axis=1)
+        norm_B = np.linalg.norm(vec_B, axis=1)
+
+        # 1. Relative Distance (Radial Scaling)
+        # Prevents extreme topological stretch by normalizing lengths
+        dist_A = norm_A / spacing_A
+        dist_B = norm_B / spacing_B
+        dist_err = np.mean(np.abs(dist_A - dist_B))
+        
+        # 2. Relative Direction (Angular & Chirality)
+        # Avoids rigid global matrices by measuring internal angles against the core barycenter vector
+        bary_A = np.mean(centroids_A[core_A_list], axis=0) - centroids_A[pA]
+        bary_B = np.mean(centroids_B[core_B_list], axis=0) - centroids_B[pB]
+        
+        len_bary_A = np.linalg.norm(bary_A) + 1e-8
+        len_bary_B = np.linalg.norm(bary_B) + 1e-8
+        
+        # Dot product (Cosine / Radial Projection) detects strict angle divergence
+        dot_A = np.dot(vec_A, bary_A) / (norm_A * len_bary_A + 1e-8)
+        dot_B = np.dot(vec_B, bary_B) / (norm_B * len_bary_B + 1e-8)
+        
+        # 2D Cross product (Sine / Tangential Projection) enforces Chirality to prevent reflection mirroring
+        cross_A = (vec_A[:, 0] * bary_A[1] - vec_A[:, 1] * bary_A[0]) / (norm_A * len_bary_A + 1e-8)
+        cross_B = (vec_B[:, 0] * bary_B[1] - vec_B[:, 1] * bary_B[0]) / (norm_B * len_bary_B + 1e-8)
+        
+        dir_err = np.mean(np.abs(dot_A - dot_B) + np.abs(cross_A - cross_B))
+
+        # Combined Shape Deviation captures both perfect structural distance AND directional arrangement
+        shape_match_err = dist_err + 0.5 * dir_err
+        
         return shape_match_err, np.mean(dist_A), np.mean(dist_B)
 
     def contiguous_expansion_pass(current_pairs):
-        pairs = list(current_pairs)
-        while True:
-            sA = {p[0] for p in pairs}
-            sB = {p[1] for p in pairs}
-            
-            if len(sA) >= np.sum(valid_A) or len(sB) >= np.sum(valid_B): break
-            
-            frontier_A = {i for i in range(num_clusters_A) if valid_A[i] and i not in sA and np.any(adj_A[i, list(sA)])}
-            frontier_B = {j for j in range(num_clusters_B) if valid_B[j] and j not in sB and np.any(adj_B[j, list(sB)])}
-            
-            if not frontier_A or not frontier_B:
-                break
-                
-            sA_list, sB_list = list(sA), list(sB)
-            bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
-            bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
-
-            best_pair = None
-            best_score = float('inf')
-            
-            for pA in frontier_A:
-                for pB in frontier_B:
-                    if valid_masses[pA, pB] > 0:
-                        # Parameter-free scale-normalized expansion criterion:
-                        # 1. Structural Match: shape_err evaluates distances to ALL mapped points
-                        #    ensuring both SHAPE and SIZE of the contour bounds are identical.
-                        # 2. Radial Growth: mean distance ensures we grow organically adjacent.
-                        shape_err, mean_dist_A, mean_dist_B = get_shape_distortion(pA, pB, sA_list, sB_list)
-                        
-                        score = shape_err + 1e-3 * (mean_dist_A + mean_dist_B)
-
-                        if score < best_score:
-                            best_score = score
-                            best_pair = (pA, pB)
-                            
-            if best_pair is not None:
-                pairs.append(best_pair)
-            else:
-                break
-        return pairs
-
-    def anneal_suboptimal_pairs(current_pairs):
         # Topological "Sliding": Replaces mapped peripheral nodes with unmapped nodes 
         # that are physically closer to the barycenter and strictly provide a tighter mapping.
         pairs = list(current_pairs)
