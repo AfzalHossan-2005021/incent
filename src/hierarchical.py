@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import scipy.sparse as sp
 
+from itertools import permutations
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import distance_matrix, Delaunay
@@ -369,14 +370,56 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         f"{int(np.count_nonzero(np.sum(valid_masses > 0, axis=0)))}"
     )
         
-    # 4. Region Growing via Contiguous Expansion from Most Confident Edge
-    # Seeding by Edge: A single point has undefined rotation, which can cause erratic early growth.
-    # We find the highest-confidence paired adjacency (an edge) to lock an initial translation and rotation vector.
+    # 4. Region Growing via Contiguous Expansion from Most Confident Triangle
+    # Seeding by a triangle stabilizes the initial rigid frame better than a single
+    # edge because both translation and rotation are already constrained.
+    def triangle_area(pts):
+        a, b, c = pts
+        return 0.5 * abs(np.cross(b - a, c - a))
+
+    def enumerate_graph_triangles(adj, valid_idx, centroids):
+        triangles = []
+        for u in valid_idx:
+            nbrs = [v for v in valid_idx if v > u and adj[u, v]]
+            for i, v in enumerate(nbrs):
+                for w in nbrs[i + 1:]:
+                    if not adj[v, w]:
+                        continue
+                    tri = (int(u), int(v), int(w))
+                    if triangle_area(centroids[list(tri)]) > 1e-8:
+                        triangles.append(tri)
+        return triangles
+
+    best_triangle_score = -np.inf
+    best_triangle = None
     best_edge_score = -1.0
     best_edge = None
     
     valid_A_idx = np.where(valid_A)[0]
     valid_B_idx = np.where(valid_B)[0]
+
+    triangles_A = enumerate_graph_triangles(adj_A, valid_A_idx, centroids_A)
+    triangles_B = enumerate_graph_triangles(adj_B, valid_B_idx, centroids_B)
+
+    for tri_A in triangles_A:
+        for tri_B in triangles_B:
+            for perm_B in permutations(tri_B):
+                tri_masses = np.array([
+                    valid_masses[tri_A[0], perm_B[0]],
+                    valid_masses[tri_A[1], perm_B[1]],
+                    valid_masses[tri_A[2], perm_B[2]],
+                ], dtype=np.float64)
+                if np.any(tri_masses <= 0):
+                    continue
+
+                score = float(np.sum(np.log(tri_masses + 1e-12)))
+                if score > best_triangle_score:
+                    best_triangle_score = score
+                    best_triangle = [
+                        (tri_A[0], perm_B[0]),
+                        (tri_A[1], perm_B[1]),
+                        (tri_A[2], perm_B[2]),
+                    ]
     
     for uA in valid_A_idx:
         for vA in valid_A_idx:
@@ -397,19 +440,28 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         best_edge_score = score2
                         best_edge = ((uA, vB), (vA, uB))
                         
-    if best_edge is None or best_edge_score <= 0.0:
-        # Fallback to single point if no valid edges exist
-        start_flat = np.argmax(valid_masses)
-        start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
-        mapped_pairs = [(start_A, start_B)]
+    if best_triangle is not None:
+        mapped_pairs = list(best_triangle)
         add_debug_line(
-            f"Seed fallback to single pair {(start_A, start_B)} with mass={float(valid_masses[start_A, start_B]):.6f}"
+            f"Seed triangle {mapped_pairs} with log-score={float(best_triangle_score):.6f} "
+            f"(A triangles={len(triangles_A)}, B triangles={len(triangles_B)})"
         )
     else:
-        mapped_pairs = [(best_edge[0][0], best_edge[0][1]), (best_edge[1][0], best_edge[1][1])]
-        add_debug_line(
-            f"Seed edge {mapped_pairs} with score={float(best_edge_score):.6f}"
-        )
+        if best_edge is None or best_edge_score <= 0.0:
+            # Fallback to single point if no valid edges exist
+            start_flat = np.argmax(valid_masses)
+            start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
+            mapped_pairs = [(start_A, start_B)]
+            add_debug_line(
+                f"Seed fallback to single pair {(start_A, start_B)} with mass={float(valid_masses[start_A, start_B]):.6f} "
+                f"(A triangles={len(triangles_A)}, B triangles={len(triangles_B)})"
+            )
+        else:
+            mapped_pairs = [(best_edge[0][0], best_edge[0][1]), (best_edge[1][0], best_edge[1][1])]
+            add_debug_line(
+                f"Seed edge fallback {mapped_pairs} with score={float(best_edge_score):.6f} "
+                f"(A triangles={len(triangles_A)}, B triangles={len(triangles_B)})"
+            )
     
     # Precompute individual cluster masses for accurate center-of-mass tracking
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
