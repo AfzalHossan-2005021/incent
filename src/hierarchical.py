@@ -470,6 +470,14 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             # is physically larger than 1 entire neighboring cluster. This is the exact mathematical 
             # definition of a "topological fold" (mapping jumping over a valid adjacent neighbor).
             if discrepancy > 1.0:
+                residuals_pairs[(pA, pB)] = discrepancy
+
+        if not residuals_pairs:
+            return current_pairs, False  # No outliers found
+
+        # Trim the single highest outlier
+        worst_pair = max(residuals_pairs, key=residuals_pairs.get)
+        current_pairs.remove(worst_pair)
         return current_pairs, True
 
     # ---------------- Active Contour Refinement Loop ---------------- #
