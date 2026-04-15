@@ -246,70 +246,62 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             centroids_B[i] = coords_B[mask].mean(axis=0)
             valid_B[i] = True
 
-    # 2. Build Structural Adjacency Matrices for Clusters based on local density interaction radii
-    def build_structural_adjacency(coords, labels, valid_mask):
+    # Calculate characteristic global spacing for tissue continuity
+    from .core import estimate_characteristic_spacing
+    char_gap_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key) * 3.0
+    char_gap_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key) * 3.0
+    
+    # 2. Biological Tissue Adjacency based strictly on cellular continuous touching
+    def build_structural_adjacency(coords, labels, valid_mask, char_gap):
         n_clusters = len(valid_mask)
-        adj = np.zeros((n_clusters, n_clusters), dtype=bool)
-        np.fill_diagonal(adj, True)
+        adj = np.zeros((n_clusters, n_clusters), dtype=np.float64)
         
         valid_idx = np.where(valid_mask)[0]
         if len(valid_idx) < 2:
             return adj
             
-        centroids = np.zeros((len(valid_idx), 2))
+        centroids = np.zeros((n_clusters, 2))
         kdtries = {}
-        intra_dists = {}
         
-        # Determine internal neighborhood boundary spheres per cluster
-        for i, c_id in enumerate(valid_idx):
+        for c_id in valid_idx:
             c_coords = coords[labels == c_id]
-            centroids[i] = c_coords.mean(axis=0)
-            
-            if len(c_coords) > 1:
-                # True physical circumradius of the cluster bounds its territory natively
-                # No magic number thresholds required
-                intra_dists[c_id] = np.max(np.linalg.norm(c_coords - centroids[i], axis=1))
-            else:
-                intra_dists[c_id] = 0.0
+            centroids[c_id] = c_coords.mean(axis=0)
+            kdtries[c_id] = cKDTree(c_coords)
 
-        # Parameter-free geometric verification without Delaunay convex hull traps
+        # Complete tissue graph: Edge exists exclusively if cell boundaries touch
         for i in range(len(valid_idx)):
             for j in range(i+1, len(valid_idx)):
                 u, v = valid_idx[i], valid_idx[j]
                 
-                # Check absolute anatomical spacing
-                dist_uv = np.linalg.norm(centroids[i] - centroids[j])
+                # Cellular physical gap analysis
+                min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
+                min_gap = np.min(min_dists)
                 
-                # Clusters touch if their physical circumspheres overlap
-                if dist_uv <= (intra_dists[u] + intra_dists[v]):
-                    adj[u, v] = True
-                    adj[v, u] = True
+                # Two spatial clusters are continuous tissue if their minimal gap 
+                # respects the characteristic bounding resolution of the manifold.
+                # If so, the geodesic edge weight is the literal centroid distance.
+                if min_gap <= char_gap:
+                    dist_uv = np.linalg.norm(centroids[u] - centroids[v])
+                    adj[u, v] = dist_uv
+                    adj[v, u] = dist_uv
                 
-        return adj, intra_dists
+        return adj
 
-    adj_A, intra_A = build_structural_adjacency(coords_A, labels_A, valid_A)
-    adj_B, intra_B = build_structural_adjacency(coords_B, labels_B, valid_B)
+    adj_A = build_structural_adjacency(coords_A, labels_A, valid_A, char_gap_A)
+    adj_B = build_structural_adjacency(coords_B, labels_B, valid_B, char_gap_B)
 
-    geo_A = dijkstra(adj_A, directed=False, unweighted=True)
-    geo_B = dijkstra(adj_B, directed=False, unweighted=True)
-
-    geo_A = dijkstra(adj_A, directed=False, unweighted=True)
-    geo_B = dijkstra(adj_B, directed=False, unweighted=True)
-
-    # 3. Parameter-free statistical expectation for OT plan
-    # Under random/independent transport, mass distributes as the outer product of marginals.
-    marg_A = np.sum(Pi_cluster, axis=1)
-    marg_B = np.sum(Pi_cluster, axis=0)
-    expected_pi = np.outer(marg_A, marg_B) / (total_mass + 1e-8)
+    # Calculate global continuous tissue length geodesics with physics, NOT unweighted cluster partition hops
+    geo_A = dijkstra(adj_A, directed=False, unweighted=False)
+    geo_B = dijkstra(adj_B, directed=False, unweighted=False)
     
-    # True biological assignments must concentrate mass significantly above this mathematical null expectation.
-    significant_matches = (Pi_cluster > expected_pi) & (Pi_cluster > 0)
-    
+    # Scale to dimensionless biological structural scale (0.0 -> 1.0 manifold coordinates)
+    max_A = np.max(geo_A[~np.isinf(geo_A)]) if np.any(~np.isinf(geo_A)) else 1.0
+    max_B = np.max(geo_B[~np.isinf(geo_B)]) if np.any(~np.isinf(geo_B)) else 1.0
+    geo_A = geo_A / (max_A + 1e-8)
+    geo_B = geo_B / (max_B + 1e-8)
+
+    # 3. Biological Mass Continuity (Use raw OT plan directly without mathematical cliff cuts)
     valid_masses = Pi_cluster.copy()
-    valid_masses[~significant_matches] = 0.0
-    
-    if np.max(valid_masses) == 0:
-        valid_masses = Pi_cluster # Fallback if null test yields no pairs
         
     # 4. Region Growing via Contiguous Expansion from Most Confident Edge
     # Seeding by Edge: A single point has undefined rotation, which can cause erratic early growth.
@@ -482,19 +474,26 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             err = get_shape_distortion(pA, pB, rest_sA, rest_sB)
             residuals[(pA, pB)] = err
 
-        median_err = float(np.median(list(residuals.values())))
         worst_pair = max(residuals, key=residuals.get)
         worst_err = residuals[worst_pair]
         
-        if worst_err > median_err + 1.0:
+        # Parameter-Free Biological Ground: 
+        # A node represents a cross-manifold mapping tear if its inclusion 
+        # creates a spatial distortion strictly larger than the maximal native 
+        # internal structural variance (diameter) of the core itself.
+        coreA_dists = geo_A[np.ix_(sA_list, sA_list)]
+        coreB_dists = geo_B[np.ix_(sB_list, sB_list)]
+        
+        # The true biological flexibility of this specific sub-tissue
+        native_flexibility = np.max(np.abs(coreA_dists - coreB_dists))
+        
+        if worst_err > native_flexibility + 1e-5:
             current_pairs.remove(worst_pair)
             return current_pairs, True
             
         return current_pairs, False
-            
-        return current_pairs, False
-        
-    # ---------------- Active Contour Refinement Loop ---------------- #        
+
+    # ---------------- Active Contour Refinement Loop ---------------- #
     # Dynamic "Grow-Trim-Grow" (Trimmed Iterative Closest Point using Dynamic Overlapping Subsets)
     # By interleaving trimming and expansion, removing a bad cluster corrects the shadow (rotation matrix).
     # This frequently un-warps the projection, suddenly revealing/aligning new valid clusters
