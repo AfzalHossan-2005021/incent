@@ -51,8 +51,9 @@ def hierarchical_pairwise_align(
         visualize_clustered_slices(sliceA, sliceB, labelsA, labelsB, spatial_key=spatial_key)
     
     print("--- [HOT] Step 2: Extracting Cluster Features ---")
-    p_A, centroidsA, mu_exprA, mu_structA  = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, all_types=all_types)
-    p_B, centroidsB, mu_exprB, mu_structB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, all_types=all_types)
+    feature_key = use_rep if use_rep is not None else "X"
+    p_A, centroidsA, mu_exprA, mu_structA  = extract_cluster_features(sliceA, labelsA, spatial_key, feature_key, label_key, all_types=all_types)
+    p_B, centroidsB, mu_exprB, mu_structB = extract_cluster_features(sliceB, labelsB, spatial_key, feature_key, label_key, all_types=all_types)
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
     M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, beta=beta)
@@ -67,7 +68,11 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(sliceA, sliceB, labelsA, labelsB, Pi_cluster, spatial_key=spatial_key)
+    idx_A, idx_B, weights_A, weights_B, quality = extract_continuous_macro_section(
+        sliceA, sliceB, labelsA, labelsB, Pi_cluster, spatial_key=spatial_key
+    )
+    dist_A = np.asarray(quality.get("dist_A_all", np.zeros(sliceA.shape[0])))
+    dist_B = np.asarray(quality.get("dist_B_all", np.zeros(sliceB.shape[0])))
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
