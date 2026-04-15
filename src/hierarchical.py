@@ -486,6 +486,9 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # 1. Initial Growth
     mapped_pairs = contiguous_expansion_pass(mapped_pairs)
     
+    visited_states = set()
+    visited_states.add(frozenset(mapped_pairs))
+    
     # 2. Active Polish Phase
     while len(mapped_pairs) >= 3:
         mapped_pairs, trimmed = trim_worst_outlier(mapped_pairs)
@@ -493,6 +496,13 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             # The shadow matrix (R) snapped back to biological truth!
             # Immediately try to grow into the newly corrected geometry space.
             mapped_pairs = contiguous_expansion_pass(mapped_pairs)
+            
+            # Danger: Infinite Oscillation Prevention
+            # (e.g., Trim removes cluster X -> Shadow shifts -> Expand picks up cluster X -> Shadow shifts back -> Trim removes X)
+            current_state = frozenset(mapped_pairs)
+            if current_state in visited_states:
+                break # We have entered a cyclic loop; the manifold has reached maximum stable equilibrium.
+            visited_states.add(current_state)
         else:
             # Convergence: No outliers, and no more clusters physically fit on the frontier.
             break
