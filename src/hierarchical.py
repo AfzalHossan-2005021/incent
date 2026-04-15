@@ -351,27 +351,35 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         # Fallback to single point if no valid edges exist
         start_flat = np.argmax(valid_masses)
         start_A, start_B = np.unravel_index(start_flat, valid_masses.shape)
-        strong_A = {start_A}
-        strong_B = {start_B}
+        mapped_pairs = [(start_A, start_B)]
     else:
-        strong_A = {best_edge[0][0], best_edge[1][0]}
-        strong_B = {best_edge[0][1], best_edge[1][1]}
+        mapped_pairs = [(best_edge[0][0], best_edge[0][1]), (best_edge[1][0], best_edge[1][1])]
     
     # Precompute individual cluster masses for accurate center-of-mass tracking
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
     masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
 
-    def get_largest_connected_component(node_set, full_adj):
-        nodes = list(node_set)
-        if not nodes: return set()
-        sub_adj = full_adj[np.ix_(nodes, nodes)]
-        n_comp, comp_labels = connected_components(sub_adj, directed=False)
+    def get_largest_connected_pair_component(pairs):
+        # Prevent scatter: ensure the mapping graph itself is contiguous
+        if not pairs: return []
+        n_pairs = len(pairs)
+        adj_pairs = np.zeros((n_pairs, n_pairs), dtype=bool)
+        for i, (uA, uB) in enumerate(pairs):
+            for j, (vA, vB) in enumerate(pairs):
+                if i != j and (adj_A[uA, vA] or adj_B[uB, vB]):
+                    adj_pairs[i, j] = True
+        n_comp, comp_labels = connected_components(adj_pairs, directed=False)
         largest = np.bincount(comp_labels).argmax()
-        return set([nodes[i] for i in np.where(comp_labels == largest)[0]])
+        return [pairs[i] for i in np.where(comp_labels == largest)[0]]
 
-    def contiguous_expansion_pass(curr_A, curr_B):
-        sA, sB = set(curr_A), set(curr_B)
-        while len(sA) < np.sum(valid_A) and len(sB) < np.sum(valid_B):
+    def contiguous_expansion_pass(current_pairs):
+        pairs = list(current_pairs)
+        while True:
+            sA = {p[0] for p in pairs}
+            sB = {p[1] for p in pairs}
+            
+            if len(sA) >= np.sum(valid_A) or len(sB) >= np.sum(valid_B): break
+            
             # Strict topological frontier: ONLY direct neighbors, excluding current elements
             frontier_A = {i for i in range(num_clusters_A) if valid_A[i] and i not in sA and np.any(adj_A[i, list(sA)])}
             frontier_B = {j for j in range(num_clusters_B) if valid_B[j] and j not in sB and np.any(adj_B[j, list(sB)])}
@@ -402,12 +410,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 R = np.eye(2) # Fallback to pure translation for early seed growth
 
             best_pair = None
-            best_score = 0.0 # Strict null-expectation requirement
-            
-            # Robust, Gaussian Probability shadow width
-            # Standard deviation scales with the median size of the tissue core to allow flexibility,
-            # ensuring deformation limits aren't excessively brittle early on.
-            sigma = rad_B * 0.5 if rad_B > 0 else 1.0
+            best_physical_match = float('inf')
             
             for pA in frontier_A:
                 for pB in frontier_B:
@@ -415,40 +418,36 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         pA_proj = (centroids_A[pA] - bary_A) @ R + bary_B
                         shadow_dist = np.linalg.norm(pA_proj - centroids_B[pB])
                         
-                        # Probabilistic soft-shadow instead of a strict hard crop
-                        score = valid_masses[pA, pB] * np.exp(- (shadow_dist**2) / (2 * sigma**2))
+                        # Parameter-free EXACT shadow: The projection error must be strictly smaller 
+                        # than the physical distance to its nearest already-selected neighbor.
+                        min_dist_to_core = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[c]) for c in sB_list if adj_B[pB, c]] or [float('inf')])
                         
-                        if score > best_score:
-                            best_score = score
+                        if shadow_dist < min_dist_to_core and shadow_dist < best_physical_match:
+                            best_physical_match = shadow_dist
                             best_pair = (pA, pB)
                             
             if best_pair is not None:
-                sA.add(best_pair[0])
-                sB.add(best_pair[1])
+                pairs.append(best_pair)
             else:
-                # Dynamic Stopping Criterion: Halts when the highest scoring neighbor
-                # within the topological boundary drops below the expected null probability threshold.
+                # Dynamic Stopping Criterion: Halts when NO neighbors fall inside the exact geometry
                 break
-        return sA, sB
+        return pairs
 
-    # Pass 1: Grow the initial core contiguously
-    strong_A, strong_B = contiguous_expansion_pass(strong_A, strong_B)
-
-    # Polish: Iterative Maximum-Residual Pruning (Greedy Shadow Shedding)
-    # Single-pass pruning fails because outliers drag the barycenter & rotation matrix with them.
-    # By iteratively removing the single worst outlier and recomputing SVD, the geometric "shadow" 
-    # steadily snaps back and contracts around the true biological core.
-    while len(strong_A) >= 3 and len(strong_B) >= 3:
-        sA_list, sB_list = list(strong_A), list(strong_B)
+    def trim_worst_outlier(current_pairs):
+        if len(current_pairs) < 3:
+            return current_pairs, False
+            
+        sA_list = [p[0] for p in current_pairs]
+        sB_list = [p[1] for p in current_pairs]
         bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
         bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
-        rad_B = max(np.mean([np.linalg.norm(centroids_B[c] - bary_B) for c in sB_list]), 1e-3)
 
         R_final = np.eye(2)
         try:
             P_c = centroids_A[sA_list] - bary_A
             Q_c = centroids_B[sB_list] - bary_B
-            U, _, Vt = np.linalg.svd(P_c.T @ valid_masses[np.ix_(sA_list, sB_list)] @ Q_c)
+            W_cross = valid_masses[np.ix_(sA_list, sB_list)]
+            U, _, Vt = np.linalg.svd(P_c.T @ W_cross @ Q_c)
             R_final = U @ Vt
             if np.linalg.det(R_final) < 0:
                 Vt[-1, :] *= -1
@@ -456,44 +455,58 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         except:
             pass
 
-        # Compute projection residuals for all current clusters
-        residuals_A = {pA: np.min(np.linalg.norm((centroids_A[pA] - bary_A) @ R_final + bary_B - centroids_B[sB_list], axis=1)) for pA in strong_A}
-        residuals_B = {pB: np.min(np.linalg.norm((centroids_B[pB] - bary_B) @ R_final.T + bary_A - centroids_A[sA_list], axis=1)) for pB in strong_B}
-
-        # Identify the single worst structural outlier
-        max_res_A = max(residuals_A.values()) if residuals_A else 0
-        max_res_B = max(residuals_B.values()) if residuals_B else 0
-        worst_res = max(max_res_A, max_res_B)
-        
-        # Threshold: 1.5x the mean core radius
-        thresh = rad_B * 1.5
-
-        if worst_res < thresh:
-            break  # Convergence: All clusters are safely inside the shifting shadow!
+        residuals_pairs = {}
+        for (pA, pB) in current_pairs:
+            neighbors_A = [c for c in sA_list if c != pA and adj_A[pA, c]]
+            min_dist_A = np.min([np.linalg.norm(centroids_A[pA] - centroids_A[n]) for n in neighbors_A]) if neighbors_A else float('inf')
+            res_A = np.linalg.norm((centroids_A[pA] - bary_A) @ R_final + bary_B - centroids_B[pB])
             
-        # Remove only the worst cluster, shifting the shadow back towards the valid consensus
-        if max_res_A >= max_res_B:
-            strong_A.remove(max(residuals_A, key=residuals_A.get))
+            neighbors_B = [c for c in sB_list if c != pB and adj_B[pB, c]]
+            min_dist_B = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[n]) for n in neighbors_B]) if neighbors_B else float('inf')
+            res_B = np.linalg.norm((centroids_B[pB] - bary_B) @ R_final.T + bary_A - centroids_A[pA])
+            
+            # If the projection error exceeds the physical boundary of the Voronoi cell, it's a topological fold
+            worst_err = max(res_A - min_dist_A, res_B - min_dist_B)
+            if worst_err > 0:
+                residuals_pairs[(pA, pB)] = max(res_A, res_B)
+                
+        if not residuals_pairs:
+            return current_pairs, False
+            
+        worst_pair = max(residuals_pairs, key=residuals_pairs.get)
+        current_pairs.remove(worst_pair)
+        return current_pairs, True
+
+    # ---------------- Active Contour Refinement Loop ---------------- #
+    # Dynamic "Grow-Trim-Grow" (Trimmed Iterative Closest Point using Dynamic Overlapping Subsets)
+    # By interleaving trimming and expansion, removing a bad cluster corrects the shadow (rotation matrix).
+    # This frequently un-warps the projection, suddenly revealing/aligning new valid clusters 
+    # that were previously hidden from the shadow because of the outlier's distortion!
+    
+    # 1. Initial Growth
+    mapped_pairs = contiguous_expansion_pass(mapped_pairs)
+    
+    # 2. Active Polish Phase
+    while len(mapped_pairs) >= 3:
+        mapped_pairs, trimmed = trim_worst_outlier(mapped_pairs)
+        if trimmed:
+            # The shadow matrix (R) snapped back to biological truth!
+            # Immediately try to grow into the newly corrected geometry space.
+            mapped_pairs = contiguous_expansion_pass(mapped_pairs)
         else:
-            strong_B.remove(max(residuals_B, key=residuals_B.get))
+            # Convergence: No outliers, and no more clusters physically fit on the frontier.
+            break
 
-    # Prevent scatter: Re-extract largest connected component using the Delaunay topological graph
-    # This prevents 'holes' or disjoint islands from surviving the pruning process.
-    if strong_A:
-        strong_A = get_largest_connected_component(strong_A, adj_A)
-    if not strong_A and len(valid_A_idx) > 0:
-        strong_A = {best_edge[0][0]} if best_edge else {np.where(valid_A)[0][0]}
-        
-    if strong_B:
-        strong_B = get_largest_connected_component(strong_B, adj_B)
-    if not strong_B and len(valid_B_idx) > 0:
-        strong_B = {best_edge[0][1]} if best_edge else {np.where(valid_B)[0][0]}
+    # Prevent scatter: Re-extract largest connected component treating pairs strictly as 1:1 atomic units
+    if mapped_pairs:
+        mapped_pairs = get_largest_connected_pair_component(mapped_pairs)
+    
+    if not mapped_pairs:
+        # Fallback if mapping destroyed
+        mapped_pairs = [(best_edge[0][0], best_edge[0][1])] if best_edge else [(np.where(valid_A)[0][0], np.where(valid_B)[0][0])]
 
-    # Pass 2: Fill in pruned contiguous gaps strictly from the topological frontier
-    strong_A, strong_B = contiguous_expansion_pass(strong_A, strong_B)
-
-    strong_A = list(strong_A)
-    strong_B = list(strong_B)
+    strong_A = [p[0] for p in mapped_pairs]
+    strong_B = [p[1] for p in mapped_pairs]
 
     if len(strong_A) == 0 or len(strong_B) == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
