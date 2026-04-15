@@ -275,34 +275,24 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             else:
                 intra_dists[c_id] = 0.0
 
-        # Centroid Delaunay quickly limits our evaluations to macroscopic topological neighbors
-        if len(valid_idx) >= 3:
-            tri = Delaunay(centroids)
-            candidate_edges = set()
-            for simplex in tri.simplices:
-                for i in range(3):
-                    for j in range(i+1, 3):
-                        u, v = valid_idx[simplex[i]], valid_idx[simplex[j]]
-                        candidate_edges.add((min(u, v), max(u, v)))
-        else:
-            u, v = valid_idx[0], valid_idx[1]
-            candidate_edges = {(min(u, v), max(u, v))}
-            
-        # Parameter-free geometric verification
-        for u, v in candidate_edges:
-            # Minimum physical inter-cluster gap via rapid KD-Tree
-            min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
-            min_gap = np.min(min_dists)
-            
-            # Clusters touch if the gap is smaller than their combined local topological spacing
-            if min_gap <= (intra_dists[u] + intra_dists[v]):
-                adj[u, v] = True
-                adj[v, u] = True
+        # Parameter-free geometric verification without Delaunay convex hull traps
+        for i in range(len(valid_idx)):
+            for j in range(i+1, len(valid_idx)):
+                u, v = valid_idx[i], valid_idx[j]
                 
-        return adj
+                # Minimum physical inter-cluster gap via rapid KD-Tree
+                min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
+                min_gap = np.min(min_dists)
+                
+                # Clusters touch if the gap is smaller than their combined local topological spacing
+                if min_gap <= (intra_dists[u] + intra_dists[v]):
+                    adj[u, v] = True
+                    adj[v, u] = True
+                
+        return adj, intra_dists
 
-    adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
-    adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
+    adj_A, intra_A = build_structural_adjacency(coords_A, labels_A, valid_A)
+    adj_B, intra_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
     # 3. Parameter-free statistical expectation for OT plan
     # Under random/independent transport, mass distributes as the outer product of marginals.
@@ -359,15 +349,8 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     masses_A = np.array([np.sum(labels_A == c) for c in range(num_clusters_A)])
     masses_B = np.array([np.sum(labels_B == c) for c in range(num_clusters_B)])
     
-    # Scale parameters for dimensionless geometric comparisons
-    tree_A = cKDTree(centroids_A[valid_A])
-    d_A, _ = tree_A.query(centroids_A[valid_A], k=2)
-    spacing_A = np.median(d_A[:, 1]) if len(d_A) > 0 else 1.0
-
-    tree_B = cKDTree(centroids_B[valid_B])
-    d_B, _ = tree_B.query(centroids_B[valid_B], k=2)
-    spacing_B = np.median(d_B[:, 1]) if len(d_B) > 0 else 1.0
-
+    # 5. Connect and Polish using Parameter-Free Topology Constraints
+    
     def get_largest_connected_pair_component(pairs):
         # Prevent scatter: ensure the mapping graph itself is contiguous
         if not pairs: return []
@@ -393,15 +376,22 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         norm_B = np.linalg.norm(vec_B, axis=1)
 
         # 1. Relative Distance (Radial Scaling)
-        # Prevents extreme topological stretch by normalizing lengths
-        dist_A = norm_A / spacing_A
-        dist_B = norm_B / spacing_B
+        # Prevent extreme topological stretch by utilizing exact local biological tissue density
+        # instead of global scalar approximations
+        local_density_A = intra_A[pA] + np.mean([intra_A[c] for c in core_A_list])
+        local_density_B = intra_B[pB] + np.mean([intra_B[c] for c in core_B_list])
+        
+        dist_A = norm_A / (local_density_A + 1e-8)
+        dist_B = norm_B / (local_density_B + 1e-8)
         dist_err = np.mean(np.abs(dist_A - dist_B))
         
         # 2. Relative Direction (Angular & Chirality)
-        # Avoids rigid global matrices by measuring internal angles against the core barycenter vector
-        bary_A = np.mean(centroids_A[core_A_list], axis=0) - centroids_A[pA]
-        bary_B = np.mean(centroids_B[core_B_list], axis=0) - centroids_B[pB]
+        # Locks origin to the most structurally foundational core cluster to prevent Barycenter drift
+        anchor_A = centroids_A[core_A_list[0]]
+        anchor_B = centroids_B[core_B_list[0]]
+        
+        bary_A = anchor_A - centroids_A[pA]
+        bary_B = anchor_B - centroids_B[pB]
         
         len_bary_A = np.linalg.norm(bary_A) + 1e-8
         len_bary_B = np.linalg.norm(bary_B) + 1e-8
@@ -527,7 +517,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     while len(mapped_pairs) >= 3:
         # Annealing Sliding Pass: Break sub-optimal peripheral locks 
         # and recruit geometrically tighter unmapped nodes closer to the barycenter
-        mapped_pairs = anneal_suboptimal_pairs(mapped_pairs)
+        mapped_pairs = contiguous_expansion_pass(mapped_pairs)
 
         mapped_pairs, trimmed = trim_worst_outlier(mapped_pairs)
         if trimmed:
