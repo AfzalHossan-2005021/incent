@@ -285,62 +285,119 @@ def extract_continuous_macro_section(
             valid_B[i] = True
 
     # 2. Build Structural Adjacency Matrices for Clusters based on local density interaction radii
-    def build_structural_adjacency(coords, labels, valid_mask):
+    def build_structural_adjacency(coords, labels, valid_mask, slice_name):
         n_clusters = len(valid_mask)
         adj = np.zeros((n_clusters, n_clusters), dtype=bool)
         np.fill_diagonal(adj, True)
         
         valid_idx = np.where(valid_mask)[0]
-        if len(valid_idx) < 2:
+        n_cells = coords.shape[0]
+        if len(valid_idx) < 2 or n_cells < 2:
+            add_debug_line(f"Adjacency {slice_name}: trivial graph")
             return adj
-            
-        centroids = np.zeros((len(valid_idx), 2))
-        kdtries = {}
-        intra_dists = {}
-        
-        # Determine internal neighborhood spacings per cluster
-        for i, c_id in enumerate(valid_idx):
-            c_coords = coords[labels == c_id]
-            centroids[i] = c_coords.mean(axis=0)
-            
-            tree = cKDTree(c_coords)
-            kdtries[c_id] = tree
-            
-            if len(c_coords) > 1:
-                # 99th percentile of internal 1-NN distances dictates natural maximum spacing
-                d, _ = tree.query(c_coords, k=2)
-                intra_dists[c_id] = np.percentile(d[:, 1], 99)
-            else:
-                intra_dists[c_id] = 0.0
 
-        # Centroid Delaunay quickly limits our evaluations to macroscopic topological neighbors
-        if len(valid_idx) >= 3:
-            tri = Delaunay(centroids)
-            candidate_edges = set()
-            for simplex in tri.simplices:
-                for i in range(3):
-                    for j in range(i+1, 3):
-                        u, v = valid_idx[simplex[i]], valid_idx[simplex[j]]
-                        candidate_edges.add((min(u, v), max(u, v)))
-        else:
-            u, v = valid_idx[0], valid_idx[1]
-            candidate_edges = {(min(u, v), max(u, v))}
-            
-        # Parameter-free geometric verification
-        for u, v in candidate_edges:
-            # Minimum physical inter-cluster gap via rapid KD-Tree
-            min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
-            min_gap = np.min(min_dists)
-            
-            # Clusters touch if the gap is smaller than their combined local topological spacing
-            if min_gap <= (intra_dists[u] + intra_dists[v]):
+        tree = cKDTree(coords)
+        nn_dists, _ = tree.query(coords, k=min(2, n_cells))
+        local_cell_scale = nn_dists[:, -1] if nn_dists.ndim > 1 else np.zeros(n_cells, dtype=np.float64)
+        positive_scales = local_cell_scale[local_cell_scale > 0]
+        fallback_scale = float(np.median(positive_scales)) if positive_scales.size > 0 else 1e-8
+
+        cluster_scale = np.zeros(n_clusters, dtype=np.float64)
+        cluster_sizes = np.bincount(labels.astype(int), minlength=n_clusters)
+        for c_id in valid_idx:
+            c_scales = local_cell_scale[labels == c_id]
+            c_scales = c_scales[c_scales > 0]
+            cluster_scale[c_id] = float(np.percentile(c_scales, 90)) if c_scales.size > 0 else fallback_scale
+
+        cell_edges = set()
+        edge_mode = "delaunay"
+        if n_cells >= 3:
+            try:
+                tri = Delaunay(coords)
+                indptr, indices = tri.vertex_neighbor_vertices
+                for i in range(n_cells):
+                    for j in indices[indptr[i]:indptr[i + 1]]:
+                        if i < j:
+                            cell_edges.add((i, int(j)))
+            except Exception:
+                edge_mode = "knn-fallback"
+        elif n_cells == 2:
+            edge_mode = "pair"
+            cell_edges.add((0, 1))
+
+        if not cell_edges and n_cells > 2:
+            edge_mode = "knn-fallback"
+            k = min(7, n_cells)
+            _, nbrs = tree.query(coords, k=k)
+            nbrs = np.asarray(nbrs)
+            if nbrs.ndim == 1:
+                nbrs = nbrs[:, None]
+            for i in range(n_cells):
+                for j in nbrs[i, 1:]:
+                    j = int(j)
+                    if i == j:
+                        continue
+                    cell_edges.add((min(i, j), max(i, j)))
+
+        if not cell_edges:
+            add_debug_line(f"Adjacency {slice_name}: no cell edges built")
+            return adj
+
+        raw_edge_lengths = np.array(
+            [np.linalg.norm(coords[i] - coords[j]) for i, j in cell_edges],
+            dtype=np.float64,
+        )
+        global_edge_cutoff = float(np.percentile(raw_edge_lengths, 95)) if raw_edge_lengths.size > 0 else float("inf")
+
+        cross_contact_counts = {}
+        cross_contact_min_gap = {}
+        retained_cell_edges = 0
+        for i, j in cell_edges:
+            edge_len = float(np.linalg.norm(coords[i] - coords[j]))
+            local_cutoff = max(local_cell_scale[i] + local_cell_scale[j], fallback_scale)
+            if edge_len > global_edge_cutoff or edge_len > local_cutoff:
+                continue
+
+            retained_cell_edges += 1
+            u, v = int(labels[i]), int(labels[j])
+            if u == v or not valid_mask[u] or not valid_mask[v]:
+                continue
+
+            key = (min(u, v), max(u, v))
+            cross_contact_counts[key] = cross_contact_counts.get(key, 0) + 1
+            cross_contact_min_gap[key] = min(cross_contact_min_gap.get(key, float("inf")), edge_len)
+
+        accepted_contacts = []
+        for (u, v), count in cross_contact_counts.items():
+            short_contact = cross_contact_min_gap[(u, v)] <= (cluster_scale[u] + cluster_scale[v])
+            if count >= 2 or short_contact or min(cluster_sizes[u], cluster_sizes[v]) <= 8:
                 adj[u, v] = True
                 adj[v, u] = True
-                
+                accepted_contacts.append(count)
+
+        if cross_contact_counts:
+            counts = np.array(list(cross_contact_counts.values()), dtype=np.int32)
+            accepted = np.array(accepted_contacts, dtype=np.int32) if accepted_contacts else np.array([], dtype=np.int32)
+            add_debug_line(
+                f"Adjacency {slice_name}: mode={edge_mode}, raw_cell_edges={len(cell_edges)}, "
+                f"filtered_cell_edges={retained_cell_edges}, cluster_contacts={len(cross_contact_counts)}, "
+                f"accepted={len(accepted_contacts)}, contact_count min/med/max="
+                f"{int(np.min(counts))}/{float(np.median(counts)):.1f}/{int(np.max(counts))}, "
+                f"accepted_count min/med/max="
+                f"{(int(np.min(accepted)) if accepted.size else 0)}/"
+                f"{(float(np.median(accepted)) if accepted.size else 0.0):.1f}/"
+                f"{(int(np.max(accepted)) if accepted.size else 0)}"
+            )
+        else:
+            add_debug_line(
+                f"Adjacency {slice_name}: mode={edge_mode}, raw_cell_edges={len(cell_edges)}, "
+                f"filtered_cell_edges={retained_cell_edges}, no cross-cluster contacts accepted"
+            )
+
         return adj
 
-    adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
-    adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
+    adj_A = build_structural_adjacency(coords_A, labels_A, valid_A, "A")
+    adj_B = build_structural_adjacency(coords_B, labels_B, valid_B, "B")
 
     if visualize_adjacency:
         from .visualize import visualize_cluster_adjacency
