@@ -351,6 +351,11 @@ def extract_continuous_macro_section(
             adj_B,
             valid_A=valid_A,
             valid_B=valid_B,
+            sliceA=sliceA,
+            sliceB=sliceB,
+            labelsA=labels_A,
+            labelsB=labels_B,
+            spatial_key=spatial_key,
         )
 
     add_debug_line(
@@ -605,6 +610,22 @@ def extract_continuous_macro_section(
         largest_component = [pairs[i] for i in np.where(comp_labels == largest)[0]]
         return enforce_one_to_one_pairs(largest_component)
 
+    def selected_edge_limit(selected_ids, centroids, adj):
+        if len(selected_ids) < 2:
+            return 1e-8
+        edge_lengths = []
+        ordered = list(selected_ids)
+        for i, u in enumerate(ordered):
+            for v in ordered[i + 1:]:
+                if adj[u, v]:
+                    edge_lengths.append(np.linalg.norm(centroids[u] - centroids[v]))
+        if edge_lengths:
+            return max(float(np.max(edge_lengths)), 1e-8)
+
+        centered = centroids[ordered] - np.mean(centroids[ordered], axis=0)
+        radial = np.linalg.norm(centered, axis=1)
+        return max(float(np.max(radial)), 1e-8)
+
     def contiguous_expansion_pass(current_pairs):
         nonlocal growth_pass_counter
         pairs = list(current_pairs)
@@ -633,6 +654,8 @@ def extract_continuous_macro_section(
             bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
             selected_mass_A = float(np.sum(masses_A[sA_list]))
             selected_mass_B = float(np.sum(masses_B[sB_list]))
+            edge_limit_A = selected_edge_limit(sA_list, centroids_A, adj_A)
+            edge_limit_B = selected_edge_limit(sB_list, centroids_B, adj_B)
             
             # Rigid alignment requires at least 3 points to stabilize rotation
             if len(sA_list) >= 3 and len(sB_list) >= 3:
@@ -651,7 +674,9 @@ def extract_continuous_macro_section(
                 R = np.eye(2) # Fallback to pure translation for early seed growth
 
             shadow_candidates = []
+            compact_shadow_candidates = []
             fallback_candidates = []
+            compact_fallback_candidates = []
             mass_positive_candidates = 0
             paired_neighbor_candidates = 0
             
@@ -711,16 +736,27 @@ def extract_continuous_macro_section(
                         'bary_shift_A': bary_shift_A,
                         'bary_shift_B': bary_shift_B,
                         'bary_shift_total': bary_shift_total,
+                        'core_step_A': min_dist_to_core_A / edge_limit_A,
+                        'core_step_B': min_dist_to_core_B / edge_limit_B,
+                        'core_step_max': max(min_dist_to_core_A / edge_limit_A, min_dist_to_core_B / edge_limit_B),
+                        'core_step_balance': abs((min_dist_to_core_A / edge_limit_A) - (min_dist_to_core_B / edge_limit_B)),
                     }
                     fallback_candidates.append(candidate)
 
+                    if candidate['core_step_A'] <= 1.0 and candidate['core_step_B'] <= 1.0:
+                        compact_fallback_candidates.append(candidate)
+
                     if shadow_dist_A < min_dist_to_core_A and shadow_dist_B < min_dist_to_core_B:
                         shadow_candidates.append(candidate)
+                        if candidate['core_step_A'] <= 1.0 and candidate['core_step_B'] <= 1.0:
+                            compact_shadow_candidates.append(candidate)
 
-            if shadow_candidates:
+            if compact_shadow_candidates:
                 best_candidate = min(
-                    shadow_candidates,
+                    compact_shadow_candidates,
                     key=lambda c: (
+                        c['core_step_balance'],
+                        c['core_step_max'],
                         c['bary_shift_total'],
                         c['bary_shift_A'],
                         c['bary_shift_B'],
@@ -737,36 +773,81 @@ def extract_continuous_macro_section(
                     f"Growth pass {pass_id} iter {iteration_id}: "
                     f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
                     f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
-                    f"shadow={len(shadow_candidates)}, fallback={len(fallback_candidates)} -> "
+                    f"shadow={len(shadow_candidates)} compact_shadow={len(compact_shadow_candidates)}, "
+                    f"fallback={len(fallback_candidates)} compact_fallback={len(compact_fallback_candidates)} -> "
+                    f"choose compact-shadow {best_pair} mass={best_candidate['pair_mass']:.6f} "
+                    f"core_step_max={best_candidate['core_step_max']:.4f} "
+                    f"bary_shift={best_candidate['bary_shift_total']:.4f} "
+                    f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
+                )
+            elif shadow_candidates:
+                best_candidate = min(
+                    shadow_candidates,
+                    key=lambda c: (
+                        c['core_step_balance'],
+                        c['core_step_max'],
+                        c['bary_shift_total'],
+                        c['bary_shift_A'],
+                        c['bary_shift_B'],
+                        -c['paired_neighbor_count'],
+                        -c['paired_neighbor_mass'],
+                        -c['pair_mass'],
+                        c['shadow_dist_max'],
+                    ),
+                )
+                best_pair = best_candidate['pair']
+                pairs.append(best_pair)
+                pairs = enforce_one_to_one_pairs(pairs)
+                add_debug_line(
+                    f"Growth pass {pass_id} iter {iteration_id}: "
+                    f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
+                    f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
+                    f"shadow={len(shadow_candidates)} compact_shadow={len(compact_shadow_candidates)}, "
+                    f"fallback={len(fallback_candidates)} compact_fallback={len(compact_fallback_candidates)} -> "
                     f"choose shadow {best_pair} mass={best_candidate['pair_mass']:.6f} "
+                    f"core_step_max={best_candidate['core_step_max']:.4f} "
+                    f"bary_shift={best_candidate['bary_shift_total']:.4f} "
+                    f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
+                )
+            elif compact_fallback_candidates:
+                best_candidate = min(
+                    compact_fallback_candidates,
+                    key=lambda c: (
+                        c['core_step_balance'],
+                        c['core_step_max'],
+                        c['bary_shift_total'],
+                        c['bary_shift_A'],
+                        c['bary_shift_B'],
+                        -c['paired_neighbor_count'],
+                        -c['paired_neighbor_mass'],
+                        -c['pair_mass'],
+                        c['shadow_dist_max'],
+                    ),
+                )
+                best_pair = best_candidate['pair']
+                pairs.append(best_pair)
+                pairs = enforce_one_to_one_pairs(pairs)
+                add_debug_line(
+                    f"Growth pass {pass_id} iter {iteration_id}: "
+                    f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
+                    f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
+                    f"shadow={len(shadow_candidates)} compact_shadow={len(compact_shadow_candidates)}, "
+                    f"fallback={len(fallback_candidates)} compact_fallback={len(compact_fallback_candidates)} -> "
+                    f"choose compact-fallback {best_pair} mass={best_candidate['pair_mass']:.6f} "
+                    f"core_step_max={best_candidate['core_step_max']:.4f} "
                     f"bary_shift={best_candidate['bary_shift_total']:.4f} "
                     f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
                 )
             elif fallback_candidates:
-                best_candidate = min(
-                    fallback_candidates,
-                    key=lambda c: (
-                        c['bary_shift_total'],
-                        c['bary_shift_A'],
-                        c['bary_shift_B'],
-                        -c['paired_neighbor_count'],
-                        -c['paired_neighbor_mass'],
-                        -c['pair_mass'],
-                        c['shadow_dist_max'],
-                    ),
-                )
-                best_pair = best_candidate['pair']
-                pairs.append(best_pair)
-                pairs = enforce_one_to_one_pairs(pairs)
                 add_debug_line(
                     f"Growth pass {pass_id} iter {iteration_id}: "
                     f"frontier A/B={len(frontier_A)}/{len(frontier_B)}, "
                     f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
-                    f"shadow={len(shadow_candidates)}, fallback={len(fallback_candidates)} -> "
-                    f"choose fallback {best_pair} mass={best_candidate['pair_mass']:.6f} "
-                    f"bary_shift={best_candidate['bary_shift_total']:.4f} "
-                    f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
+                    f"shadow={len(shadow_candidates)} compact_shadow={len(compact_shadow_candidates)}, "
+                    f"fallback={len(fallback_candidates)} compact_fallback={len(compact_fallback_candidates)}, "
+                    "stop due to non-compact fallback candidates"
                 )
+                break
             else:
                 # Stop only when no frontier neighbor pair carries admissible OT mass.
                 add_debug_line(
@@ -904,6 +985,24 @@ def extract_continuous_macro_section(
     add_debug_line(
         f"Final matched pairs={mapped_pairs}"
     )
+
+    if visualize_adjacency:
+        from .visualize import visualize_cluster_adjacency
+        visualize_cluster_adjacency(
+            centroids_A,
+            centroids_B,
+            adj_A,
+            adj_B,
+            valid_A=valid_A,
+            valid_B=valid_B,
+            sliceA=sliceA,
+            sliceB=sliceB,
+            labelsA=labels_A,
+            labelsB=labels_B,
+            selected_A=strong_A,
+            selected_B=strong_B,
+            spatial_key=spatial_key,
+        )
     emit_debug_report()
     
     return idx_A, idx_B, dist_A, dist_B

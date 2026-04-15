@@ -509,6 +509,13 @@ def visualize_cluster_adjacency(
     adj_B,
     valid_A=None,
     valid_B=None,
+    sliceA=None,
+    sliceB=None,
+    labelsA=None,
+    labelsB=None,
+    selected_A=None,
+    selected_B=None,
+    spatial_key="spatial",
 ):
     """
     Visualizes the within-slice cluster adjacency graphs using edges between
@@ -521,11 +528,17 @@ def visualize_cluster_adjacency(
         adj_B: (C_B, C_B) boolean adjacency matrix for slice B.
         valid_A: optional boolean mask of valid slice A clusters.
         valid_B: optional boolean mask of valid slice B clusters.
+        sliceA/sliceB: optional AnnData slices to show the cell-level clusters.
+        labelsA/labelsB: optional cluster labels for the cells in sliceA/sliceB.
+        selected_A/selected_B: optional iterables of selected cluster ids to highlight.
+        spatial_key: key for cell coordinates if slices are provided.
     """
     if valid_A is None:
         valid_A = np.ones(len(centroidsA), dtype=bool)
     if valid_B is None:
         valid_B = np.ones(len(centroidsB), dtype=bool)
+    selected_A = set(selected_A or [])
+    selected_B = set(selected_B or [])
 
     def collect_edges(centroids, adj, valid_mask):
         lines = []
@@ -544,15 +557,47 @@ def visualize_cluster_adjacency(
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
+    if sliceA is not None and labelsA is not None:
+        ptsA = sliceA.obsm[spatial_key]
+        ax1.scatter(ptsA[:, 0], ptsA[:, 1], c=labelsA, cmap='tab20', s=3, alpha=0.22, zorder=0)
     if lines_A:
         ax1.add_collection(LineCollection(lines_A, colors='steelblue', linewidths=1.0, alpha=0.45, zorder=1))
     ax1.scatter(centroidsA[valid_idx_A, 0], centroidsA[valid_idx_A, 1], c='navy', s=20, zorder=2)
+    if selected_A:
+        sel_A = np.array(sorted(selected_A), dtype=int)
+        sel_A = sel_A[(sel_A >= 0) & (sel_A < len(centroidsA))]
+        if len(sel_A) > 0:
+            ax1.scatter(
+                centroidsA[sel_A, 0],
+                centroidsA[sel_A, 1],
+                facecolors='none',
+                edgecolors='gold',
+                linewidths=1.8,
+                s=90,
+                zorder=3,
+            )
     ax1.set_title(f"Slice A Cluster Adjacency ({len(lines_A)} edges)")
     ax1.axis('equal')
 
+    if sliceB is not None and labelsB is not None:
+        ptsB = sliceB.obsm[spatial_key]
+        ax2.scatter(ptsB[:, 0], ptsB[:, 1], c=labelsB, cmap='tab20', s=3, alpha=0.22, zorder=0)
     if lines_B:
         ax2.add_collection(LineCollection(lines_B, colors='indianred', linewidths=1.0, alpha=0.45, zorder=1))
     ax2.scatter(centroidsB[valid_idx_B, 0], centroidsB[valid_idx_B, 1], c='darkred', s=20, zorder=2)
+    if selected_B:
+        sel_B = np.array(sorted(selected_B), dtype=int)
+        sel_B = sel_B[(sel_B >= 0) & (sel_B < len(centroidsB))]
+        if len(sel_B) > 0:
+            ax2.scatter(
+                centroidsB[sel_B, 0],
+                centroidsB[sel_B, 1],
+                facecolors='none',
+                edgecolors='gold',
+                linewidths=1.8,
+                s=90,
+                zorder=3,
+            )
     ax2.set_title(f"Slice B Cluster Adjacency ({len(lines_B)} edges)")
     ax2.axis('equal')
 
