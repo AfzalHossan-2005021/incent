@@ -377,6 +377,57 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         a, b, c = pts
         return 0.5 * abs(np.cross(b - a, c - a))
 
+    def triangle_side_lengths(pts):
+        a, b, c = pts
+        return np.sort(np.array([
+            np.linalg.norm(a - b),
+            np.linalg.norm(a - c),
+            np.linalg.norm(b - c),
+        ], dtype=np.float64))
+
+    def normalized_triangle_signature(pts):
+        lengths = triangle_side_lengths(pts)
+        scale = max(np.mean(lengths), 1e-8)
+        return lengths / scale
+
+    def triangle_geometry_score(pts_A, pts_B):
+        sig_A = normalized_triangle_signature(pts_A)
+        sig_B = normalized_triangle_signature(pts_B)
+        edge_mismatch = float(np.linalg.norm(sig_A - sig_B))
+
+        area_A = triangle_area(pts_A)
+        area_B = triangle_area(pts_B)
+        area_scale = max(np.sqrt(area_A * area_B), 1e-8)
+        area_mismatch = abs(area_A - area_B) / area_scale
+
+        bary_A_tri = np.mean(pts_A, axis=0)
+        bary_B_tri = np.mean(pts_B, axis=0)
+        centered_A = pts_A - bary_A_tri
+        centered_B = pts_B - bary_B_tri
+        try:
+            U, _, Vt = np.linalg.svd(centered_A.T @ centered_B)
+            R_seed = U @ Vt
+            if np.linalg.det(R_seed) < 0:
+                Vt[-1, :] *= -1
+                R_seed = U @ Vt
+        except:
+            R_seed = np.eye(2)
+
+        aligned_A = centered_A @ R_seed
+        rigid_residual = float(np.sqrt(np.mean(np.sum((aligned_A - centered_B) ** 2, axis=1))))
+
+        # Lower is better; all terms use both slices symmetrically.
+        return edge_mismatch + area_mismatch + rigid_residual, {
+            'edge_mismatch': edge_mismatch,
+            'area_mismatch': area_mismatch,
+            'rigid_residual': rigid_residual,
+        }
+
+    def edge_geometry_penalty(uA, vA, uB, vB):
+        len_A = np.linalg.norm(centroids_A[uA] - centroids_A[vA])
+        len_B = np.linalg.norm(centroids_B[uB] - centroids_B[vB])
+        return abs(len_A - len_B) / max(np.sqrt(len_A * len_B), 1e-8)
+
     def enumerate_graph_triangles(adj, valid_idx, centroids):
         triangles = []
         for u in valid_idx:
@@ -392,8 +443,10 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
     best_triangle_score = -np.inf
     best_triangle = None
-    best_edge_score = -1.0
+    best_triangle_debug = None
+    best_edge_score = -np.inf
     best_edge = None
+    best_edge_debug = None
     
     valid_A_idx = np.where(valid_A)[0]
     valid_B_idx = np.where(valid_B)[0]
@@ -402,8 +455,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     triangles_B = enumerate_graph_triangles(adj_B, valid_B_idx, centroids_B)
 
     for tri_A in triangles_A:
+        pts_A = centroids_A[list(tri_A)]
         for tri_B in triangles_B:
+            pts_B_base = centroids_B[list(tri_B)]
             for perm_B in permutations(tri_B):
+                perm_indices = [tri_B.index(v) for v in perm_B]
+                pts_B = pts_B_base[perm_indices]
                 tri_masses = np.array([
                     valid_masses[tri_A[0], perm_B[0]],
                     valid_masses[tri_A[1], perm_B[1]],
@@ -412,7 +469,9 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 if np.any(tri_masses <= 0):
                     continue
 
-                score = float(np.sum(np.log(tri_masses + 1e-12)))
+                geometry_penalty, geom_debug = triangle_geometry_score(pts_A, pts_B)
+                mass_score = float(np.sum(np.log(tri_masses + 1e-12)))
+                score = mass_score - geometry_penalty
                 if score > best_triangle_score:
                     best_triangle_score = score
                     best_triangle = [
@@ -420,6 +479,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         (tri_A[1], perm_B[1]),
                         (tri_A[2], perm_B[2]),
                     ]
+                    best_triangle_debug = {
+                        'mass_score': mass_score,
+                        'geometry_penalty': geometry_penalty,
+                        **geom_debug,
+                    }
     
     for uA in valid_A_idx:
         for vA in valid_A_idx:
@@ -430,20 +494,37 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     if uB == vB or not adj_B[uB, vB]: continue
                     
                     # Match can be (uA->uB, vA->vB) or (uA->vB, vA->uB)
-                    score1 = valid_masses[uA, uB] * valid_masses[vA, vB]
-                    score2 = valid_masses[uA, vB] * valid_masses[vA, uB]
+                    mass_score1 = float(np.log(valid_masses[uA, uB] + 1e-12) + np.log(valid_masses[vA, vB] + 1e-12))
+                    mass_score2 = float(np.log(valid_masses[uA, vB] + 1e-12) + np.log(valid_masses[vA, uB] + 1e-12))
+                    geom_penalty1 = edge_geometry_penalty(uA, vA, uB, vB)
+                    geom_penalty2 = edge_geometry_penalty(uA, vA, vB, uB)
+                    score1 = mass_score1 - geom_penalty1
+                    score2 = mass_score2 - geom_penalty2
                     
                     if score1 > best_edge_score:
                         best_edge_score = score1
                         best_edge = ((uA, uB), (vA, vB))
+                        best_edge_debug = {
+                            'mass_score': mass_score1,
+                            'geometry_penalty': geom_penalty1,
+                        }
                     if score2 > best_edge_score:
                         best_edge_score = score2
                         best_edge = ((uA, vB), (vA, uB))
+                        best_edge_debug = {
+                            'mass_score': mass_score2,
+                            'geometry_penalty': geom_penalty2,
+                        }
                         
     if best_triangle is not None:
         mapped_pairs = list(best_triangle)
         add_debug_line(
-            f"Seed triangle {mapped_pairs} with log-score={float(best_triangle_score):.6f} "
+            f"Seed triangle {mapped_pairs} with score={float(best_triangle_score):.6f} "
+            f"mass_score={float(best_triangle_debug['mass_score']):.6f} "
+            f"geometry_penalty={float(best_triangle_debug['geometry_penalty']):.6f} "
+            f"edge_mismatch={float(best_triangle_debug['edge_mismatch']):.6f} "
+            f"area_mismatch={float(best_triangle_debug['area_mismatch']):.6f} "
+            f"rigid_residual={float(best_triangle_debug['rigid_residual']):.6f} "
             f"(A triangles={len(triangles_A)}, B triangles={len(triangles_B)})"
         )
     else:
@@ -460,6 +541,8 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             mapped_pairs = [(best_edge[0][0], best_edge[0][1]), (best_edge[1][0], best_edge[1][1])]
             add_debug_line(
                 f"Seed edge fallback {mapped_pairs} with score={float(best_edge_score):.6f} "
+                f"mass_score={float(best_edge_debug['mass_score']):.6f} "
+                f"geometry_penalty={float(best_edge_debug['geometry_penalty']):.6f} "
                 f"(A triangles={len(triangles_A)}, B triangles={len(triangles_B)})"
             )
     
@@ -615,13 +698,16 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         shadow_candidates.append(candidate)
 
             if shadow_candidates:
-                best_candidate = max(
+                best_candidate = min(
                     shadow_candidates,
                     key=lambda c: (
-                        c['paired_neighbor_count'],
-                        c['paired_neighbor_mass'],
-                        c['pair_mass'],
-                        -c['shadow_dist_max'],
+                        c['bary_shift_total'],
+                        c['bary_shift_A'],
+                        c['bary_shift_B'],
+                        -c['paired_neighbor_count'],
+                        -c['paired_neighbor_mass'],
+                        -c['pair_mass'],
+                        c['shadow_dist_max'],
                     ),
                 )
                 best_pair = best_candidate['pair']
@@ -633,6 +719,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     f"mass>0={mass_positive_candidates}, paired={paired_neighbor_candidates}, "
                     f"shadow={len(shadow_candidates)}, fallback={len(fallback_candidates)} -> "
                     f"choose shadow {best_pair} mass={best_candidate['pair_mass']:.6f} "
+                    f"bary_shift={best_candidate['bary_shift_total']:.4f} "
                     f"shadow_max={best_candidate['shadow_dist_max']:.4f}"
                 )
             elif fallback_candidates:
