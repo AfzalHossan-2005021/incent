@@ -260,18 +260,15 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         kdtries = {}
         intra_dists = {}
         
-        # Determine internal neighborhood spacings per cluster
+        # Determine internal neighborhood boundary spheres per cluster
         for i, c_id in enumerate(valid_idx):
             c_coords = coords[labels == c_id]
             centroids[i] = c_coords.mean(axis=0)
             
-            tree = cKDTree(c_coords)
-            kdtries[c_id] = tree
-            
             if len(c_coords) > 1:
-                # 99th percentile of internal 1-NN distances dictates natural maximum spacing
-                d, _ = tree.query(c_coords, k=2)
-                intra_dists[c_id] = np.percentile(d[:, 1], 99)
+                # True physical circumradius of the cluster bounds its territory natively
+                # No magic number thresholds required
+                intra_dists[c_id] = np.max(np.linalg.norm(c_coords - centroids[i], axis=1))
             else:
                 intra_dists[c_id] = 0.0
 
@@ -280,12 +277,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             for j in range(i+1, len(valid_idx)):
                 u, v = valid_idx[i], valid_idx[j]
                 
-                # Minimum physical inter-cluster gap via rapid KD-Tree
-                min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
-                min_gap = np.min(min_dists)
+                # Check absolute anatomical spacing
+                dist_uv = np.linalg.norm(centroids[i] - centroids[j])
                 
-                # Clusters touch if the gap is smaller than their combined local topological spacing
-                if min_gap <= (intra_dists[u] + intra_dists[v]):
+                # Clusters touch if their physical circumspheres overlap
+                if dist_uv <= (intra_dists[u] + intra_dists[v]):
                     adj[u, v] = True
                     adj[v, u] = True
                 
