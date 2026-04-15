@@ -408,9 +408,13 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                         norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
                         norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
                         
-                        # Parameter-free scale-normalized expansion criterion
-                        # Replaces rigid SVD tracking and favors biologically contiguous pairs
-                        score = norm_dA + norm_dB
+                        # Parameter-free scale-normalized expansion criterion:
+                        # 1. Structural Match: abs(norm_dA - norm_dB) ensures the pair represents the same 
+                        #    relative topological radial distance from the biological core.
+                        # 2. Radial Growth: + 1e-3 * (norm_dA + norm_dB) ensures we grow radially outwards 
+                        #    organically rather than randomly jumping across the frontier.
+                        match_error = abs(norm_dA - norm_dB)
+                        score = match_error + 1e-3 * (norm_dA + norm_dB)
                         
                         if score < best_score:
                             best_score = score
@@ -420,6 +424,77 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 pairs.append(best_pair)
             else:
                 break
+        return pairs
+
+    def anneal_suboptimal_pairs(current_pairs):
+        # Topological "Sliding": Replaces mapped peripheral nodes with unmapped nodes 
+        # that are physically closer to the barycenter and strictly provide a tighter mapping.
+        pairs = list(current_pairs)
+        improved = True
+        
+        while improved:
+            improved = False
+            sA_list = [p[0] for p in pairs]
+            sB_list = [p[1] for p in pairs]
+            
+            bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
+            bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
+            
+            mapped_A = {p[0]: p for p in pairs}
+            mapped_B = {p[1]: p for p in pairs}
+            
+            for i, (pA, pB) in enumerate(pairs):
+                # How perfectly does the current locked pair map?
+                curr_err = abs(
+                    (np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A) - 
+                    (np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B)
+                )
+                
+                best_new_pair = None
+                best_err = curr_err
+                
+                # Check if pA could map to an unmapped pB closer to the core
+                for pB_alt in range(num_clusters_B):
+                    if valid_B[pB_alt] and pB_alt not in mapped_B and valid_masses[pA, pB_alt] > 0:
+                        alt_err = abs(
+                            (np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A) - 
+                            (np.linalg.norm(centroids_B[pB_alt] - bary_B) / spacing_B)
+                        )
+                        # We demand a structurally tighter fit without using arbitrary parameters
+                        # We also demand it resolves closer to the barycenter (norm is smaller)
+                        norm_dB_alt = np.linalg.norm(centroids_B[pB_alt] - bary_B) / spacing_B
+                        norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
+                        
+                        if alt_err < best_err and norm_dB_alt < norm_dB:
+                            # Verify physical adjacency isn't totally shattered
+                            rest_sB = [x for x in sB_list if x != pB]
+                            if np.any(adj_B[pB_alt, rest_sB]):
+                                best_err = alt_err
+                                best_new_pair = (pA, pB_alt)
+                
+                # Check if pB could map to an unmapped pA closer to the core
+                for pA_alt in range(num_clusters_A):
+                    if valid_A[pA_alt] and pA_alt not in mapped_A and valid_masses[pA_alt, pB] > 0:
+                        alt_err = abs(
+                            (np.linalg.norm(centroids_A[pA_alt] - bary_A) / spacing_A) - 
+                            (np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B)
+                        )
+                        norm_dA_alt = np.linalg.norm(centroids_A[pA_alt] - bary_A) / spacing_A
+                        norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
+                        
+                        if alt_err < best_err and norm_dA_alt < norm_dA:
+                            rest_sA = [x for x in sA_list if x != pA]
+                            if np.any(adj_A[pA_alt, rest_sA]):
+                                best_err = alt_err
+                                best_new_pair = (pA_alt, pB)
+                                
+                if best_new_pair:
+                    pairs[i] = best_new_pair
+                    mapped_A = {p[0]: p for p in pairs}
+                    mapped_B = {p[1]: p for p in pairs}
+                    improved = True
+                    break # Recompute barycenter and loop again
+        
         return pairs
 
     def trim_worst_outlier(current_pairs):
@@ -494,6 +569,10 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     
     # 2. Active Polish Phase
     while len(mapped_pairs) >= 3:
+        # Annealing Sliding Pass: Break sub-optimal peripheral locks 
+        # and recruit geometrically tighter unmapped nodes closer to the barycenter
+        mapped_pairs = anneal_suboptimal_pairs(mapped_pairs)
+
         mapped_pairs, trimmed = trim_worst_outlier(mapped_pairs)
         if trimmed:
             # The shadow matrix (R) snapped back to biological truth!
