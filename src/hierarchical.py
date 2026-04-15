@@ -428,33 +428,48 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             
         sA_list = [p[0] for p in current_pairs]
         sB_list = [p[1] for p in current_pairs]
-        bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
-        bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
+        
+        # Calculate full weighted sums to efficiently compute Leave-One-Out (LOO) barycenters
+        weights_A = masses_A[sA_list]
+        weights_B = masses_B[sB_list]
+        
+        sum_pos_A = np.sum(centroids_A[sA_list] * weights_A[:, None], axis=0)
+        sum_mass_A = np.sum(weights_A)
+        
+        sum_pos_B = np.sum(centroids_B[sB_list] * weights_B[:, None], axis=0)
+        sum_mass_B = np.sum(weights_B)
 
         residuals_pairs = {}
         for (pA, pB) in current_pairs:
-            # Scale-normalized barycenter mismatch as structural outlier detection
-            norm_dA = np.linalg.norm(centroids_A[pA] - bary_A) / spacing_A
-            norm_dB = np.linalg.norm(centroids_B[pB] - bary_B) / spacing_B
+            # Leave-One-Out (LOO) Barycenter Computation:
+            # Preventing "Self-Masking / Leverage Skew". If we use the full barycenter, an extreme outlier 
+            # pulls the center of mass toward itself. This artificially shrinks its own discrepancy while 
+            # inflating the discrepancy of perfectly healthy points on the opposite side of the tissue, 
+            # causing the exact wrong pairs to be trimmed! By evaluating against the core EXCLUDING itself, 
+            # true outliers are mathematically exposed.
             
-            # An outlier shows severe dimensional discrepancy from the core center
+            m_pA = masses_A[pA]
+            loo_mass_A = sum_mass_A - m_pA
+            if loo_mass_A <= 0: continue
+            loo_bary_A = (sum_pos_A - centroids_A[pA] * m_pA) / loo_mass_A
+            
+            m_pB = masses_B[pB]
+            loo_mass_B = sum_mass_B - m_pB
+            if loo_mass_B <= 0: continue
+            loo_bary_B = (sum_pos_B - centroids_B[pB] * m_pB) / loo_mass_B
+
+            # Scale-normalized LOO barycenter mismatch
+            norm_dA = np.linalg.norm(centroids_A[pA] - loo_bary_A) / spacing_A  
+            norm_dB = np.linalg.norm(centroids_B[pB] - loo_bary_B) / spacing_B  
+
+            # An outlier shows severe dimensional discrepancy from the LOO core center
             discrepancy = abs(norm_dA - norm_dB)
             
-            neighbors_A = [c for c in sA_list if c != pA and adj_A[pA, c]]
-            min_dist_A = np.min([np.linalg.norm(centroids_A[pA] - centroids_A[n]) for n in neighbors_A]) / spacing_A if neighbors_A else float('inf')
-            
-            neighbors_B = [c for c in sB_list if c != pB and adj_B[pB, c]]
-            min_dist_B = np.min([np.linalg.norm(centroids_B[pB] - centroids_B[n]) for n in neighbors_B]) / spacing_B if neighbors_B else float('inf')
-            
-            # Parameter-free check: The radial mapping stretch must not exceed its own local topological step size
-            if discrepancy > max(min_dist_A, min_dist_B):
-                residuals_pairs[(pA, pB)] = discrepancy
-                
-        if not residuals_pairs:
-            return current_pairs, False
-            
-        worst_pair = max(residuals_pairs, key=residuals_pairs.get)
-        current_pairs.remove(worst_pair)
+            # Parameter-free biological bound: The discrepancy is scaled by the median cluster spacing.
+            # A discrepancy > 1.0 means the radial stretch offset between the source and target 
+            # is physically larger than 1 entire neighboring cluster. This is the exact mathematical 
+            # definition of a "topological fold" (mapping jumping over a valid adjacent neighbor).
+            if discrepancy > 1.0:
         return current_pairs, True
 
     # ---------------- Active Contour Refinement Loop ---------------- #
