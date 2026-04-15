@@ -290,6 +290,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     adj_A, intra_A = build_structural_adjacency(coords_A, labels_A, valid_A)
     adj_B, intra_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
+    geo_A = dijkstra(adj_A, directed=False, unweighted=True)
+    geo_B = dijkstra(adj_B, directed=False, unweighted=True)
+
+    geo_A = dijkstra(adj_A, directed=False, unweighted=True)
+    geo_B = dijkstra(adj_B, directed=False, unweighted=True)
+
     # 3. Parameter-free statistical expectation for OT plan
     # Under random/independent transport, mass distributes as the outer product of marginals.
     marg_A = np.sum(Pi_cluster, axis=1)
@@ -362,54 +368,24 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
     def get_shape_distortion(pA, pB, core_A_list, core_B_list):
         if not core_A_list or not core_B_list:
-            return 0.0, 0.0, 0.0
+            return 0.0
 
-        # Vector displacement from the candidate point to the established mapped core
-        vec_A = centroids_A[core_A_list] - centroids_A[pA]
-        vec_B = centroids_B[core_B_list] - centroids_B[pB]
+        # Topological Geodesic Hop Discrepancy natively captures biological tissue bending/manifold structure
+        dist_A = geo_A[pA, core_A_list]
+        dist_B = geo_B[pB, core_B_list]
         
-        norm_A = np.linalg.norm(vec_A, axis=1)
-        norm_B = np.linalg.norm(vec_B, axis=1)
-
-        # 1. Relative Distance (Radial Scaling)
-        # Prevent extreme topological stretch by utilizing exact local biological tissue density
-        # instead of global scalar approximations
-        local_density_A = intra_A[pA] + np.mean([intra_A[c] for c in core_A_list])
-        local_density_B = intra_B[pB] + np.mean([intra_B[c] for c in core_B_list])
+        hop_err = np.abs(dist_A - dist_B)
         
-        dist_A = norm_A / (local_density_A + 1e-8)
-        dist_B = norm_B / (local_density_B + 1e-8)
-        dist_err = np.mean(np.abs(dist_A - dist_B))
-        
-        # 2. Relative Direction (Angular & Chirality)
-        # Locks origin to the most structurally foundational core cluster to prevent Barycenter drift
-        anchor_A = centroids_A[core_A_list[0]]
-        anchor_B = centroids_B[core_B_list[0]]
-        
-        bary_A = anchor_A - centroids_A[pA]
-        bary_B = anchor_B - centroids_B[pB]
-        
-        len_bary_A = np.linalg.norm(bary_A) + 1e-8
-        len_bary_B = np.linalg.norm(bary_B) + 1e-8
-        
-        # Dot product (Cosine / Radial Projection) detects strict angle divergence
-        dot_A = np.dot(vec_A, bary_A) / (norm_A * len_bary_A + 1e-8)
-        dot_B = np.dot(vec_B, bary_B) / (norm_B * len_bary_B + 1e-8)
-        
-        # 2D Cross product (Sine / Tangential Projection) enforces Chirality to prevent reflection mirroring
-        cross_A = (vec_A[:, 0] * bary_A[1] - vec_A[:, 1] * bary_A[0]) / (norm_A * len_bary_A + 1e-8)
-        cross_B = (vec_B[:, 0] * bary_B[1] - vec_B[:, 1] * bary_B[0]) / (norm_B * len_bary_B + 1e-8)
-        
-        dir_err = np.mean(np.abs(dot_A - dot_B) + np.abs(cross_A - cross_B))
-
-        # Combined Shape Deviation captures both perfect structural distance AND directional arrangement
-        shape_match_err = dist_err + 0.5 * dir_err
-        
-        return shape_match_err, np.mean(dist_A), np.mean(dist_B)
+        # Penalize severely if mapping crosses disconnected tissue boundaries
+        inf_mask = np.isinf(dist_A) | np.isinf(dist_B)
+        if np.any(inf_mask):
+            max_val_A = np.max(geo_A[~np.isinf(geo_A)]) if np.any(~np.isinf(geo_A)) else 10.0
+            max_val_B = np.max(geo_B[~np.isinf(geo_B)]) if np.any(~np.isinf(geo_B)) else 10.0
+            hop_err[inf_mask] = max(max_val_A, max_val_B) * 2.0
+            
+        return float(np.mean(hop_err))
 
     def anneal_suboptimal_pairs(current_pairs):
-        # Topological "Sliding": Replaces mapped peripheral nodes with unmapped nodes 
-        # that are physically closer to the barycenter and strictly provide a tighter mapping.
         pairs = list(current_pairs)
         improved = True
         
@@ -418,43 +394,29 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             sA_list = [p[0] for p in pairs]
             sB_list = [p[1] for p in pairs]
             
-            bary_A = np.average(centroids_A[sA_list], axis=0, weights=masses_A[sA_list])
-            bary_B = np.average(centroids_B[sB_list], axis=0, weights=masses_B[sB_list])
-            
             mapped_A = {p[0]: p for p in pairs}
             mapped_B = {p[1]: p for p in pairs}
             
             for i, (pA, pB) in enumerate(pairs):
-                # We exclude this node itself to perform a LOO (Leave-One-Out) shape distortion evaluate
                 rest_sA = [x for j, x in enumerate(sA_list) if j != i]
                 rest_sB = [x for j, x in enumerate(sB_list) if j != i]
                 
-                curr_err, _, _ = get_shape_distortion(pA, pB, rest_sA, rest_sB)
-
+                best_err = get_shape_distortion(pA, pB, rest_sA, rest_sB)
                 best_new_pair = None
-                best_err = curr_err
 
-                # Check if pA could map to an unmapped pB that improves SHAPE adherence
                 for pB_alt in range(num_clusters_B):
                     if valid_B[pB_alt] and pB_alt not in mapped_B and valid_masses[pA, pB_alt] > 0:
-                        alt_err, _, alt_dist_B = get_shape_distortion(pA, pB_alt, rest_sA, rest_sB)
-                        
-                        _, _, orig_dist_B = get_shape_distortion(pA, pB, rest_sA, rest_sB)
-
-                        # Must tighten shape constraints entirely, and pull inward topologically
-                        if alt_err < best_err and alt_dist_B < orig_dist_B:
-                            if np.any(adj_B[pB_alt, rest_sB]):
+                        if np.any(adj_B[pB_alt, rest_sB]):
+                            alt_err = get_shape_distortion(pA, pB_alt, rest_sA, rest_sB)
+                            if alt_err < best_err:
                                 best_err = alt_err
                                 best_new_pair = (pA, pB_alt)
 
-                # Check if pB could map to an unmapped pA that improves SHAPE adherence
                 for pA_alt in range(num_clusters_A):
                     if valid_A[pA_alt] and pA_alt not in mapped_A and valid_masses[pA_alt, pB] > 0:
-                        alt_err, alt_dist_A, _ = get_shape_distortion(pA_alt, pB, rest_sA, rest_sB)
-                        
-                        _, orig_dist_A, _ = get_shape_distortion(pA, pB, rest_sA, rest_sB)
-
-                        if alt_err < best_err and alt_dist_A < orig_dist_A:
+                        if np.any(adj_A[pA_alt, rest_sA]):
+                            alt_err = get_shape_distortion(pA_alt, pB, rest_sA, rest_sB)
+                            if alt_err < best_err:
                                 best_err = alt_err
                                 best_new_pair = (pA_alt, pB)
                                 
@@ -463,12 +425,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     mapped_A = {p[0]: p for p in pairs}
                     mapped_B = {p[1]: p for p in pairs}
                     improved = True
-                    break # Recompute barycenter and loop again
+                    break
         
         return pairs
 
     def contiguous_expansion_pass(current_pairs):
-        # 1. Topologically Grows the active contour outwards from the current mapped core
         pairs = list(current_pairs)
         improved = True
         
@@ -485,7 +446,6 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             
             for uA in range(num_clusters_A):
                 if not valid_A[uA] or uA in mapped_A: continue
-                # Must be topologically adjacent to the growing footprint
                 if not np.any(adj_A[uA, sA_list]): continue
                 
                 for uB in range(num_clusters_B):
@@ -494,14 +454,12 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                     
                     if valid_masses[uA, uB] == 0: continue
                     
-                    err, _, _ = get_shape_distortion(uA, uB, sA_list, sB_list)
+                    err = get_shape_distortion(uA, uB, sA_list, sB_list)
                     
-                    # Parameter-Free Threshold: Deformation must remain within 1 full biological cluster density
-                    if err <= 1.0:
-                        score = valid_masses[uA, uB] / (err + 1e-3)
-                        if score > best_score:
-                            best_score = score
-                            best_pair = (uA, uB)
+                    score = valid_masses[uA, uB] / (err + 1e-3)
+                    if score > best_score:
+                        best_score = score
+                        best_pair = (uA, uB)
                             
             if best_pair:
                 pairs.append(best_pair)
@@ -516,28 +474,25 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         sA_list = [p[0] for p in current_pairs]
         sB_list = [p[1] for p in current_pairs]
         
-        residuals_pairs = {}
+        residuals = {}
         for i, (pA, pB) in enumerate(current_pairs):
-            # Compute purely shape-based structural distortion (implicitly Leave-One-Out)
             rest_sA = [x for j, x in enumerate(sA_list) if j != i]
             rest_sB = [x for j, x in enumerate(sB_list) if j != i]
             
-            discrepancy, _, _ = get_shape_distortion(pA, pB, rest_sA, rest_sB)
+            err = get_shape_distortion(pA, pB, rest_sA, rest_sB)
+            residuals[(pA, pB)] = err
 
-            # Geometric Shape Disruption Threshold
-            # A discrepancy > 1.0 means the addition of this mapping distorts the 
-            # entire structural contour envelope of the core by more than an entire biological
-            # cluster unit on average. This represents a massive geometric bulge or tear 
-            # across the shape's boundary.
-            if discrepancy > 1.0:
-                residuals_pairs[(pA, pB)] = discrepancy
-
-        if not residuals_pairs:
-            return current_pairs, False  # No structural tears found
-
-        worst_pair = max(residuals_pairs, key=residuals_pairs.get)
-        current_pairs.remove(worst_pair)
-        return current_pairs, True
+        median_err = float(np.median(list(residuals.values())))
+        worst_pair = max(residuals, key=residuals.get)
+        worst_err = residuals[worst_pair]
+        
+        if worst_err > median_err + 1.0:
+            current_pairs.remove(worst_pair)
+            return current_pairs, True
+            
+        return current_pairs, False
+            
+        return current_pairs, False
         
     # ---------------- Active Contour Refinement Loop ---------------- #        
     # Dynamic "Grow-Trim-Grow" (Trimmed Iterative Closest Point using Dynamic Overlapping Subsets)
