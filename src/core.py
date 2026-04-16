@@ -72,7 +72,7 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B = extract_continuous_macro_section(
+    macro_section = extract_continuous_macro_section(
         sliceA,
         sliceB,
         labelsA,
@@ -81,6 +81,18 @@ def hierarchical_pairwise_align(
         spatial_key=spatial_key,
         label_key=label_key
     )
+    if not macro_section.ok:
+        raise ValueError(
+            "Hierarchical alignment aborted: no trustworthy overlapping macro-component "
+            f"was identified. Reason: {macro_section.reason}."
+        )
+
+    idx_A = macro_section.idx_A
+    idx_B = macro_section.idx_B
+    dist_A = macro_section.dist_A
+    dist_B = macro_section.dist_B
+    initial_idx_A = macro_section.initial_idx_A
+    initial_idx_B = macro_section.initial_idx_B
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
