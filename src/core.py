@@ -382,7 +382,7 @@ def pairwise_align(
         radius_multipliers=(2.5, 4.0, 6.0),
         n_shells=3,
         harmonics=(0, 1, 2),
-        harmonic_weights={1: 1.25, 2: 1.5},
+        harmonic_weights=None,
         distance_decay="linear",
         include_self=False,
     )
@@ -607,12 +607,17 @@ def neighborhood_distribution_fourier(
     return_metadata=False,
 ):
     """
-    Rotation-invariant neighborhood descriptor.
+    Rotation- and reflection-invariant neighborhood descriptor.
 
     For each focal cell, each cell type, and each radial shell:
       m=0 -> abundance
-      m=1 -> one-sidedness
-      m=2 -> bilateral / opposite-half structure
+      m=1 -> polarity magnitude
+      m=2 -> bilateral / opposite-half anisotropy magnitude
+
+    Nonzero harmonics are represented by their complex magnitudes rather than
+    phase-resolved real/imaginary parts. This yields descriptors that remain
+    stable under arbitrary in-plane rotation and reflection, which is essential
+    for partial tissue alignment before orientation has been resolved.
 
     Output is nonnegative and suitable for Jensen-Shannon after normalization.
     """
@@ -660,23 +665,9 @@ def neighborhood_distribution_fourier(
     n_types = len(cell_types)
     n_shells_eff = len(shell_edges) - 1
     
-    n_harm = 0
-    for m in harmonics:
-        if m == 0: n_harm += 1
-        else:      n_harm += 2
+    n_harm = len(harmonics)
 
     shell_areas = np.pi * (shell_edges[1:] ** 2 - shell_edges[:-1] ** 2)
-
-    # Compute tissue reference direction once using PCA for phase-coherent chirality
-    def compute_reference_angle(pts):
-        centered = pts - pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        v1 = vh[0]
-        if np.mean((centered @ v1) ** 3) < 0:
-            v1 = -v1
-        return np.arctan2(v1[1], v1[0])
-    
-    ref_angle = compute_reference_angle(coords)
 
     # group index = type * n_shells + shell
     n_groups = n_types * n_shells_eff
@@ -737,26 +728,15 @@ def neighborhood_distribution_fourier(
                 ang = m * theta
                 real = np.bincount(group_idx, weights=w * np.cos(ang), minlength=n_groups)
                 imag = np.bincount(group_idx, weights=w * np.sin(ang), minlength=n_groups)
-                
-                phase_anchor = np.exp(-1j * m * ref_angle)
-                descriptor_complex = (real + 1j * imag) * phase_anchor
-                
-                mag_real = descriptor_complex.real
-                mag_imag = descriptor_complex.imag
-                
+
+                magnitude = np.sqrt(real ** 2 + imag ** 2)
                 if area_normalize:
-                    mag_real = mag_real / np.maximum(group_area, 1e-12)
-                    mag_imag = mag_imag / np.maximum(group_area, 1e-12)
-                    
-                mag_real *= harmonic_weights.get(m, 1.0)
-                mag_imag *= harmonic_weights.get(m, 1.0)
-                
-                local[:, h_pos] = mag_real
-                local[:, h_pos+1] = mag_imag
-                h_pos += 2
-                
-        # Make nonnegative for Jensen-Shannon divergence
-        local = local - local.min()
+                    magnitude = magnitude / np.maximum(group_area, 1e-12)
+
+                magnitude *= harmonic_weights.get(m, 1.0)
+
+                local[:, h_pos] = magnitude
+                h_pos += 1
 
         flat = local.reshape(-1)
 
@@ -783,7 +763,7 @@ def neighborhood_distribution_fourier(
         "cell_types": cell_types,
         "shell_edges": shell_edges,
         "harmonics": harmonics,
-        "feature_shape": (n_types, n_shells_eff, n_harm),
+        "feature_shape": (n_types, n_shells_eff, len(harmonics)),
     }
     return features, metadata
 
@@ -815,7 +795,7 @@ def neighborhood_distribution_multiscale(
     return_metadata=False,
 ):
     """
-    Concatenate rotation-invariant descriptors across multiple radii.
+    Concatenate rotation- and reflection-invariant descriptors across multiple radii.
     """
     radii = [float(r) for r in radii]
     if any(r <= 0 for r in radii):
@@ -970,7 +950,7 @@ def calculate_neighborhood_dissimilarity(
     label_key="cell_type_annot",
 ):
     """
-    Neighborhood dissimilarity using multiscale rotation-invariant descriptors
+    Neighborhood dissimilarity using multiscale rotation- and reflection-invariant descriptors
     and proper re-normalization before Jensen-Shannon distance.
     """
     all_types = np.array(sorted(

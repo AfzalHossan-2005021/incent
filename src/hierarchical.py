@@ -27,7 +27,9 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         masses: np.ndarray (C,) normalized size of each cluster
         centroids: np.ndarray (C, 2) average spatial coordinate
         mu_expr: np.ndarray (C, D) mean expression/latent vector
-        mu_struct: np.ndarray (C, T * 3) spatial distribution within the cluster itself based on 3 Fourier harmonics of the cell type localization
+        mu_struct: np.ndarray (C, T * 2) invariant structural descriptor made of
+            per-cell-type abundance (m=0) and bilateral anisotropy magnitude
+            (|m=2|) measured relative to the cluster centroid
     """
     coords = adata.obsm[spatial_key]
     n_cells = coords.shape[0]
@@ -55,19 +57,10 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     masses = np.zeros(n_clusters)
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
     centroids = np.zeros((n_clusters, 2))
-    
-    def compute_reference_angle(pts):
-        centered = pts - pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        v1 = vh[0]
-        if np.mean((centered @ v1) ** 3) < 0:
-            v1 = -v1
-        return np.arctan2(v1[1], v1[0])
-        
-    ref_angle = compute_reference_angle(coords)
-    
-    # 5 harmonics (m=0 (1), m=1 (2), m=2 (2)) per cell type
-    mu_struct = np.zeros((n_clusters, n_types * 5))
+
+    # Two invariant channels per cell type:
+    # m=0 abundance and |m=2| bilateral anisotropy magnitude.
+    mu_struct = np.zeros((n_clusters, n_types * 2))
     
     for c_i, c in enumerate(unique_labels):
         mask = (labels == c)
@@ -83,33 +76,21 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             mapped_types = [type_map[t] for t in c_types if t in type_map]
             counts = np.bincount(mapped_types, minlength=n_types).astype(np.float64)
             
-            # --- Computed Intrinsic Cluster Fourier Context ---
-            # Evaluates cell localization RELATIVE to the macro-cluster centroid
+            # --- Invariant intrinsic cluster context ---
+            # Evaluates cell localization relative to the cluster centroid using
+            # abundance and bilateral anisotropy magnitude only.
             rel_coords = coords[mask] - centroids[c_i]
             thetas = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
             
-            local_feat = np.zeros((n_types, 5))
+            local_feat = np.zeros((n_types, 2))
             c_types_idx = np.array(mapped_types)
             
-            feat_idx = 0
-            for m in [0, 1, 2]:
-                if m == 0:
-                    local_feat[:, feat_idx] = counts
-                    feat_idx += 1
-                else:
-                    ang = m * thetas
-                    real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
-                    imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
-                    
-                    phase_anchor = np.exp(-1j * m * ref_angle)
-                    descriptor_complex = (real + 1j * imag) * phase_anchor
-                    
-                    local_feat[:, feat_idx] = descriptor_complex.real
-                    local_feat[:, feat_idx + 1] = descriptor_complex.imag
-                    feat_idx += 2
-            
-            # Make nonnegative for Jensen-Shannon divergence
-            local_feat = local_feat - local_feat.min()
+            local_feat[:, 0] = counts
+
+            ang = 2.0 * thetas
+            real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
+            imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
+            local_feat[:, 1] = np.sqrt(real ** 2 + imag ** 2)
             
             flat = local_feat.reshape(-1)
             if flat.sum() > 0:
@@ -125,9 +106,9 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     
     Args:
         mu_expr_A: np.ndarray (C_A, D) mean expression for slice A
-        mu_struct_A: np.ndarray (C_A, T * 3) structural features for slice A
+        mu_struct_A: np.ndarray (C_A, K) invariant structural features for slice A
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
-        mu_struct_B: np.ndarray (C_B, T * 3) structural features for slice B
+        mu_struct_B: np.ndarray (C_B, K) invariant structural features for slice B
         beta: weight for structural distance (expression distance is 1 - beta)
         
     Returns:
@@ -140,11 +121,11 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     # Cosine distance for continuous expression
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
             
-    # Jensen-Shannon for cell type histograms (probability distributions)
+    # Jensen-Shannon for nonnegative invariant structural descriptors
     M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
     for i in range(mu_struct_A.shape[0]):
         for j in range(mu_struct_B.shape[0]):
-            # Using Jensen-Shannon since the fourier features are normalized probabilistic distributions over space
+            # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
             M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
 
     
