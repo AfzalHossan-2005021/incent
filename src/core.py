@@ -72,7 +72,7 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B = extract_continuous_macro_section(
+    idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B, matched_cluster_pairs = extract_continuous_macro_section(
         sliceA,
         sliceB,
         labelsA,
@@ -100,20 +100,28 @@ def hierarchical_pairwise_align(
         # Restrict labels to the matched core
         core_labels_A = labelsA[idx_A]
         core_labels_B = labelsB[idx_B]
-        
-        for cA in range(Pi_cluster.shape[0]):
-            for cB in range(Pi_cluster.shape[1]):
-                mass = Pi_cluster[cA, cB]
-                if mass > 0:
-                    # Find cells in the core that belong to these clusters
-                    cells_A = idx_A[core_labels_A == cA]
-                    cells_B = idx_B[core_labels_B == cB]
-                    
-                    if len(cells_A) > 0 and len(cells_B) > 0:
-                        # Distribute mass uniformly across the block
-                        block_mass = mass / (len(cells_A) * len(cells_B))
-                        grid_A, grid_B = np.ix_(cells_A, cells_B)
-                        pi_full[grid_A, grid_B] += block_mass
+
+        selected_cluster_pairs = list(matched_cluster_pairs)
+        if not selected_cluster_pairs:
+            selected_cluster_pairs = [
+                (cA, cB)
+                for cA in range(Pi_cluster.shape[0])
+                for cB in range(Pi_cluster.shape[1])
+                if Pi_cluster[cA, cB] > 0
+            ]
+
+        for cA, cB in selected_cluster_pairs:
+            mass = Pi_cluster[cA, cB]
+            if mass > 0:
+                # Find cells in the core that belong to this matched cluster pair
+                cells_A = idx_A[core_labels_A == cA]
+                cells_B = idx_B[core_labels_B == cB]
+
+                if len(cells_A) > 0 and len(cells_B) > 0:
+                    # Distribute mass uniformly across the matched block
+                    block_mass = mass / (len(cells_A) * len(cells_B))
+                    grid_A, grid_B = np.ix_(cells_A, cells_B)
+                    pi_full[grid_A, grid_B] += block_mass
 
     print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
     from .visualize import stack_slices_pairwise

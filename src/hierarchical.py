@@ -240,13 +240,13 @@ def compute_pairwise_mutual_information_contribution(pi):
     return contrib
 
 
-def select_initial_match_component(match_adj, match_scores):
+def select_initial_match_component(matches, match_adj, match_scores):
     """
     Select the strongest initial motif in the match graph.
 
     Preference order:
-    1) triangle (three mutually adjacent matched pairs)
-    2) edge (two adjacent matched pairs)
+    1) triangle (three mutually adjacent one-to-one matched pairs)
+    2) edge (two adjacent one-to-one matched pairs)
     3) singleton (single best matched pair)
     """
     num_matches = match_adj.shape[0]
@@ -264,6 +264,10 @@ def select_initial_match_component(match_adj, match_scores):
                 continue
             for k in range(j + 1, num_matches):
                 if match_adj[i, k] and match_adj[j, k]:
+                    tri_A = {matches[i][0], matches[j][0], matches[k][0]}
+                    tri_B = {matches[i][1], matches[j][1], matches[k][1]}
+                    if len(tri_A) < 3 or len(tri_B) < 3:
+                        continue
                     score = match_scores[i] + match_scores[j] + match_scores[k]
                     if score > best_triangle_score:
                         best_triangle_score = score
@@ -278,6 +282,8 @@ def select_initial_match_component(match_adj, match_scores):
     for i in range(num_matches):
         for j in range(i + 1, num_matches):
             if match_adj[i, j]:
+                if matches[i][0] == matches[j][0] or matches[i][1] == matches[j][1]:
+                    continue
                 score = match_scores[i] + match_scores[j]
                 if score > best_edge_score:
                     best_edge_score = score
@@ -290,15 +296,165 @@ def select_initial_match_component(match_adj, match_scores):
     return np.array([int(np.argmax(match_scores))], dtype=int)
 
 
+def fit_rigid_transform(src, tgt):
+    """
+    Fit a rigid transform in row-vector form: src @ R.T + t ~= tgt.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    tgt = np.asarray(tgt, dtype=np.float64)
+
+    if src.shape != tgt.shape or src.ndim != 2 or src.shape[1] != 2:
+        raise ValueError("Rigid transform expects two arrays of shape (n, 2).")
+
+    if src.shape[0] == 0:
+        return np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64)
+
+    src_center = src.mean(axis=0)
+    tgt_center = tgt.mean(axis=0)
+
+    if src.shape[0] == 1:
+        R = np.eye(2, dtype=np.float64)
+        t = tgt_center - src_center
+        return R, t
+
+    src_centered = src - src_center
+    tgt_centered = tgt - tgt_center
+
+    H = src_centered.T @ tgt_centered
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = tgt_center - src_center @ R.T
+    return R, t
+
+
+def map_sliceB_to_sliceA_frame(centroids_A, centroids_B, matched_pairs):
+    """
+    Align slice B centroids into the current slice A frame using matched cluster pairs.
+    """
+    if len(matched_pairs) == 0:
+        return centroids_B.copy(), np.zeros(2, dtype=np.float64)
+
+    anchor_A = centroids_A[[a for a, _ in matched_pairs]]
+    anchor_B = centroids_B[[b for _, b in matched_pairs]]
+    R, t = fit_rigid_transform(anchor_B, anchor_A)
+    aligned_B = centroids_B @ R.T + t
+    origin = anchor_A.mean(axis=0)
+    return aligned_B, origin
+
+
+def angular_difference(theta_a, theta_b):
+    """
+    Smallest absolute angular difference between two angles.
+    """
+    return abs(np.arctan2(np.sin(theta_a - theta_b), np.cos(theta_a - theta_b)))
+
+
+def pair_has_paired_frontier_support(pA, pB, matched_pairs, adj_A, adj_B):
+    """
+    A candidate extension must touch at least one already matched pair in both slices.
+    """
+    return any(adj_A[pA, a] and adj_B[pB, b] for a, b in matched_pairs)
+
+
+def score_candidate_pair(pA, pB, centroids_A, aligned_centroids_B, origin, mi_contrib):
+    """
+    Parameter-free geometric ranking of a candidate pair in the shared frame.
+
+    The primary score is the positional discrepancy in the common coordinate
+    system; radial and angular discrepancies serve as interpretable tie-breakers.
+    """
+    rel_A = centroids_A[pA] - origin
+    rel_B = aligned_centroids_B[pB] - origin
+
+    radius_A = float(np.linalg.norm(rel_A))
+    radius_B = float(np.linalg.norm(rel_B))
+    radial_gap = abs(radius_A - radius_B)
+
+    if radius_A > 1e-12 and radius_B > 1e-12:
+        angle_A = float(np.arctan2(rel_A[1], rel_A[0]))
+        angle_B = float(np.arctan2(rel_B[1], rel_B[0]))
+        angle_gap = angular_difference(angle_A, angle_B)
+    else:
+        angle_gap = 0.0
+
+    coord_gap = float(np.linalg.norm(rel_A - rel_B))
+    return (coord_gap, radial_gap, angle_gap, -float(mi_contrib[pA, pB]))
+
+
+def select_next_reciprocal_pair(frontier_A, frontier_B, matched_pairs, adj_A, adj_B, centroids_A, centroids_B, mi_contrib):
+    """
+    Select the next one-to-one frontier pair by reciprocal best match in the shared frame.
+    """
+    if len(frontier_A) == 0 or len(frontier_B) == 0:
+        return None
+
+    aligned_centroids_B, origin = map_sliceB_to_sliceA_frame(centroids_A, centroids_B, matched_pairs)
+
+    best_for_A = {}
+    best_rank_for_A = {}
+    for pA in frontier_A:
+        best_pair = None
+        best_rank = None
+        for pB in frontier_B:
+            if mi_contrib[pA, pB] <= 0:
+                continue
+            if not pair_has_paired_frontier_support(pA, pB, matched_pairs, adj_A, adj_B):
+                continue
+
+            rank = score_candidate_pair(pA, pB, centroids_A, aligned_centroids_B, origin, mi_contrib)
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_pair = pB
+
+        if best_pair is not None:
+            best_for_A[pA] = best_pair
+            best_rank_for_A[pA] = best_rank
+
+    best_for_B = {}
+    for pB in frontier_B:
+        best_pair = None
+        best_rank = None
+        for pA in frontier_A:
+            if mi_contrib[pA, pB] <= 0:
+                continue
+            if not pair_has_paired_frontier_support(pA, pB, matched_pairs, adj_A, adj_B):
+                continue
+
+            rank = score_candidate_pair(pA, pB, centroids_A, aligned_centroids_B, origin, mi_contrib)
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_pair = pA
+
+        if best_pair is not None:
+            best_for_B[pB] = best_pair
+
+    reciprocal_pairs = []
+    for pA, pB in best_for_A.items():
+        if best_for_B.get(pB) == pA:
+            reciprocal_pairs.append((best_rank_for_A[pA], pA, pB))
+
+    if not reciprocal_pairs:
+        return None
+
+    reciprocal_pairs.sort(key=lambda x: x[0])
+    _, pA, pB = reciprocal_pairs[0]
+    return (pA, pB)
+
+
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
     """
-    Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
+    Identifies a one-to-one, co-contiguous macro-section from the clustering alignment.
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
     
     total_mass = np.sum(Pi_cluster)
     if total_mass == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M), []
         
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
 
@@ -380,7 +536,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     # 3. Select cluster-pairs enriched above the size-preserving independence null
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
     positive_flat_idx = np.flatnonzero(mi_contrib > 0)
-    selected_flat_idx = positive_flat_idx[np.argsort(mi_contrib.ravel()[positive_flat_idx])[::-1]]
+    if positive_flat_idx.size > 0:
+        selected_flat_idx = positive_flat_idx[np.argsort(mi_contrib.ravel()[positive_flat_idx])[::-1]]
+    else:
+        flat_pi = Pi_cluster.ravel()
+        selected_flat_idx = np.argsort(flat_pi)[::-1]
 
     matches = []
     match_scores = []
@@ -392,7 +552,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             
     num_matches = len(matches)
     if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M), []
         
     # 4. Enforce Structural Similarity & Continuity via Match-Graph
     # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
@@ -406,67 +566,65 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 match_adj[j, i] = True
 
     match_scores = np.asarray(match_scores, dtype=np.float64)
-    largest_match_indices = select_initial_match_component(match_adj, match_scores)
+    largest_match_indices = select_initial_match_component(matches, match_adj, match_scores)
+    matched_pairs = [matches[i] for i in largest_match_indices]
+    matched_A = {a for a, _ in matched_pairs}
+    matched_B = {b for _, b in matched_pairs}
     
-    strong_A = list(set([matches[i][0] for i in largest_match_indices]))
-    strong_B = list(set([matches[i][1] for i in largest_match_indices]))
-    
-    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
-    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
+    core_cells_A = np.where(np.isin(labels_A, list(matched_A)))[0]
+    core_cells_B = np.where(np.isin(labels_B, list(matched_B)))[0]
 
     if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M), matched_pairs
 
     initial_idx_A = core_cells_A.copy()
     initial_idx_B = core_cells_B.copy()
-    
-    # Compute initial barycenters of the starting core components
-    bary_A = np.mean(centroids_A[strong_A], axis=0)
-    bary_B = np.mean(centroids_B[strong_B], axis=0)
 
-    # 5. Determine Target Expansion Size
-    # Target is 1/3 of the clusters of the smaller slice
-    target_count = max(1, int(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))
-    print(f"[HOT] Topological Extension: Expanding until {target_count} clusters are in the strong set.")
+    motif_name = {1: "singleton", 2: "edge", 3: "triangle"}.get(len(matched_pairs), "component")
+    print(
+        f"[HOT] Topological Extension: starting from a {motif_name} and extending one-to-one "
+        "until one slice frontier is exhausted or no reciprocal biologically supported pair remains."
+    )
 
-    # 6. Cluster-level Topological Extension
-    while min(len(strong_A), len(strong_B)) < target_count:
-        # Find all topological neighbors of the current strong components
-        neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
-        neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
-        
-        # Exclude clusters already in the strong set
-        candidates_A = [c for c in neighbors_A if c not in strong_A and valid_A[c]]
-        candidates_B = [c for c in neighbors_B if c not in strong_B and valid_B[c]]
-        
-        if not candidates_A or not candidates_B:
+    # 5. Cluster-level one-to-one topological extension in the shared frame
+    while True:
+        matched_A_list = sorted(matched_A)
+        matched_B_list = sorted(matched_B)
+
+        neighbors_A = np.where(np.any(adj_A[matched_A_list, :], axis=0))[0]
+        neighbors_B = np.where(np.any(adj_B[matched_B_list, :], axis=0))[0]
+
+        frontier_A = [c for c in neighbors_A if valid_A[c] and c not in matched_A]
+        frontier_B = [c for c in neighbors_B if valid_B[c] and c not in matched_B]
+
+        if not frontier_A or not frontier_B:
+            print("[HOT] Topological Extension stopped: one slice ran out of unmatched frontier clusters.")
             break
-            
-        # Find the valid matching pair that is closest to the initial barycenters
-        best_pair = None
-        best_dist = float('inf')
-        
-        for pA in candidates_A:
-            for pB in candidates_B:
-                dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
-                dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
-                
-                # We minimize the combined distance to the respective barycenters
-                total_dist = dist_A + dist_B
-                if total_dist < best_dist:
-                    best_dist = total_dist
-                    best_pair = (pA, pB)
-                    
-        # Add the best geometrically compact pair
-        if best_pair is not None:
-            strong_A.append(best_pair[0])
-            strong_B.append(best_pair[1])
-        else:
+
+        next_pair = select_next_reciprocal_pair(
+            frontier_A=frontier_A,
+            frontier_B=frontier_B,
+            matched_pairs=matched_pairs,
+            adj_A=adj_A,
+            adj_B=adj_B,
+            centroids_A=centroids_A,
+            centroids_B=centroids_B,
+            mi_contrib=mi_contrib
+        )
+
+        if next_pair is None:
+            print("[HOT] Topological Extension stopped: no reciprocal, topologically supported, MI-enriched pair remained.")
             break
+
+        matched_pairs.append(next_pair)
+        matched_A.add(next_pair[0])
+        matched_B.add(next_pair[1])
 
     # Extract final cells based strictly on expanded cluster membership
-    idx_A = np.where(np.isin(labels_A, strong_A))[0]
-    idx_B = np.where(np.isin(labels_B, strong_B))[0]
+    final_A = sorted(matched_A)
+    final_B = sorted(matched_B)
+    idx_A = np.where(np.isin(labels_A, final_A))[0]
+    idx_B = np.where(np.isin(labels_B, final_B))[0]
 
     # Compute physical distances from the newly expanded core to all cells
     core_coords_A = coords_A[idx_A]
@@ -478,5 +636,5 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
     
-    return idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B
+    return idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B, matched_pairs
 
