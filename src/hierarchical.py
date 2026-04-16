@@ -56,18 +56,8 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
     centroids = np.zeros((n_clusters, 2))
     
-    def compute_reference_angle(pts):
-        centered = pts - pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        v1 = vh[0]
-        if np.mean((centered @ v1) ** 3) < 0:
-            v1 = -v1
-        return np.arctan2(v1[1], v1[0])
-        
-    ref_angle = compute_reference_angle(coords)
-    
-    # 5 harmonics (m=0 (1), m=1 (2), m=2 (2)) per cell type
-    mu_struct = np.zeros((n_clusters, n_types * 5))
+    # 3 harmonics (m=0, 1, 2) per cell type
+    mu_struct = np.zeros((n_clusters, n_types * 3))
     
     for c_i, c in enumerate(unique_labels):
         mask = (labels == c)
@@ -88,28 +78,19 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             rel_coords = coords[mask] - centroids[c_i]
             thetas = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
             
-            local_feat = np.zeros((n_types, 5))
+            local_feat = np.zeros((n_types, 3))
             c_types_idx = np.array(mapped_types)
             
-            feat_idx = 0
-            for m in [0, 1, 2]:
+            for h_idx, m in enumerate([0, 1, 2]):
                 if m == 0:
-                    local_feat[:, feat_idx] = counts
-                    feat_idx += 1
+                    mag = counts
                 else:
                     ang = m * thetas
                     real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
                     imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
+                    mag = np.hypot(real, imag)
                     
-                    phase_anchor = np.exp(-1j * m * ref_angle)
-                    descriptor_complex = (real + 1j * imag) * phase_anchor
-                    
-                    local_feat[:, feat_idx] = descriptor_complex.real
-                    local_feat[:, feat_idx + 1] = descriptor_complex.imag
-                    feat_idx += 2
-            
-            # Make nonnegative for Jensen-Shannon divergence
-            local_feat = local_feat - local_feat.min()
+                local_feat[:, h_idx] = mag
             
             flat = local_feat.reshape(-1)
             if flat.sum() > 0:
@@ -125,9 +106,9 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     
     Args:
         mu_expr_A: np.ndarray (C_A, D) mean expression for slice A
-        mu_struct_A: np.ndarray (C_A, T * 3) structural features for slice A
+        mu_struct_A: np.ndarray (C_A, K) invariant structural features for slice A
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
-        mu_struct_B: np.ndarray (C_B, T * 3) structural features for slice B
+        mu_struct_B: np.ndarray (C_B, K) invariant structural features for slice B
         beta: weight for structural distance (expression distance is 1 - beta)
         
     Returns:
@@ -140,11 +121,11 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     # Cosine distance for continuous expression
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
             
-    # Jensen-Shannon for cell type histograms (probability distributions)
+    # Jensen-Shannon for nonnegative invariant structural descriptors
     M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
     for i in range(mu_struct_A.shape[0]):
         for j in range(mu_struct_B.shape[0]):
-            # Using Jensen-Shannon since the fourier features are normalized probabilistic distributions over space
+            # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
             M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
 
     
