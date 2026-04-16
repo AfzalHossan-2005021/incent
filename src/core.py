@@ -5,18 +5,188 @@ import numpy as np
 from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
+from scipy.stats import rankdata
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_feature_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
+from .hierarchical import (
+    empirical_logit_evidence,
+    extract_cluster_features,
+    extract_continuous_macro_section,
+    fit_weighted_rigid_transform,
+    compute_cluster_feature_costs,
+    compute_cluster_structural_matrix,
+    run_coarse_partial_fgw,
+)
 from .visualize import (
     visualize_clustered_slices,
     visualize_cluster_mapping,
     visualize_initial_connected_component,
     visualize_selected_anchors,
 )
+
+
+def estimate_coordinate_spacing_from_array(coords, k=6):
+    """
+    Robust local spacing estimate for a raw coordinate array.
+
+    This mirrors the logic used on AnnData objects and is employed when building
+    sparse within-cluster initialization maps before the fine-scale OT stage.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    n = coords.shape[0]
+    if n < 2:
+        return 1.0
+
+    k_eff = min(k + 1, n)
+    tree = cKDTree(coords)
+    dists, _ = tree.query(coords, k=k_eff)
+
+    kth = dists[:, -1]
+    kth = kth[np.isfinite(kth) & (kth > 0)]
+    if kth.size == 0:
+        return 1.0
+    return float(np.median(kth))
+
+
+def normalized_rank_positions(values):
+    """
+    Map a 1D array to the unit interval via stable empirical ranks.
+
+    Equal values retain identical averaged ranks through the tie-aware evidence
+    transform used elsewhere in the pipeline.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.size <= 1:
+        return np.zeros(values.size, dtype=np.float64)
+
+    ranks = rankdata(values, method="average") - 1.0
+    return ranks / max(values.size - 1, 1)
+
+
+def synthesize_structured_cluster_initialization(
+    sliceA,
+    sliceB,
+    labelsA,
+    labelsB,
+    idx_A,
+    idx_B,
+    selected_pairs,
+    Pi_cluster,
+    centroidsA,
+    centroidsB,
+    use_rep="X_pca",
+    label_key="cell_type_annot",
+    spatial_key="spatial",
+):
+    """
+    Build a sparse, structure-aware cell-level initialization from matched macro clusters.
+
+    Each matched cluster-pair is refined independently using a one-to-one partial
+    assignment between cells. Candidate cell pairs are scored by four
+    complementary, parameter-light criteria:
+
+    1. residual after the rigid transform induced by the trusted cluster anchors
+    2. feature similarity in the chosen expression/latent representation
+    3. agreement in within-cluster radial depth rank
+    4. cell-type agreement when annotations are available
+
+    Scores are converted to empirical log-odds and only matches stronger than
+    the neutral unmatched alternative are retained. This avoids the artificial
+    dense blocks produced by uniform mass spreading and yields a much cleaner
+    coarse geometric signal for downstream overlap estimation.
+    """
+    if len(selected_pairs) == 0 or len(idx_A) == 0 or len(idx_B) == 0:
+        return np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
+
+    coords_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
+    coords_B = np.asarray(sliceB.obsm[spatial_key], dtype=np.float64)
+    feat_A = to_dense_array(sliceA.X if use_rep == "X" else extract_data_matrix(sliceA, use_rep))
+    feat_B = to_dense_array(sliceB.X if use_rep == "X" else extract_data_matrix(sliceB, use_rep))
+    type_A = sliceA.obs[label_key].astype(str).to_numpy()
+    type_B = sliceB.obs[label_key].astype(str).to_numpy()
+
+    selected_mask_A = np.zeros(sliceA.shape[0], dtype=bool)
+    selected_mask_A[idx_A] = True
+    selected_mask_B = np.zeros(sliceB.shape[0], dtype=bool)
+    selected_mask_B[idx_B] = True
+
+    cluster_weights = np.array(
+        [max(Pi_cluster[u, v], 1e-12) for u, v in selected_pairs],
+        dtype=np.float64
+    )
+    R_seed, t_seed = fit_weighted_rigid_transform(
+        centroidsA[[u for u, _ in selected_pairs]],
+        centroidsB[[v for _, v in selected_pairs]],
+        weights=cluster_weights
+    )
+
+    pi_init = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
+
+    for cA, cB in selected_pairs:
+        block_mass = float(Pi_cluster[cA, cB])
+        if block_mass <= 0:
+            continue
+
+        cells_A = np.where((labelsA == cA) & selected_mask_A)[0]
+        cells_B = np.where((labelsB == cB) & selected_mask_B)[0]
+        if len(cells_A) == 0 or len(cells_B) == 0:
+            continue
+
+        coords_A_block = coords_A[cells_A]
+        coords_B_block = coords_B[cells_B]
+        pred_B_block = coords_A_block @ R_seed.T + t_seed
+
+        geom_scale = max(
+            estimate_coordinate_spacing_from_array(coords_A_block),
+            estimate_coordinate_spacing_from_array(coords_B_block),
+            1e-12
+        )
+        geom_cost = euclidean_distances(pred_B_block, coords_B_block) / geom_scale
+        expr_cost = cosine_distances(feat_A[cells_A], feat_B[cells_B])
+
+        radial_A = normalized_rank_positions(np.linalg.norm(coords_A_block - centroidsA[cA], axis=1))
+        radial_B = normalized_rank_positions(np.linalg.norm(coords_B_block - centroidsB[cB], axis=1))
+        radial_cost = np.abs(radial_A[:, None] - radial_B[None, :])
+
+        type_cost = (type_A[cells_A, None] != type_B[cells_B][None, :]).astype(np.float64)
+
+        geom_evidence = empirical_logit_evidence(geom_cost.ravel(), larger_is_better=False).reshape(geom_cost.shape)
+        expr_evidence = empirical_logit_evidence(expr_cost.ravel(), larger_is_better=False).reshape(expr_cost.shape)
+        radial_evidence = empirical_logit_evidence(radial_cost.ravel(), larger_is_better=False).reshape(radial_cost.shape)
+        type_evidence = empirical_logit_evidence(type_cost.ravel(), larger_is_better=False).reshape(type_cost.shape)
+
+        total_score = geom_evidence + expr_evidence + radial_evidence + type_evidence
+
+        nA_block, nB_block = total_score.shape
+        real_cols = nB_block
+        cost = np.zeros((nA_block, nB_block + nA_block), dtype=np.float64)
+        cost[:, :nB_block] = -total_score
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        accepted_mask = col_ind < real_cols
+        accepted_rows = row_ind[accepted_mask]
+        accepted_cols = col_ind[accepted_mask]
+        accepted_scores = total_score[accepted_rows, accepted_cols]
+        accepted_keep = accepted_scores > 0
+
+        accepted_rows = accepted_rows[accepted_keep]
+        accepted_cols = accepted_cols[accepted_keep]
+        accepted_scores = accepted_scores[accepted_keep]
+
+        if accepted_scores.size == 0:
+            continue
+
+        pair_weights = np.exp(accepted_scores - accepted_scores.max())
+        pair_weights /= max(pair_weights.sum(), 1e-12)
+
+        for row_local, col_local, w in zip(accepted_rows, accepted_cols, pair_weights):
+            pi_init[cells_A[row_local], cells_B[col_local]] += block_mass * float(w)
+
+    return pi_init
 
 
 def hierarchical_pairwise_align(
@@ -39,6 +209,11 @@ def hierarchical_pairwise_align(
     """
     Performs Hierarchical OT by clustering cells into mesoregions, aligning clusters with Partial FGW,
     and then restricting the cell-level OT matchings to the aligned blocks.
+
+    The procedure is intentionally conservative: if the coarse stage cannot
+    identify a trustworthy one-to-one overlap anchor or if the induced overlap
+    shadow is unstable, the function raises an explicit error rather than
+    silently reverting to full-slice alignment.
     
     Returns the cell-level alignment pi.
     """
@@ -72,7 +247,7 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B = extract_continuous_macro_section(
+    idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B, selected_pairs = extract_continuous_macro_section(
         sliceA,
         sliceB,
         labelsA,
@@ -81,6 +256,17 @@ def hierarchical_pairwise_align(
         spatial_key=spatial_key,
         label_key=label_key
     )
+
+    if len(idx_A) == 0 or len(idx_B) == 0 or len(selected_pairs) == 0:
+        raise ValueError(
+            "Hierarchical alignment aborted: no trustworthy overlapping macro-component "
+            "could be identified from the coarse partial FGW alignment."
+        )
+    if len({u for u, _ in selected_pairs}) != len(selected_pairs) or len({v for _, v in selected_pairs}) != len(selected_pairs):
+        raise ValueError(
+            "Hierarchical alignment aborted: the coarse anchor remained macroscopically ambiguous "
+            "because the selected cluster correspondences were not one-to-one."
+        )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
@@ -95,26 +281,26 @@ def hierarchical_pairwise_align(
         visualize_selected_anchors(sliceA, sliceB, idx_A, idx_B, spatial_key=spatial_key, dist_A=dist_A, dist_B=dist_B)
 
     print("--- [HOT] Step 6: Synthesizing Cell-Level Footprint from Macro Clusters ---")
-    pi_full = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
-    
-    if len(idx_A) > 0 and len(idx_B) > 0:
-        # Restrict labels to the matched core
-        core_labels_A = labelsA[idx_A]
-        core_labels_B = labelsB[idx_B]
-        
-        for cA in range(Pi_cluster.shape[0]):
-            for cB in range(Pi_cluster.shape[1]):
-                mass = Pi_cluster[cA, cB]
-                if mass > 0:
-                    # Find cells in the core that belong to these clusters
-                    cells_A = idx_A[core_labels_A == cA]
-                    cells_B = idx_B[core_labels_B == cB]
-                    
-                    if len(cells_A) > 0 and len(cells_B) > 0:
-                        # Distribute mass uniformly across the block
-                        block_mass = mass / (len(cells_A) * len(cells_B))
-                        grid_A, grid_B = np.ix_(cells_A, cells_B)
-                        pi_full[grid_A, grid_B] += block_mass
+    pi_full = synthesize_structured_cluster_initialization(
+        sliceA=sliceA,
+        sliceB=sliceB,
+        labelsA=labelsA,
+        labelsB=labelsB,
+        idx_A=idx_A,
+        idx_B=idx_B,
+        selected_pairs=selected_pairs,
+        Pi_cluster=Pi_cluster,
+        centroidsA=centroidsA,
+        centroidsB=centroidsB,
+        use_rep=use_rep,
+        label_key=label_key,
+        spatial_key=spatial_key,
+    )
+    if np.sum(pi_full) <= 0:
+        raise ValueError(
+            "Hierarchical alignment aborted: the macro-matched clusters did not admit a "
+            "trustworthy sparse cell-level initialization."
+        )
 
     print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
     from .visualize import stack_slices_pairwise
@@ -163,9 +349,10 @@ def hierarchical_pairwise_align(
         overlap_mask_A = overlap_mask[tuple(grid_A.T)]
         overlap_mask_B = overlap_mask[tuple(grid_B.T)]
         
-        # Fallback if overlap vanishes perfectly
-        if not np.any(overlap_mask_A): overlap_mask_A[:] = True
-        if not np.any(overlap_mask_B): overlap_mask_B[:] = True
+        if not np.any(overlap_mask_A) or not np.any(overlap_mask_B):
+            raise ValueError(
+                "The coarse anchor did not induce a stable overlapping shadow between the two slices."
+            )
         
         # 3. Supplying ONLY the shadow slices to the final OT pipeline
         # Within the shadow, apply decaying weights from the previously matched biological core
@@ -239,8 +426,10 @@ def hierarchical_pairwise_align(
         return pi_full_final
         
     except Exception as e:
-        print(f"Global refinement failed: {e}. Returning block-restricted pi_full.")
-        return pi_full
+        raise RuntimeError(
+            "Hierarchical alignment terminated explicitly during overlap projection/refinement. "
+            "The method did not find a trustworthy partial overlap for fine-scale OT."
+        ) from e
 
 
 def align_multiple_slices(

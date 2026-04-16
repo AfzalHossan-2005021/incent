@@ -8,6 +8,7 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import distance_matrix, Delaunay
 from sklearn.metrics.pairwise import cosine_distances
 from scipy.spatial.distance import jensenshannon
+from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
 
 
@@ -470,10 +471,8 @@ def empirical_logit_evidence(values, larger_is_better=True):
         return np.zeros(0, dtype=np.float64)
 
     working = values if larger_is_better else -values
-    order = np.argsort(working, kind="mergesort")
-    ranks = np.empty(values.size, dtype=np.int64)
-    ranks[order] = np.arange(values.size)
-    p = (ranks + 1.0) / (values.size + 1.0)
+    ranks = rankdata(working, method="average")
+    p = ranks / (values.size + 1.0)
     return np.log(p) - np.log1p(-p)
 
 
@@ -593,12 +592,31 @@ def extract_continuous_macro_section(
     compartments because expansion is never allowed independently on the two
     slices and every newly added pair must beat the neutral unmatched
     alternative in a one-to-one frontier assignment.
+
+    Returns
+    -------
+    idx_A, idx_B:
+        Cell indices belonging to the final coupled overlap region.
+    dist_A, dist_B:
+        Distance-to-core fields used to bias the final fine-scale alignment.
+    initial_idx_A, initial_idx_B:
+        Cell indices belonging to the initial seed motif before coupled growth.
+    selected_pairs:
+        Ordered list of matched cluster-pairs retained by the coupled expansion.
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
     
     total_mass = np.sum(Pi_cluster)
     if total_mass == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            np.full(N, np.inf, dtype=np.float64),
+            np.full(M, np.inf, dtype=np.float64),
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            [],
+        )
         
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
 
@@ -665,7 +683,15 @@ def extract_continuous_macro_section(
             
     num_matches = len(matches)
     if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            np.full(N, np.inf, dtype=np.float64),
+            np.full(M, np.inf, dtype=np.float64),
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            [],
+        )
         
     # Convert global biological evidence channels into centered log-odds.
     transport_evidence = empirical_logit_evidence(transport_signal, larger_is_better=True)
@@ -697,7 +723,15 @@ def extract_continuous_macro_section(
     core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
 
     if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            np.full(N, np.inf, dtype=np.float64),
+            np.full(M, np.inf, dtype=np.float64),
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            [],
+        )
 
     initial_idx_A = core_cells_A.copy()
     initial_idx_B = core_cells_B.copy()
@@ -829,5 +863,5 @@ def extract_continuous_macro_section(
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
     
-    return idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B
+    return idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B, selected_pairs
 
