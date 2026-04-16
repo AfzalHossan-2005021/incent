@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import scipy.sparse as sp
 
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import distance_matrix, Delaunay
@@ -216,6 +217,32 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     return pi_samp
 
 
+def compute_pairwise_log_enrichment(pi):
+    """
+    Log-enrichment of each cluster-pair under a size-preserving independence null.
+
+    The null model preserves the coarse transport marginals and therefore answers:
+    "is this pair matched more strongly than expected from cluster sizes alone?"
+    Positive values indicate enrichment above that null and serve as the
+    parameter-free entry criterion for candidate anchor pairs.
+    """
+    total_mass = np.sum(pi)
+    if total_mass <= 0:
+        return np.full_like(pi, -np.inf, dtype=np.float64)
+
+    P = pi / total_mass
+    row_mass = P.sum(axis=1, keepdims=True)
+    col_mass = P.sum(axis=0, keepdims=True)
+    expected = row_mass @ col_mass
+
+    log_enrichment = np.full_like(P, -np.inf, dtype=np.float64)
+    positive_mass = P > 0
+    log_enrichment[positive_mass] = np.log(
+        (P[positive_mass] + 1e-12) / (expected[positive_mass] + 1e-12)
+    )
+    return log_enrichment
+
+
 def compute_pairwise_mutual_information_contribution(pi):
     """
     Per-pair mutual-information contribution under a size-preserving independence null.
@@ -228,16 +255,280 @@ def compute_pairwise_mutual_information_contribution(pi):
         return np.zeros_like(pi, dtype=np.float64)
 
     P = pi / total_mass
-    row_mass = P.sum(axis=1, keepdims=True)
-    col_mass = P.sum(axis=0, keepdims=True)
-    expected = row_mass @ col_mass
+    log_enrichment = compute_pairwise_log_enrichment(pi)
 
     contrib = np.zeros_like(P, dtype=np.float64)
-    positive_mass = P > 0
-    contrib[positive_mass] = P[positive_mass] * np.log(
-        (P[positive_mass] + 1e-12) / (expected[positive_mass] + 1e-12)
-    )
+    positive_mass = np.isfinite(log_enrichment)
+    contrib[positive_mass] = P[positive_mass] * log_enrichment[positive_mass]
     return contrib
+
+
+def build_cluster_contact_graph(coords, labels, valid_mask):
+    """
+    Construct a parameter-light cluster contact graph from physical cluster geometry.
+
+    The graph is deliberately based on verified spatial contact rather than raw
+    centroid proximity. Candidate edges are proposed by the centroid Delaunay
+    triangulation when possible and then retained only when the minimum
+    inter-cluster gap is compatible with the intrinsic within-cluster spacing of
+    the two clusters. This prevents long-range shortcuts between symmetric but
+    non-overlapping tissue compartments.
+
+    Returns
+    -------
+    adjacency:
+        Boolean contact graph with self-loops on the diagonal.
+    edge_lengths:
+        Symmetric matrix containing centroid-to-centroid edge lengths for the
+        retained contacts and zeros elsewhere.
+    """
+    n_clusters = len(valid_mask)
+    adjacency = np.zeros((n_clusters, n_clusters), dtype=bool)
+    edge_lengths = np.zeros((n_clusters, n_clusters), dtype=np.float64)
+    np.fill_diagonal(adjacency, True)
+
+    valid_idx = np.where(valid_mask)[0]
+    if len(valid_idx) < 2:
+        return adjacency, edge_lengths
+
+    centroids = np.zeros((len(valid_idx), 2), dtype=np.float64)
+    centroid_lookup = {}
+    kdtrees = {}
+    intra_dists = {}
+
+    for i, c_id in enumerate(valid_idx):
+        c_coords = coords[labels == c_id]
+        centroids[i] = c_coords.mean(axis=0)
+        centroid_lookup[c_id] = centroids[i]
+
+        tree = cKDTree(c_coords)
+        kdtrees[c_id] = tree
+
+        if len(c_coords) > 1:
+            d, _ = tree.query(c_coords, k=2)
+            intra_dists[c_id] = float(np.percentile(d[:, 1], 99))
+        else:
+            intra_dists[c_id] = 0.0
+
+    if len(valid_idx) >= 3:
+        try:
+            tri = Delaunay(centroids)
+            candidate_edges = set()
+            for simplex in tri.simplices:
+                for i in range(3):
+                    for j in range(i + 1, 3):
+                        u = valid_idx[simplex[i]]
+                        v = valid_idx[simplex[j]]
+                        candidate_edges.add((min(u, v), max(u, v)))
+        except Exception:
+            candidate_edges = {
+                (min(u, v), max(u, v))
+                for i, u in enumerate(valid_idx)
+                for v in valid_idx[i + 1:]
+            }
+    else:
+        u, v = valid_idx[0], valid_idx[1]
+        candidate_edges = {(min(u, v), max(u, v))}
+
+    for u, v in candidate_edges:
+        min_dists, _ = kdtrees[u].query(coords[labels == v], k=1)
+        min_gap = float(np.min(min_dists))
+
+        if min_gap <= (intra_dists[u] + intra_dists[v]):
+            edge_len = float(np.linalg.norm(centroid_lookup[u] - centroid_lookup[v]))
+            adjacency[u, v] = True
+            adjacency[v, u] = True
+            edge_lengths[u, v] = edge_len
+            edge_lengths[v, u] = edge_len
+
+    return adjacency, edge_lengths
+
+
+def normalize_contact_graph(edge_lengths):
+    """
+    Normalize cluster-contact edge lengths by the intrinsic cluster spacing.
+
+    The median retained edge length is used as the characteristic graph unit so
+    that geodesic distances and rigid residuals become dimensionless and
+    comparable across slices with different sampling density.
+    """
+    positive = edge_lengths[edge_lengths > 0]
+    scale = float(np.median(positive)) if positive.size > 0 else 1.0
+    return edge_lengths / max(scale, 1e-12), max(scale, 1e-12)
+
+
+def compute_graph_geodesics(edge_lengths):
+    """
+    Compute all-pairs geodesic distances on the normalized cluster contact graph.
+
+    Disconnected distances are mapped to a large finite penalty so they remain
+    usable in downstream arithmetic without introducing special-case branches.
+    """
+    distances = dijkstra(sp.csr_matrix(edge_lengths), directed=False)
+    finite = distances[np.isfinite(distances)]
+    if finite.size == 0:
+        distances = np.full_like(edge_lengths, 2.0, dtype=np.float64)
+        np.fill_diagonal(distances, 0.0)
+        return distances
+
+    finite_nonzero = finite[finite > 0]
+    fallback = float(np.max(finite_nonzero)) * 2.0 if finite_nonzero.size > 0 else 2.0
+    distances[np.isinf(distances)] = fallback
+    np.fill_diagonal(distances, 0.0)
+    return distances
+
+
+def compute_cluster_cell_type_histograms(adata, labels, n_clusters, label_key="cell_type_annot", all_types=None):
+    """
+    Compute within-cluster cell-type compositions for biologically grounded matching.
+
+    These histograms act as coarse "microenvironment identities" that are much
+    more stable than raw centroid geometry and help separate nearby symmetric
+    compartments whose local molecular composition differs subtly.
+    """
+    cell_types = adata.obs[label_key].astype(str).to_numpy()
+    if all_types is None:
+        all_types = np.array(sorted(np.unique(cell_types)), dtype=str)
+    else:
+        all_types = np.array(all_types, dtype=str)
+
+    type_to_idx = {ct: i for i, ct in enumerate(all_types)}
+    hist = np.zeros((n_clusters, len(all_types)), dtype=np.float64)
+
+    for cluster_id in range(n_clusters):
+        mask = labels == cluster_id
+        if not np.any(mask):
+            continue
+        mapped = [type_to_idx[x] for x in cell_types[mask] if x in type_to_idx]
+        if not mapped:
+            continue
+        counts = np.bincount(mapped, minlength=len(all_types)).astype(np.float64)
+        hist[cluster_id] = counts / max(counts.sum(), 1.0)
+
+    return hist, all_types
+
+
+def compute_cluster_context_features(cluster_hist, adjacency):
+    """
+    Build cluster context descriptors from own composition and adjacent composition.
+
+    The descriptor concatenates the within-cluster composition with the mean
+    composition of directly contacting neighboring clusters, yielding a local
+    niche signature that is insensitive to rigid motion yet informative for
+    symmetry resolution.
+    """
+    n_clusters = cluster_hist.shape[0]
+    context = np.zeros_like(cluster_hist, dtype=np.float64)
+
+    for i in range(n_clusters):
+        neighbors = np.where(adjacency[i])[0]
+        neighbors = neighbors[neighbors != i]
+
+        aggregate = cluster_hist[i].copy()
+        if neighbors.size > 0:
+            aggregate += cluster_hist[neighbors].mean(axis=0)
+
+        total = aggregate.sum()
+        if total > 0:
+            context[i] = aggregate / total
+
+    features = np.concatenate([cluster_hist, context], axis=1)
+    row_sums = features.sum(axis=1, keepdims=True)
+    nz = row_sums[:, 0] > 0
+    features[nz] /= row_sums[nz]
+    return features
+
+
+def fit_weighted_rigid_transform(source_points, target_points, weights=None):
+    """
+    Fit the best rigid transform mapping source points to target points.
+
+    Reflection is allowed because cross-slice alignment must handle arbitrary
+    flips. When only one matched pair is available, the transform reduces to a
+    pure translation anchored at that pair.
+    """
+    source_points = np.asarray(source_points, dtype=np.float64)
+    target_points = np.asarray(target_points, dtype=np.float64)
+
+    if source_points.shape[0] == 0:
+        return np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64)
+
+    if source_points.shape[0] == 1:
+        return np.eye(2, dtype=np.float64), target_points[0] - source_points[0]
+
+    if weights is None:
+        weights = np.ones(source_points.shape[0], dtype=np.float64)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
+
+    weights = weights / max(weights.sum(), 1e-12)
+    source_center = (weights[:, None] * source_points).sum(axis=0)
+    target_center = (weights[:, None] * target_points).sum(axis=0)
+
+    source_centered = source_points - source_center
+    target_centered = target_points - target_center
+
+    H = source_centered.T @ (weights[:, None] * target_centered)
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    t = target_center - R @ source_center
+    return R, t
+
+
+def empirical_logit_evidence(values, larger_is_better=True):
+    """
+    Convert a score vector into centered, parameter-free evidence values.
+
+    Scores are ranked empirically and mapped to log-odds. This places unrelated
+    evidence channels on a common scale without introducing hand-tuned weights.
+    Values above the empirical median receive positive evidence, values below it
+    receive negative evidence, and tied/isolated cases remain near zero.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    working = values if larger_is_better else -values
+    order = np.argsort(working, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.int64)
+    ranks[order] = np.arange(values.size)
+    p = (ranks + 1.0) / (values.size + 1.0)
+    return np.log(p) - np.log1p(-p)
+
+
+def solve_frontier_assignment(frontier_A, frontier_B, candidate_pairs, candidate_scores):
+    """
+    Solve one-to-one matching on the current product-graph frontier.
+
+    Each frontier node in slice A receives a private dummy option with zero
+    evidence. A real pair is accepted only when its joint evidence is stronger
+    than that neutral alternative, which yields an automatic stopping rule
+    without prescribing a target region size.
+    """
+    if len(frontier_A) == 0 or len(frontier_B) == 0 or len(candidate_pairs) == 0:
+        return []
+
+    frontier_A = np.array(sorted(frontier_A), dtype=int)
+    frontier_B = np.array(sorted(frontier_B), dtype=int)
+    col_map = {v: i for i, v in enumerate(frontier_B)}
+
+    BIG = 1e9
+    cost = np.full((len(frontier_A), len(frontier_B) + len(frontier_A)), BIG, dtype=np.float64)
+    np.fill_diagonal(cost[:, len(frontier_B):], 0.0)
+
+    row_map = {u: i for i, u in enumerate(frontier_A)}
+    for (u, v), score in zip(candidate_pairs, candidate_scores):
+        if u not in row_map or v not in col_map:
+            continue
+        cost[row_map[u], col_map[v]] = -float(score)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+
+    selected = []
+    for r, c in zip(row_ind, col_ind):
+        if c < len(frontier_B) and cost[r, c] < 0:
+            selected.append((int(frontier_A[r]), int(frontier_B[c])))
+    return selected
 
 
 def select_initial_match_component(match_adj, match_scores):
@@ -290,9 +581,37 @@ def select_initial_match_component(match_adj, match_scores):
     return np.array([int(np.argmax(match_scores))], dtype=int)
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
+def extract_continuous_macro_section(
+    sliceA,
+    sliceB,
+    labels_A,
+    labels_B,
+    Pi_cluster,
+    spatial_key='spatial',
+    label_key='cell_type_annot'
+):
     """
-    Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
+    Identify a compact, biologically consistent overlap region from the coarse alignment.
+
+    The procedure intentionally avoids fixed region-size targets and barycentric
+    growth heuristics. It proceeds in two stages:
+
+    1. Seed selection:
+       Candidate cluster-pairs are defined by enrichment above a
+       size-preserving transport null and organized into a match graph. The
+       initial anchor is the strongest triangle, then edge, then singleton.
+
+    2. Coupled frontier expansion:
+       Starting from the seed motif, the method grows both slices jointly on the
+       product graph of admissible cluster-pairs. Only frontier pairs that are
+       simultaneously supported by transport enrichment, local niche similarity,
+       geodesic consistency relative to the already selected anchor, and rigid
+       consistency under the current seed-derived transform are accepted.
+
+    This design prevents the region from drifting into nearby symmetric
+    compartments because expansion is never allowed independently on the two
+    slices and every newly added pair must beat the neutral unmatched
+    alternative in a one-to-one frontier assignment.
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
     
@@ -319,82 +638,63 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             centroids_B[i] = coords_B[mask].mean(axis=0)
             valid_B[i] = True
 
-    # 2. Build Structural Adjacency Matrices for Clusters based on local density interaction radii
-    def build_structural_adjacency(coords, labels, valid_mask):
-        n_clusters = len(valid_mask)
-        adj = np.zeros((n_clusters, n_clusters), dtype=bool)
-        np.fill_diagonal(adj, True)
-        
-        valid_idx = np.where(valid_mask)[0]
-        if len(valid_idx) < 2:
-            return adj
-            
-        centroids = np.zeros((len(valid_idx), 2))
-        kdtries = {}
-        intra_dists = {}
-        
-        # Determine internal neighborhood spacings per cluster
-        for i, c_id in enumerate(valid_idx):
-            c_coords = coords[labels == c_id]
-            centroids[i] = c_coords.mean(axis=0)
-            
-            tree = cKDTree(c_coords)
-            kdtries[c_id] = tree
-            
-            if len(c_coords) > 1:
-                # 99th percentile of internal 1-NN distances dictates natural maximum spacing
-                d, _ = tree.query(c_coords, k=2)
-                intra_dists[c_id] = np.percentile(d[:, 1], 99)
-            else:
-                intra_dists[c_id] = 0.0
+    # 2. Build cluster contact graphs and intrinsic geodesic coordinates
+    adj_A, edge_A = build_cluster_contact_graph(coords_A, labels_A, valid_A)
+    adj_B, edge_B = build_cluster_contact_graph(coords_B, labels_B, valid_B)
 
-        # Centroid Delaunay quickly limits our evaluations to macroscopic topological neighbors
-        if len(valid_idx) >= 3:
-            tri = Delaunay(centroids)
-            candidate_edges = set()
-            for simplex in tri.simplices:
-                for i in range(3):
-                    for j in range(i+1, 3):
-                        u, v = valid_idx[simplex[i]], valid_idx[simplex[j]]
-                        candidate_edges.add((min(u, v), max(u, v)))
-        else:
-            u, v = valid_idx[0], valid_idx[1]
-            candidate_edges = {(min(u, v), max(u, v))}
-            
-        # Parameter-free geometric verification
-        for u, v in candidate_edges:
-            # Minimum physical inter-cluster gap via rapid KD-Tree
-            min_dists, _ = kdtries[u].query(coords[labels == v], k=1)
-            min_gap = np.min(min_dists)
-            
-            # Clusters touch if the gap is smaller than their combined local topological spacing
-            if min_gap <= (intra_dists[u] + intra_dists[v]):
-                adj[u, v] = True
-                adj[v, u] = True
-                
-        return adj
+    edge_A_norm, edge_scale_A = normalize_contact_graph(edge_A)
+    edge_B_norm, edge_scale_B = normalize_contact_graph(edge_B)
+    geodesic_A = compute_graph_geodesics(edge_A_norm)
+    geodesic_B = compute_graph_geodesics(edge_B_norm)
 
-    adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
-    adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
+    # 3. Build biologically grounded cluster context descriptors
+    all_types = np.array(sorted(
+        set(sliceA.obs[label_key].astype(str)) |
+        set(sliceB.obs[label_key].astype(str))
+    ), dtype=str)
+    cluster_hist_A, _ = compute_cluster_cell_type_histograms(
+        sliceA, labels_A, num_clusters_A, label_key=label_key, all_types=all_types
+    )
+    cluster_hist_B, _ = compute_cluster_cell_type_histograms(
+        sliceB, labels_B, num_clusters_B, label_key=label_key, all_types=all_types
+    )
+    context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
+    context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
 
-    # 3. Select cluster-pairs enriched above the size-preserving independence null
+    # 4. Select cluster-pairs enriched above the size-preserving independence null
+    log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
-    positive_flat_idx = np.flatnonzero(mi_contrib > 0)
+    positive_flat_idx = np.flatnonzero(log_enrichment > 0)
     selected_flat_idx = positive_flat_idx[np.argsort(mi_contrib.ravel()[positive_flat_idx])[::-1]]
 
     matches = []
     match_scores = []
+    transport_signal = []
+    context_signal = []
     for idx in selected_flat_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
         if valid_A[u] and valid_B[v]:
             matches.append((u, v))
             match_scores.append(mi_contrib[u, v])
+            transport_signal.append(log_enrichment[u, v])
+
+            concat_A = context_feat_A[u]
+            concat_B = context_feat_B[v]
+            context_signal.append(-jensenshannon(concat_A, concat_B))
             
     num_matches = len(matches)
     if num_matches == 0:
         return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
         
-    # 4. Enforce Structural Similarity & Continuity via Match-Graph
+    # Convert global biological evidence channels into centered log-odds.
+    transport_evidence = empirical_logit_evidence(transport_signal, larger_is_better=True)
+    context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
+    global_pair_evidence = {
+        pair: float(te + ce)
+        for pair, te, ce in zip(matches, transport_evidence, context_evidence)
+    }
+
+    # 5. Enforce Structural Similarity & Continuity via Match-Graph
     # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
     match_adj = np.zeros((num_matches, num_matches), dtype=bool)
     for i in range(num_matches):
@@ -406,10 +706,11 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 match_adj[j, i] = True
 
     match_scores = np.asarray(match_scores, dtype=np.float64)
-    largest_match_indices = select_initial_match_component(match_adj, match_scores)
+    initial_match_indices = select_initial_match_component(match_adj, match_scores)
     
-    strong_A = list(set([matches[i][0] for i in largest_match_indices]))
-    strong_B = list(set([matches[i][1] for i in largest_match_indices]))
+    seed_pairs = [matches[i] for i in initial_match_indices]
+    strong_A = sorted({u for u, _ in seed_pairs})
+    strong_B = sorted({v for _, v in seed_pairs})
     
     core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
     core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
@@ -419,52 +720,121 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
 
     initial_idx_A = core_cells_A.copy()
     initial_idx_B = core_cells_B.copy()
-    
-    # Compute initial barycenters of the starting core components
-    bary_A = np.mean(centroids_A[strong_A], axis=0)
-    bary_B = np.mean(centroids_B[strong_B], axis=0)
 
-    # 5. Determine Target Expansion Size
-    # Target is 1/3 of the clusters of the smaller slice
-    target_count = max(1, int(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))
-    print(f"[HOT] Topological Extension: Expanding until {target_count} clusters are in the strong set.")
+    # 6. Coupled frontier expansion on the product graph of admissible cluster pairs
+    print("[HOT] Coupled frontier expansion: growing only one-to-one frontier matches that beat the unmatched null.")
+    selected_pairs = list(seed_pairs)
+    selected_A = set(strong_A)
+    selected_B = set(strong_B)
+    candidate_pair_set = set(matches)
+    transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
 
-    # 6. Cluster-level Topological Extension
-    while min(len(strong_A), len(strong_B)) < target_count:
-        # Find all topological neighbors of the current strong components
-        neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
-        neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
-        
-        # Exclude clusters already in the strong set
-        candidates_A = [c for c in neighbors_A if c not in strong_A and valid_A[c]]
-        candidates_B = [c for c in neighbors_B if c not in strong_B and valid_B[c]]
-        
-        if not candidates_A or not candidates_B:
-            break
-            
-        # Find the valid matching pair that is closest to the initial barycenters
-        best_pair = None
-        best_dist = float('inf')
-        
-        for pA in candidates_A:
-            for pB in candidates_B:
-                dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
-                dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
-                
-                # We minimize the combined distance to the respective barycenters
-                total_dist = dist_A + dist_B
-                if total_dist < best_dist:
-                    best_dist = total_dist
-                    best_pair = (pA, pB)
-                    
-        # Add the best geometrically compact pair
-        if best_pair is not None:
-            strong_A.append(best_pair[0])
-            strong_B.append(best_pair[1])
-        else:
+    round_idx = 0
+    while True:
+        round_idx += 1
+        frontier_A = {
+            node
+            for node in np.where(np.any(adj_A[list(selected_A), :], axis=0))[0]
+            if valid_A[node] and node not in selected_A
+        }
+        frontier_B = {
+            node
+            for node in np.where(np.any(adj_B[list(selected_B), :], axis=0))[0]
+            if valid_B[node] and node not in selected_B
+        }
+
+        if not frontier_A or not frontier_B:
             break
 
-    # Extract final cells based strictly on expanded cluster membership
+        seed_weights = np.array(
+            [max(mi_contrib[u, v], 1e-12) for u, v in selected_pairs],
+            dtype=np.float64
+        )
+        R_seed, t_seed = fit_weighted_rigid_transform(
+            centroids_A[[u for u, _ in selected_pairs]],
+            centroids_B[[v for _, v in selected_pairs]],
+            weights=seed_weights
+        )
+
+        frontier_pairs = []
+        support_counts = []
+        topology_gaps = []
+        attachment_gaps = []
+        rigid_residuals = []
+
+        selected_us = np.array([u for u, _ in selected_pairs], dtype=int)
+        selected_vs = np.array([v for _, v in selected_pairs], dtype=int)
+
+        for u in sorted(frontier_A):
+            for v in sorted(frontier_B):
+                if (u, v) not in candidate_pair_set:
+                    continue
+
+                support_pairs = [
+                    (su, sv)
+                    for su, sv in selected_pairs
+                    if adj_A[u, su] and adj_B[v, sv]
+                ]
+                if not support_pairs:
+                    continue
+
+                topology_gap = float(np.median(np.abs(
+                    geodesic_A[u, selected_us] - geodesic_B[v, selected_vs]
+                )))
+
+                support_us = np.array([su for su, _ in support_pairs], dtype=int)
+                support_vs = np.array([sv for _, sv in support_pairs], dtype=int)
+                attachment_gap = float(np.median(np.abs(
+                    edge_A_norm[u, support_us] - edge_B_norm[v, support_vs]
+                )))
+
+                rigid_prediction = centroids_A[u] @ R_seed.T + t_seed
+                rigid_residual = float(
+                    np.linalg.norm(centroids_B[v] - rigid_prediction) / transform_scale
+                )
+
+                frontier_pairs.append((u, v))
+                support_counts.append(len(support_pairs))
+                topology_gaps.append(topology_gap)
+                attachment_gaps.append(attachment_gap)
+                rigid_residuals.append(rigid_residual)
+
+        if not frontier_pairs:
+            break
+
+        support_evidence = empirical_logit_evidence(support_counts, larger_is_better=True)
+        topology_evidence = empirical_logit_evidence(topology_gaps, larger_is_better=False)
+        attachment_evidence = empirical_logit_evidence(attachment_gaps, larger_is_better=False)
+        rigid_evidence = empirical_logit_evidence(rigid_residuals, larger_is_better=False)
+
+        frontier_scores = []
+        for pair, se, te, ae, re in zip(
+            frontier_pairs,
+            support_evidence,
+            topology_evidence,
+            attachment_evidence,
+            rigid_evidence
+        ):
+            frontier_scores.append(global_pair_evidence[pair] + float(se + te + ae + re))
+
+        accepted_pairs = solve_frontier_assignment(frontier_A, frontier_B, frontier_pairs, frontier_scores)
+        if not accepted_pairs:
+            break
+
+        for u, v in accepted_pairs:
+            selected_pairs.append((u, v))
+            selected_A.add(u)
+            selected_B.add(v)
+
+        print(f"[HOT] Expansion round {round_idx}: accepted {len(accepted_pairs)} matched frontier pair(s).")
+
+    if round_idx == 1 and len(selected_pairs) == len(seed_pairs):
+        print("[HOT] Expansion terminated at the seed: no frontier pair exceeded the unmatched null.")
+
+    strong_A = sorted(selected_A)
+    strong_B = sorted(selected_B)
+
+    # Extract final cells based strictly on the coupled expansion result
     idx_A = np.where(np.isin(labels_A, strong_A))[0]
     idx_B = np.where(np.isin(labels_B, strong_B))[0]
 

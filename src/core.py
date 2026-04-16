@@ -78,7 +78,8 @@ def hierarchical_pairwise_align(
         labelsA,
         labelsB,
         Pi_cluster,
-        spatial_key=spatial_key
+        spatial_key=spatial_key,
+        label_key=label_key
     )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
