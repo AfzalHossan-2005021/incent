@@ -6,7 +6,7 @@ from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, Delaunay, QhullError
 from scipy.stats import rankdata
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
@@ -65,6 +65,190 @@ def normalized_rank_positions(values):
 
     ranks = rankdata(values, method="average") - 1.0
     return ranks / max(values.size - 1, 1)
+
+
+def weighted_quantile(values, weights, q=0.5):
+    """
+    Weighted quantile with stable behavior under degenerate inputs.
+
+    This is used to derive geometry scales from the data itself rather than from
+    fixed user-facing cutoffs. When the weighted support is too small or
+    numerically unstable, the function falls back to the ordinary unweighted
+    quantile.
+    """
+    values = np.asarray(values, dtype=np.float64).ravel()
+    weights = np.asarray(weights, dtype=np.float64).ravel()
+
+    if values.size == 0:
+        return 0.0
+    if weights.size != values.size or np.sum(weights > 0) == 0:
+        return float(np.quantile(values, q))
+
+    order = np.argsort(values)
+    values = values[order]
+    weights = np.maximum(weights[order], 0.0)
+    cum = np.cumsum(weights)
+    total = float(cum[-1])
+    if total <= 0:
+        return float(np.quantile(values, q))
+
+    target = float(np.clip(q, 0.0, 1.0)) * total
+    idx = int(np.searchsorted(cum, target, side="left"))
+    idx = min(max(idx, 0), values.size - 1)
+    return float(values[idx])
+
+
+def build_planar_contact_graph(coords):
+    """
+    Construct a parameter-light planar contact graph from 2D cell coordinates.
+
+    A Delaunay graph provides a reviewer-friendly notion of local adjacency in a
+    tissue section because it is intrinsic to the sampled geometry and does not
+    require a user-tuned neighborhood radius. If Delaunay triangulation becomes
+    numerically unstable, the function falls back to a small symmetric kNN
+    graph, which preserves locality without introducing long-range bridges.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    n = coords.shape[0]
+    adjacency = [set() for _ in range(n)]
+
+    if n <= 1:
+        return adjacency
+    if n == 2:
+        adjacency[0].add(1)
+        adjacency[1].add(0)
+        return adjacency
+
+    try:
+        tri = Delaunay(coords)
+        for simplex in tri.simplices:
+            simplex = [int(x) for x in simplex]
+            for i in range(len(simplex)):
+                for j in range(i + 1, len(simplex)):
+                    u, v = simplex[i], simplex[j]
+                    adjacency[u].add(v)
+                    adjacency[v].add(u)
+        return adjacency
+    except (QhullError, ValueError):
+        pass
+
+    k_eff = min(7, n)
+    tree = cKDTree(coords)
+    _, nbrs = tree.query(coords, k=k_eff)
+    if nbrs.ndim == 1:
+        nbrs = nbrs[:, None]
+
+    raw = [set() for _ in range(n)]
+    for i in range(n):
+        for j in np.atleast_1d(nbrs[i])[1:]:
+            raw[i].add(int(j))
+
+    for i in range(n):
+        for j in raw[i]:
+            if i in raw[j]:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+    return adjacency
+
+
+def extract_anchor_connected_component(adjacency, seed_idx, evidence):
+    """
+    Keep only the positive-evidence component attached to the biological anchor.
+
+    The overlap evidence is allowed to be soft, but the accepted region remains
+    topologically connected to the trusted anchor motif. This prevents nearby
+    repeated structures from entering the overlap merely because they are
+    geometrically close after a coarse rigid alignment.
+    """
+    n = len(adjacency)
+    if n == 0:
+        return np.array([], dtype=int)
+
+    evidence = np.asarray(evidence, dtype=np.float64)
+    candidate = evidence > 0
+
+    seed_idx = np.asarray(seed_idx, dtype=int)
+    seed_idx = seed_idx[(seed_idx >= 0) & (seed_idx < n)]
+    if seed_idx.size == 0:
+        return np.array([], dtype=int)
+
+    candidate[seed_idx] = True
+
+    visited = np.zeros(n, dtype=bool)
+    stack = [int(i) for i in np.unique(seed_idx).tolist()]
+    while stack:
+        node = stack.pop()
+        if visited[node] or not candidate[node]:
+            continue
+        visited[node] = True
+        for nbr in adjacency[node]:
+            nbr = int(nbr)
+            if candidate[nbr] and not visited[nbr]:
+                stack.append(nbr)
+
+    return np.where(visited)[0]
+
+
+def compute_soft_overlap_evidence(
+    coords_query,
+    coords_ref,
+    anchor_distance,
+    initialization_support,
+    spatial_scale,
+):
+    """
+    Compute a soft overlap evidence field for one slice in the common frame.
+
+    The score combines:
+    1. cross-slice local density in the aligned coordinate system
+    2. compactness relative to the trusted macro anchor
+    3. support from the sparse cell-level initialization
+
+    Each channel is converted to empirical log-odds so the combination stays
+    parameter-light and adapts to the current sample pair instead of depending
+    on hard user-tuned thresholds.
+    """
+    coords_query = np.asarray(coords_query, dtype=np.float64)
+    coords_ref = np.asarray(coords_ref, dtype=np.float64)
+    anchor_distance = np.asarray(anchor_distance, dtype=np.float64)
+    initialization_support = np.asarray(initialization_support, dtype=np.float64)
+
+    if coords_query.shape[0] == 0:
+        return np.array([], dtype=np.float64)
+    if coords_ref.shape[0] == 0:
+        return np.full(coords_query.shape[0], -np.inf, dtype=np.float64)
+
+    k_eff = min(max(4, int(np.ceil(np.log2(max(coords_ref.shape[0], 4))))), coords_ref.shape[0])
+    tree_ref = cKDTree(coords_ref)
+    dists, _ = tree_ref.query(coords_query, k=k_eff)
+    if np.ndim(dists) == 1:
+        dists = dists[:, None]
+
+    kernel_density = np.exp(-(dists ** 2) / (2.0 * max(spatial_scale, 1e-12) ** 2)).mean(axis=1)
+    density_evidence = empirical_logit_evidence(kernel_density, larger_is_better=True)
+    anchor_evidence = empirical_logit_evidence(anchor_distance, larger_is_better=False)
+    support_evidence = empirical_logit_evidence(initialization_support, larger_is_better=True)
+
+    return density_evidence + anchor_evidence + support_evidence
+
+
+def estimate_alignment_residual_scale(coords_A_aligned, coords_B_aligned, pi_init, fallback_scale):
+    """
+    Estimate the geometric residual scale from the sparse initializer support.
+
+    Using the transport-supported residuals makes the fine-stage overlap model
+    adapt to the quality of the coarse initialization. This avoids fixed shadow
+    radii while still giving a stable geometry scale for the final pairwise
+    initialization.
+    """
+    rows, cols = np.nonzero(pi_init > 0)
+    if rows.size == 0:
+        return float(max(fallback_scale, 1e-12))
+
+    residuals = np.linalg.norm(coords_A_aligned[rows] - coords_B_aligned[cols], axis=1)
+    weights = pi_init[rows, cols]
+    data_scale = weighted_quantile(residuals, weights, q=0.75)
+    return float(max(data_scale, fallback_scale, 1e-12))
 
 
 def synthesize_structured_cluster_initialization(
@@ -211,8 +395,8 @@ def hierarchical_pairwise_align(
     and then restricting the cell-level OT matchings to the aligned blocks.
 
     The procedure is intentionally conservative: if the coarse stage cannot
-    identify a trustworthy one-to-one overlap anchor or if the induced overlap
-    shadow is unstable, the function raises an explicit error rather than
+    identify a trustworthy one-to-one overlap anchor or if the induced soft
+    overlap field is unstable, the function raises an explicit error rather than
     silently reverting to full-slice alignment.
     
     Returns the cell-level alignment pi.
@@ -302,74 +486,81 @@ def hierarchical_pairwise_align(
             "trustworthy sparse cell-level initialization."
         )
 
-    print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
+    print("--- [HOT] Step 7: Global Refinement via Soft Overlap Projection ---")
     from .visualize import stack_slices_pairwise
     try:
-        # 1. Geometrically align full slices using the partial block solution
-        aligned_slices = stack_slices_pairwise([sliceA, sliceB], [pi_full], output_params=False)
+        # 1. Geometrically align full slices using the trusted sparse support.
+        # The robust Procrustes options give a more stable common frame for
+        # overlap inference under partial overlap and repeated anatomy, without
+        # changing the transport plan itself.
+        aligned_slices = stack_slices_pairwise(
+            [sliceA, sliceB],
+            [pi_full],
+            output_params=False,
+            pair_weight_mode="mutual",
+            robust_final_fit=True,
+        )
         coords_A_aligned = np.asarray(aligned_slices[0].obsm[spatial_key])
         coords_B_aligned = np.asarray(aligned_slices[1].obsm[spatial_key])
-        
-        # 2. Determine overlapping regions based on Morphological Rasterization (Exact Shadow)
-        # Replaces soft radius (KDTree) or rigid boundaries (Convex Hull) with a grid footprint
-        # capturing the actual boundaries, contours, and internal holes perfectly.
+
+        # 2. Build a soft overlap evidence field and keep only the
+        # anchor-connected component in each slice.
         s_A = estimate_characteristic_spacing(sliceA, spatial_key=spatial_key)
         s_B = estimate_characteristic_spacing(sliceB, spatial_key=spatial_key)
-        grid_size = max(s_A, s_B) * 2.0  # Granularity is roughly 2 cell spaces wide
-        
-        # Compute common coordinate boundaries
-        min_coords = np.minimum(coords_A_aligned.min(axis=0), coords_B_aligned.min(axis=0))
+        residual_scale = estimate_alignment_residual_scale(
+            coords_A_aligned,
+            coords_B_aligned,
+            pi_full,
+            fallback_scale=max(s_A, s_B),
+        )
 
-        # Convert continuous coordinates into discrete grid indices
-        def to_grid(coords):
-            return np.maximum(0, np.floor((coords - min_coords) / grid_size).astype(int))
-            
-        grid_A = to_grid(coords_A_aligned)
-        grid_B = to_grid(coords_B_aligned)
-        
-        # Build 2D occupancy maps
-        max_idx_A = grid_A.max(axis=0)
-        max_idx_B = grid_B.max(axis=0)
-        grid_bounds = np.maximum(max_idx_A, max_idx_B) + 5  # pad for safety
-        
-        from scipy.ndimage import binary_dilation
-        mask_A = np.zeros(grid_bounds, dtype=bool)
-        mask_B = np.zeros(grid_bounds, dtype=bool)
-        
-        mask_A[tuple(grid_A.T)] = True
-        mask_B[tuple(grid_B.T)] = True
-        
-        # Dilate footprint slightly to connect cellular gaps mathematically without bloating the tissue
-        mask_A_dilated = binary_dilation(mask_A, iterations=1)
-        mask_B_dilated = binary_dilation(mask_B, iterations=1)
-        
-        # The exact, topological shadow intersection of both tissues
-        overlap_mask = mask_A_dilated & mask_B_dilated
-        
-        overlap_mask_A = overlap_mask[tuple(grid_A.T)]
-        overlap_mask_B = overlap_mask[tuple(grid_B.T)]
-        
-        if not np.any(overlap_mask_A) or not np.any(overlap_mask_B):
+        row_support = pi_full.sum(axis=1)
+        col_support = pi_full.sum(axis=0)
+
+        overlap_evidence_A = compute_soft_overlap_evidence(
+            coords_A_aligned,
+            coords_B_aligned,
+            dist_A,
+            row_support,
+            residual_scale,
+        )
+        overlap_evidence_B = compute_soft_overlap_evidence(
+            coords_B_aligned,
+            coords_A_aligned,
+            dist_B,
+            col_support,
+            residual_scale,
+        )
+
+        adjacency_A = build_planar_contact_graph(np.asarray(sliceA.obsm[spatial_key], dtype=np.float64))
+        adjacency_B = build_planar_contact_graph(np.asarray(sliceB.obsm[spatial_key], dtype=np.float64))
+
+        idx_A_shadow = extract_anchor_connected_component(adjacency_A, idx_A, overlap_evidence_A)
+        idx_B_shadow = extract_anchor_connected_component(adjacency_B, idx_B, overlap_evidence_B)
+
+        if len(idx_A_shadow) == 0 or len(idx_B_shadow) == 0:
             raise ValueError(
-                "The coarse anchor did not induce a stable overlapping shadow between the two slices."
+                "The coarse anchor did not induce a stable anchor-connected overlap field between the two slices."
             )
-        
-        # 3. Supplying ONLY the shadow slices to the final OT pipeline
-        # Within the shadow, apply decaying weights from the previously matched biological core
-        idx_A_shadow = np.where(overlap_mask_A)[0]
-        idx_B_shadow = np.where(overlap_mask_B)[0]
-        
+
+        # 3. Restrict the final OT to the anchor-connected overlap and
+        # initialize it with a coupled geometry-aware prior.
         sliceA_shadow = sliceA[idx_A_shadow].copy()
         sliceB_shadow = sliceB[idx_B_shadow].copy()
-        
-        # Scaling the decay dynamically based on the width of the shadow
-        sigma_A = max(1e-5, np.max(dist_A[idx_A_shadow]) / 2.0)
-        sigma_B = max(1e-5, np.max(dist_B[idx_B_shadow]) / 2.0)
-        
-        weight_A_shadow = np.exp(- (dist_A[idx_A_shadow]**2) / (2 * sigma_A**2))
-        weight_B_shadow = np.exp(- (dist_B[idx_B_shadow]**2) / (2 * sigma_B**2))
 
-        G_init_shadow = np.outer(weight_A_shadow, weight_B_shadow)
+        weight_A_shadow = np.exp(overlap_evidence_A[idx_A_shadow] - np.max(overlap_evidence_A[idx_A_shadow]))
+        weight_B_shadow = np.exp(overlap_evidence_B[idx_B_shadow] - np.max(overlap_evidence_B[idx_B_shadow]))
+
+        coords_A_shadow_aligned = coords_A_aligned[idx_A_shadow]
+        coords_B_shadow_aligned = coords_B_aligned[idx_B_shadow]
+        geom_residual = euclidean_distances(coords_A_shadow_aligned, coords_B_shadow_aligned)
+        geom_prior = np.exp(-(geom_residual ** 2) / (2.0 * residual_scale ** 2))
+
+        G_init_shadow = geom_prior * np.outer(weight_A_shadow, weight_B_shadow)
+        support_block = pi_full[np.ix_(idx_A_shadow, idx_B_shadow)]
+        support_sum = float(np.sum(support_block))
+        if support_sum > 0:
+            G_init_shadow += support_block / support_sum
         G_init_sum = np.sum(G_init_shadow)
         if G_init_sum > 0:
             G_init_shadow /= G_init_sum
@@ -389,21 +580,25 @@ def hierarchical_pairwise_align(
                 weight_B_full[idx_B_shadow] = weight_B_shadow
                 
                 sc1 = ax1.scatter(ptsA_full[:,0], ptsA_full[:,1], c=weight_A_full, cmap='magma', s=2, alpha=0.9)
-                ax1.set_title("Slice A: Shadow Weights (Core Decaying)")
+                ax1.scatter(ptsA_full[idx_A,0], ptsA_full[idx_A,1], c='cyan', s=2, alpha=0.4, label='Macro Anchor')
+                ax1.set_title("Slice A: Soft Overlap Confidence")
                 ax1.axis('equal')
-                fig.colorbar(sc1, ax=ax1, label='Init Weight Bias')
+                ax1.legend()
+                fig.colorbar(sc1, ax=ax1, label='Overlap Confidence')
                 
                 sc2 = ax2.scatter(ptsB_full[:,0], ptsB_full[:,1], c=weight_B_full, cmap='magma', s=2, alpha=0.9)
-                ax2.set_title("Slice B: Shadow Weights (Core Decaying)")
+                ax2.scatter(ptsB_full[idx_B,0], ptsB_full[idx_B,1], c='cyan', s=2, alpha=0.4, label='Macro Anchor')
+                ax2.set_title("Slice B: Soft Overlap Confidence")
                 ax2.axis('equal')
-                fig.colorbar(sc2, ax=ax2, label='Init Weight Bias')
+                ax2.legend()
+                fig.colorbar(sc2, ax=ax2, label='Overlap Confidence')
                 
-                plt.suptitle("Global Overlap Projection Weights (Exact Shadow + Core Decay)")
+                plt.suptitle("Global Overlap Projection Weights (Soft Anchor-Connected Field)")
                 plt.show()
             except Exception as e:
                 print(f"Overlap weight visualization failed: {e}")
             
-        print(f"--- [HOT] Step 8: Executing Final Base OT on Shadow Portions (A: {len(idx_A_shadow)}, B: {len(idx_B_shadow)}) ---")
+        print(f"--- [HOT] Step 8: Executing Final Base OT on Soft Overlap Portions (A: {len(idx_A_shadow)}, B: {len(idx_B_shadow)}) ---")
         pi_shadow_final = pairwise_align(
             sliceA=sliceA_shadow,
             sliceB=sliceB_shadow,
