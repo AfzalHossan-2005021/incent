@@ -240,24 +240,25 @@ def compute_pairwise_mutual_information_contribution(pi):
     return contrib
 
 
-def select_initial_match_component(matches, match_adj, match_scores):
+def enumerate_initial_match_hypotheses(matches, match_adj, match_scores):
     """
-    Select the strongest initial motif in the match graph.
+    Enumerate all highest-order one-to-one seed hypotheses in the match graph.
 
     Preference order:
-    1) triangle (three mutually adjacent one-to-one matched pairs)
-    2) edge (two adjacent one-to-one matched pairs)
-    3) singleton (single best matched pair)
+    1) triangles
+    2) edges
+    3) singletons
     """
     num_matches = match_adj.shape[0]
     if num_matches == 0:
-        return np.array([], dtype=int)
+        return [], "empty"
 
     match_scores = np.asarray(match_scores, dtype=np.float64)
 
-    # Prefer the strongest triangle clique.
-    best_triangle = None
-    best_triangle_score = -np.inf
+    def make_seed(indices):
+        return tuple(matches[idx] for idx in indices)
+
+    triangles = []
     for i in range(num_matches):
         for j in range(i + 1, num_matches):
             if not match_adj[i, j]:
@@ -268,32 +269,27 @@ def select_initial_match_component(matches, match_adj, match_scores):
                     tri_B = {matches[i][1], matches[j][1], matches[k][1]}
                     if len(tri_A) < 3 or len(tri_B) < 3:
                         continue
-                    score = match_scores[i] + match_scores[j] + match_scores[k]
-                    if score > best_triangle_score:
-                        best_triangle_score = score
-                        best_triangle = np.array([i, j, k], dtype=int)
+                    triangles.append((match_scores[i] + match_scores[j] + match_scores[k], make_seed((i, j, k))))
 
-    if best_triangle is not None:
-        return best_triangle
+    if triangles:
+        triangles.sort(key=lambda x: x[0], reverse=True)
+        return [list(seed) for _, seed in triangles], "triangle"
 
-    # Fall back to the strongest supported edge.
-    best_edge = None
-    best_edge_score = -np.inf
+    edges = []
     for i in range(num_matches):
         for j in range(i + 1, num_matches):
             if match_adj[i, j]:
                 if matches[i][0] == matches[j][0] or matches[i][1] == matches[j][1]:
                     continue
-                score = match_scores[i] + match_scores[j]
-                if score > best_edge_score:
-                    best_edge_score = score
-                    best_edge = np.array([i, j], dtype=int)
+                edges.append((match_scores[i] + match_scores[j], make_seed((i, j))))
 
-    if best_edge is not None:
-        return best_edge
+    if edges:
+        edges.sort(key=lambda x: x[0], reverse=True)
+        return [list(seed) for _, seed in edges], "edge"
 
-    # Final fall back: single best matched pair.
-    return np.array([int(np.argmax(match_scores))], dtype=int)
+    singletons = [(match_scores[i], make_seed((i,))) for i in range(num_matches)]
+    singletons.sort(key=lambda x: x[0], reverse=True)
+    return [list(seed) for _, seed in singletons], "singleton"
 
 
 def fit_rigid_transform(src, tgt):
@@ -446,9 +442,104 @@ def select_next_reciprocal_pair(frontier_A, frontier_B, matched_pairs, adj_A, ad
     return (pA, pB)
 
 
+def evaluate_hypothesis(matched_pairs, centroids_A, centroids_B, mi_contrib):
+    """
+    Evaluate a grown hypothesis for final model selection.
+    """
+    if len(matched_pairs) == 0:
+        return {
+            "num_pairs": 0,
+            "total_mi": -np.inf,
+            "median_residual": np.inf,
+            "mean_residual": np.inf,
+            "residuals": np.zeros(0, dtype=np.float64),
+        }
+
+    aligned_centroids_B, _ = map_sliceB_to_sliceA_frame(centroids_A, centroids_B, matched_pairs)
+    residuals = np.array(
+        [np.linalg.norm(centroids_A[a] - aligned_centroids_B[b]) for a, b in matched_pairs],
+        dtype=np.float64,
+    )
+    total_mi = float(sum(mi_contrib[a, b] for a, b in matched_pairs))
+
+    return {
+        "num_pairs": len(matched_pairs),
+        "total_mi": total_mi,
+        "median_residual": float(np.median(residuals)),
+        "mean_residual": float(np.mean(residuals)),
+        "residuals": residuals,
+    }
+
+
+def hypothesis_sort_key(stats):
+    """
+    Lexicographic ranking for final hypothesis selection.
+    """
+    return (
+        int(stats["num_pairs"]),
+        float(stats["total_mi"]),
+        -float(stats["median_residual"]),
+        -float(stats["mean_residual"]),
+    )
+
+
+def grow_seed_hypothesis(seed_pairs, adj_A, adj_B, centroids_A, centroids_B, mi_contrib, valid_A, valid_B):
+    """
+    Grow one seed hypothesis by reciprocal one-to-one frontier expansion.
+    """
+    matched_pairs = list(seed_pairs)
+    matched_A = {a for a, _ in matched_pairs}
+    matched_B = {b for _, b in matched_pairs}
+
+    stop_reason = "completed"
+    while True:
+        matched_A_list = sorted(matched_A)
+        matched_B_list = sorted(matched_B)
+
+        neighbors_A = np.where(np.any(adj_A[matched_A_list, :], axis=0))[0]
+        neighbors_B = np.where(np.any(adj_B[matched_B_list, :], axis=0))[0]
+
+        frontier_A = [c for c in neighbors_A if valid_A[c] and c not in matched_A]
+        frontier_B = [c for c in neighbors_B if valid_B[c] and c not in matched_B]
+
+        if not frontier_A or not frontier_B:
+            stop_reason = "frontier_exhausted"
+            break
+
+        next_pair = select_next_reciprocal_pair(
+            frontier_A=frontier_A,
+            frontier_B=frontier_B,
+            matched_pairs=matched_pairs,
+            adj_A=adj_A,
+            adj_B=adj_B,
+            centroids_A=centroids_A,
+            centroids_B=centroids_B,
+            mi_contrib=mi_contrib,
+        )
+
+        if next_pair is None:
+            stop_reason = "no_supported_pair"
+            break
+
+        matched_pairs.append(next_pair)
+        matched_A.add(next_pair[0])
+        matched_B.add(next_pair[1])
+
+    stats = evaluate_hypothesis(matched_pairs, centroids_A, centroids_B, mi_contrib)
+    return {
+        "initial_pairs": list(seed_pairs),
+        "matched_pairs": matched_pairs,
+        "matched_A": sorted(matched_A),
+        "matched_B": sorted(matched_B),
+        "stats": stats,
+        "stop_reason": stop_reason,
+    }
+
+
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
     """
-    Identifies a one-to-one, co-contiguous macro-section from the clustering alignment.
+    Identifies a one-to-one, co-contiguous macro-section from the clustering alignment
+    by growing and comparing multiple seed hypotheses.
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
     
@@ -566,65 +657,57 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 match_adj[j, i] = True
 
     match_scores = np.asarray(match_scores, dtype=np.float64)
-    largest_match_indices = select_initial_match_component(matches, match_adj, match_scores)
-    matched_pairs = [matches[i] for i in largest_match_indices]
-    matched_A = {a for a, _ in matched_pairs}
-    matched_B = {b for _, b in matched_pairs}
-    
-    core_cells_A = np.where(np.isin(labels_A, list(matched_A)))[0]
-    core_cells_B = np.where(np.isin(labels_B, list(matched_B)))[0]
+    seed_hypotheses, motif_name = enumerate_initial_match_hypotheses(matches, match_adj, match_scores)
+    if len(seed_hypotheses) == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M), []
 
-    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M), matched_pairs
+    print(f"[HOT] Hypothesis Search: evaluating {len(seed_hypotheses)} {motif_name} seed(s).")
 
-    initial_idx_A = core_cells_A.copy()
-    initial_idx_B = core_cells_B.copy()
-
-    motif_name = {1: "singleton", 2: "edge", 3: "triangle"}.get(len(matched_pairs), "component")
-    print(
-        f"[HOT] Topological Extension: starting from a {motif_name} and extending one-to-one "
-        "until one slice frontier is exhausted or no reciprocal biologically supported pair remains."
-    )
-
-    # 5. Cluster-level one-to-one topological extension in the shared frame
-    while True:
-        matched_A_list = sorted(matched_A)
-        matched_B_list = sorted(matched_B)
-
-        neighbors_A = np.where(np.any(adj_A[matched_A_list, :], axis=0))[0]
-        neighbors_B = np.where(np.any(adj_B[matched_B_list, :], axis=0))[0]
-
-        frontier_A = [c for c in neighbors_A if valid_A[c] and c not in matched_A]
-        frontier_B = [c for c in neighbors_B if valid_B[c] and c not in matched_B]
-
-        if not frontier_A or not frontier_B:
-            print("[HOT] Topological Extension stopped: one slice ran out of unmatched frontier clusters.")
-            break
-
-        next_pair = select_next_reciprocal_pair(
-            frontier_A=frontier_A,
-            frontier_B=frontier_B,
-            matched_pairs=matched_pairs,
+    best_hypothesis = None
+    for seed_pairs in seed_hypotheses:
+        hypothesis = grow_seed_hypothesis(
+            seed_pairs=seed_pairs,
             adj_A=adj_A,
             adj_B=adj_B,
             centroids_A=centroids_A,
             centroids_B=centroids_B,
-            mi_contrib=mi_contrib
+            mi_contrib=mi_contrib,
+            valid_A=valid_A,
+            valid_B=valid_B,
         )
 
-        if next_pair is None:
-            print("[HOT] Topological Extension stopped: no reciprocal, topologically supported, MI-enriched pair remained.")
-            break
+        if best_hypothesis is None or hypothesis_sort_key(hypothesis["stats"]) > hypothesis_sort_key(best_hypothesis["stats"]):
+            best_hypothesis = hypothesis
 
-        matched_pairs.append(next_pair)
-        matched_A.add(next_pair[0])
-        matched_B.add(next_pair[1])
+    matched_pairs = best_hypothesis["matched_pairs"]
+    matched_A = best_hypothesis["matched_A"]
+    matched_B = best_hypothesis["matched_B"]
+    initial_pairs = best_hypothesis["initial_pairs"]
+
+    initial_A = sorted({a for a, _ in initial_pairs})
+    initial_B = sorted({b for _, b in initial_pairs})
+    core_cells_A = np.where(np.isin(labels_A, matched_A))[0]
+    core_cells_B = np.where(np.isin(labels_B, matched_B))[0]
+    initial_idx_A = np.where(np.isin(labels_A, initial_A))[0]
+    initial_idx_B = np.where(np.isin(labels_B, initial_B))[0]
+
+    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), initial_idx_A, initial_idx_B, matched_pairs
+
+    stats = best_hypothesis["stats"]
+    print(
+        f"[HOT] Hypothesis Search winner: {len(initial_pairs)}-pair {motif_name} seed -> "
+        f"{stats['num_pairs']} matched pairs, total MI={stats['total_mi']:.4f}, "
+        f"median residual={stats['median_residual']:.4f}."
+    )
+    if best_hypothesis["stop_reason"] == "frontier_exhausted":
+        print("[HOT] Topological Extension stopped: one slice ran out of unmatched frontier clusters.")
+    elif best_hypothesis["stop_reason"] == "no_supported_pair":
+        print("[HOT] Topological Extension stopped: no reciprocal, topologically supported, MI-enriched pair remained.")
 
     # Extract final cells based strictly on expanded cluster membership
-    final_A = sorted(matched_A)
-    final_B = sorted(matched_B)
-    idx_A = np.where(np.isin(labels_A, final_A))[0]
-    idx_B = np.where(np.isin(labels_B, final_B))[0]
+    idx_A = core_cells_A
+    idx_B = core_cells_B
 
     # Compute physical distances from the newly expanded core to all cells
     core_coords_A = coords_A[idx_A]
