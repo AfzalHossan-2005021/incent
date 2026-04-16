@@ -28,9 +28,7 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         masses: np.ndarray (C,) normalized size of each cluster
         centroids: np.ndarray (C, 2) average spatial coordinate
         mu_expr: np.ndarray (C, D) mean expression/latent vector
-        mu_struct: np.ndarray (C, T * 2) invariant structural descriptor made of
-            per-cell-type abundance (m=0) and bilateral anisotropy magnitude
-            (|m=2|) measured relative to the cluster centroid
+        mu_struct: np.ndarray (C, T * 3) spatial distribution within the cluster itself based on 3 Fourier harmonics of the cell type localization
     """
     coords = adata.obsm[spatial_key]
     n_cells = coords.shape[0]
@@ -58,10 +56,9 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     masses = np.zeros(n_clusters)
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
     centroids = np.zeros((n_clusters, 2))
-
-    # Two invariant channels per cell type:
-    # m=0 abundance and |m=2| bilateral anisotropy magnitude.
-    mu_struct = np.zeros((n_clusters, n_types * 2))
+    
+    # 3 harmonics (m=0, 1, 2) per cell type
+    mu_struct = np.zeros((n_clusters, n_types * 3))
     
     for c_i, c in enumerate(unique_labels):
         mask = (labels == c)
@@ -77,21 +74,24 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             mapped_types = [type_map[t] for t in c_types if t in type_map]
             counts = np.bincount(mapped_types, minlength=n_types).astype(np.float64)
             
-            # --- Invariant intrinsic cluster context ---
-            # Evaluates cell localization relative to the cluster centroid using
-            # abundance and bilateral anisotropy magnitude only.
+            # --- Computed Intrinsic Cluster Fourier Context ---
+            # Evaluates cell localization RELATIVE to the macro-cluster centroid
             rel_coords = coords[mask] - centroids[c_i]
             thetas = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
             
-            local_feat = np.zeros((n_types, 2))
+            local_feat = np.zeros((n_types, 3))
             c_types_idx = np.array(mapped_types)
             
-            local_feat[:, 0] = counts
-
-            ang = 2.0 * thetas
-            real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
-            imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
-            local_feat[:, 1] = np.sqrt(real ** 2 + imag ** 2)
+            for h_idx, m in enumerate([0, 1, 2]):
+                if m == 0:
+                    mag = counts
+                else:
+                    ang = m * thetas
+                    real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
+                    imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
+                    mag = np.hypot(real, imag)
+                    
+                local_feat[:, h_idx] = mag
             
             flat = local_feat.reshape(-1)
             if flat.sum() > 0:
