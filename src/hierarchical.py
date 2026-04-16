@@ -249,7 +249,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     
     total_mass = np.sum(Pi_cluster)
     if total_mass == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
         
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
 
@@ -343,7 +343,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
             
     num_matches = len(matches)
     if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
         
     # 4. Enforce Structural Similarity & Continuity via Match-Graph
     # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
@@ -373,7 +373,10 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
 
     if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), np.arange(N), np.arange(M)
+
+    initial_idx_A = core_cells_A.copy()
+    initial_idx_B = core_cells_B.copy()
     
     # Compute initial barycenters of the starting core components
     bary_A = np.mean(centroids_A[strong_A], axis=0)
@@ -433,5 +436,5 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
     
-    return idx_A, idx_B, dist_A, dist_B
+    return idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B
 

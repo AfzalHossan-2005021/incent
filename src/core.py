@@ -11,7 +11,12 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
 from .hierarchical import extract_cluster_features, compute_cluster_feature_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
-from .visualize import visualize_clustered_slices, visualize_cluster_mapping, visualize_selected_anchors
+from .visualize import (
+    visualize_clustered_slices,
+    visualize_cluster_mapping,
+    visualize_initial_connected_component,
+    visualize_selected_anchors,
+)
 
 
 def hierarchical_pairwise_align(
@@ -67,11 +72,25 @@ def hierarchical_pairwise_align(
 
     # We now prepare the injection into standard cell-level pairwise_align
     print("--- [HOT] Step 5: Extract Continuous Macro Sections ---")
-    idx_A, idx_B, dist_A, dist_B = extract_continuous_macro_section(sliceA, sliceB, labelsA, labelsB, Pi_cluster, spatial_key=spatial_key)
+    idx_A, idx_B, dist_A, dist_B, initial_idx_A, initial_idx_B = extract_continuous_macro_section(
+        sliceA,
+        sliceB,
+        labelsA,
+        labelsB,
+        Pi_cluster,
+        spatial_key=spatial_key
+    )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 
     if visualize_clusters:
+        visualize_initial_connected_component(
+            sliceA,
+            sliceB,
+            initial_idx_A,
+            initial_idx_B,
+            spatial_key=spatial_key
+        )
         visualize_selected_anchors(sliceA, sliceB, idx_A, idx_B, spatial_key=spatial_key, dist_A=dist_A, dist_B=dist_B)
 
     print("--- [HOT] Step 6: Synthesizing Cell-Level Footprint from Macro Clusters ---")

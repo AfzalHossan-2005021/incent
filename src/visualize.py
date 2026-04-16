@@ -551,3 +551,38 @@ def visualize_selected_anchors(
     
     plt.show()
 
+
+def visualize_initial_connected_component(
+    sliceA,
+    sliceB,
+    idx_A,
+    idx_B,
+    spatial_key="spatial"
+):
+    """
+    Visualizes the initially selected connected macro component before later expansion.
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    ptsA = sliceA.obsm[spatial_key]
+    ptsB = sliceB.obsm[spatial_key]
+
+    init_A_mask = np.zeros(sliceA.shape[0], dtype=bool)
+    init_A_mask[idx_A] = True
+    init_B_mask = np.zeros(sliceB.shape[0], dtype=bool)
+    init_B_mask[idx_B] = True
+
+    ax1.scatter(ptsA[:, 0], ptsA[:, 1], c='lightgray', s=4, alpha=0.35, label='All Cells')
+    ax1.scatter(ptsA[init_A_mask, 0], ptsA[init_A_mask, 1], c='crimson', s=5, alpha=0.9, label='Initial Connected Component')
+    ax1.set_title("Slice A: Initial Connected Component")
+    ax1.axis('equal')
+    ax1.legend()
+
+    ax2.scatter(ptsB[:, 0], ptsB[:, 1], c='lightgray', s=4, alpha=0.35, label='All Cells')
+    ax2.scatter(ptsB[init_B_mask, 0], ptsB[init_B_mask, 1], c='crimson', s=5, alpha=0.9, label='Initial Connected Component')
+    ax2.set_title("Slice B: Initial Connected Component")
+    ax2.axis('equal')
+    ax2.legend()
+
+    plt.show()
+
