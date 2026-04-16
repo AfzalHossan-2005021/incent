@@ -5,7 +5,6 @@ import scipy.sparse as sp
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import distance_matrix, Delaunay
-from scipy.sparse.csgraph import connected_components
 from sklearn.metrics.pairwise import cosine_distances
 from scipy.spatial.distance import jensenshannon
 from ot.gromov import fused_unbalanced_gromov_wasserstein
@@ -241,6 +240,56 @@ def compute_pairwise_mutual_information_contribution(pi):
     return contrib
 
 
+def select_initial_match_component(match_adj, match_scores):
+    """
+    Select the strongest initial motif in the match graph.
+
+    Preference order:
+    1) triangle (three mutually adjacent matched pairs)
+    2) edge (two adjacent matched pairs)
+    3) singleton (single best matched pair)
+    """
+    num_matches = match_adj.shape[0]
+    if num_matches == 0:
+        return np.array([], dtype=int)
+
+    match_scores = np.asarray(match_scores, dtype=np.float64)
+
+    # Prefer the strongest triangle clique.
+    best_triangle = None
+    best_triangle_score = -np.inf
+    for i in range(num_matches):
+        for j in range(i + 1, num_matches):
+            if not match_adj[i, j]:
+                continue
+            for k in range(j + 1, num_matches):
+                if match_adj[i, k] and match_adj[j, k]:
+                    score = match_scores[i] + match_scores[j] + match_scores[k]
+                    if score > best_triangle_score:
+                        best_triangle_score = score
+                        best_triangle = np.array([i, j, k], dtype=int)
+
+    if best_triangle is not None:
+        return best_triangle
+
+    # Fall back to the strongest supported edge.
+    best_edge = None
+    best_edge_score = -np.inf
+    for i in range(num_matches):
+        for j in range(i + 1, num_matches):
+            if match_adj[i, j]:
+                score = match_scores[i] + match_scores[j]
+                if score > best_edge_score:
+                    best_edge_score = score
+                    best_edge = np.array([i, j], dtype=int)
+
+    if best_edge is not None:
+        return best_edge
+
+    # Final fall back: single best matched pair.
+    return np.array([int(np.argmax(match_scores))], dtype=int)
+
+
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
     """
     Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
@@ -356,15 +405,8 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 match_adj[i, j] = True
                 match_adj[j, i] = True
 
-    # Find the structurally co-contiguous component with the strongest total enrichment
-    n_comp, comp_labels = connected_components(match_adj, directed=False)
     match_scores = np.asarray(match_scores, dtype=np.float64)
-    component_scores = np.zeros(n_comp, dtype=np.float64)
-    for comp_idx in range(n_comp):
-        component_scores[comp_idx] = match_scores[comp_labels == comp_idx].sum()
-
-    largest = component_scores.argmax()
-    largest_match_indices = np.where(comp_labels == largest)[0]
+    largest_match_indices = select_initial_match_component(match_adj, match_scores)
     
     strong_A = list(set([matches[i][0] for i in largest_match_indices]))
     strong_B = list(set([matches[i][1] for i in largest_match_indices]))
