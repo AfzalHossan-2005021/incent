@@ -217,6 +217,30 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     return pi_samp
 
 
+def compute_pairwise_mutual_information_contribution(pi):
+    """
+    Per-pair mutual-information contribution under a size-preserving independence null.
+
+    Each entry quantifies how much a cluster-pair in the coarse transport plan is
+    enriched above the random coupling induced by the transport marginals.
+    """
+    total_mass = np.sum(pi)
+    if total_mass <= 0:
+        return np.zeros_like(pi, dtype=np.float64)
+
+    P = pi / total_mass
+    row_mass = P.sum(axis=1, keepdims=True)
+    col_mass = P.sum(axis=0, keepdims=True)
+    expected = row_mass @ col_mass
+
+    contrib = np.zeros_like(P, dtype=np.float64)
+    positive_mass = P > 0
+    contrib[positive_mass] = P[positive_mass] * np.log(
+        (P[positive_mass] + 1e-12) / (expected[positive_mass] + 1e-12)
+    )
+    return contrib
+
+
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
     """
     Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
@@ -304,19 +328,18 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     adj_A = build_structural_adjacency(coords_A, labels_A, valid_A)
     adj_B = build_structural_adjacency(coords_B, labels_B, valid_B)
 
-    # 3. Select ENLARGED subset of transport masses
-    flat_pi = Pi_cluster.flatten()
-    sorted_idx = np.argsort(flat_pi)[::-1]
-    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
-    
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass)
-    selected_flat_idx = sorted_idx[:cutoff_idx+1]
-    
+    # 3. Select cluster-pairs enriched above the size-preserving independence null
+    mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
+    positive_flat_idx = np.flatnonzero(mi_contrib > 0)
+    selected_flat_idx = positive_flat_idx[np.argsort(mi_contrib.ravel()[positive_flat_idx])[::-1]]
+
     matches = []
+    match_scores = []
     for idx in selected_flat_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
         if valid_A[u] and valid_B[v]:
             matches.append((u, v))
+            match_scores.append(mi_contrib[u, v])
             
     num_matches = len(matches)
     if num_matches == 0:
@@ -333,9 +356,14 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 match_adj[i, j] = True
                 match_adj[j, i] = True
 
-    # Find the largest Structurally Co-Contiguous Component
+    # Find the structurally co-contiguous component with the strongest total enrichment
     n_comp, comp_labels = connected_components(match_adj, directed=False)
-    largest = np.bincount(comp_labels).argmax()
+    match_scores = np.asarray(match_scores, dtype=np.float64)
+    component_scores = np.zeros(n_comp, dtype=np.float64)
+    for comp_idx in range(n_comp):
+        component_scores[comp_idx] = match_scores[comp_labels == comp_idx].sum()
+
+    largest = component_scores.argmax()
     largest_match_indices = np.where(comp_labels == largest)[0]
     
     strong_A = list(set([matches[i][0] for i in largest_match_indices]))
