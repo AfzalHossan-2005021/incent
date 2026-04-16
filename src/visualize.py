@@ -16,6 +16,9 @@ def generalized_procrustes_analysis(
     matrix=False,
     allow_reflection=True,
     topk=None,
+    pair_weight_mode="row_mass",
+    robust_final_fit=False,
+    robust_max_iter=5,
     eps=1e-12,
 ):
     """
@@ -46,6 +49,19 @@ def generalized_procrustes_analysis(
     topk : int or None
         Number of target candidates kept per source row.
         If None, chosen automatically.
+    pair_weight_mode : {"row_mass", "mutual"}
+        How hard matched pairs are weighted in the final rigid fit.
+        ``"row_mass"`` preserves the historical behavior. ``"mutual"`` uses
+        transport mass times mutual row/column support and is more robust for
+        visualization under partial overlap and repeated structures.
+    robust_final_fit : bool
+        If ``True``, refine the final rigid transform with adaptive
+        residual-based reweighting. This is useful for visualization because it
+        reduces barycentric averaging from ambiguous correspondences without
+        changing the transport plan itself.
+    robust_max_iter : int
+        Maximum number of adaptive reweighting iterations used when
+        ``robust_final_fit=True``.
     eps : float
         Small numerical constant.
 
@@ -142,6 +158,55 @@ def generalized_procrustes_analysis(
         t_ = my - R_ @ mx
         return R_, t_, mx, my
 
+    def _fit_pairs_rigid_adaptive(Xm, Ym, w=None, allow_reflection_=True, max_iter_=5):
+        """
+        Adaptively reweight matched pairs by their rigid residuals.
+
+        This uses a scale-free Cauchy-like M-estimator where the residual scale
+        is re-estimated from the current fit by a robust median/MAD summary.
+        The procedure is parameter-light and intended for display transforms,
+        where a few ambiguous soft matches can otherwise pull the final overlay
+        toward an average of competing anatomical hypotheses.
+        """
+        if Xm.shape[0] == 0:
+            raise ValueError("No matched pairs found for rigid fit.")
+
+        if w is None:
+            base_w = np.ones(Xm.shape[0], dtype=float)
+        else:
+            base_w = np.asarray(w, dtype=float)
+
+        if Xm.shape[0] < 3 or max_iter_ <= 0:
+            return _fit_pairs_rigid(Xm, Ym, w=base_w, allow_reflection_=allow_reflection_)
+
+        cur_w = np.maximum(base_w, eps)
+        prev_w = None
+        best = None
+
+        for _ in range(max_iter_):
+            R_, t_, mx, my = _fit_pairs_rigid(
+                Xm,
+                Ym,
+                w=cur_w,
+                allow_reflection_=allow_reflection_,
+            )
+            resid = np.linalg.norm(Xm @ R_.T + t_ - Ym, axis=1)
+            med = float(np.median(resid))
+            mad = float(np.median(np.abs(resid - med)))
+            scale = max(med, 1.4826 * mad, eps)
+
+            robust_w = 1.0 / (1.0 + (resid / scale) ** 2)
+            cur_w = np.maximum(base_w * robust_w, eps)
+            best = (R_, t_, mx, my)
+
+            if prev_w is not None and np.allclose(cur_w, prev_w, rtol=1e-3, atol=1e-6):
+                break
+            prev_w = cur_w.copy()
+
+        if best is None:
+            return _fit_pairs_rigid(Xm, Ym, w=base_w, allow_reflection_=allow_reflection_)
+        return best
+
     # ------------------------------------------------------------------
     # 1) Coarse soft rigid fit from full pi
     # ------------------------------------------------------------------
@@ -156,6 +221,7 @@ def generalized_procrustes_analysis(
     # ------------------------------------------------------------------
     n, m = pi.shape
     row_mass = pi.sum(axis=1)
+    col_mass = pi.sum(axis=0)
     active_rows = np.where(row_mass > eps)[0]
 
     if len(active_rows) < 2:
@@ -235,7 +301,13 @@ def generalized_procrustes_analysis(
         i = int(active_rows[r])
         j = int(all_real_cols[c])
         pairs.append((i, j))
-        weights.append(row_mass[i])
+        if pair_weight_mode == "mutual":
+            pij = float(pi[i, j])
+            row_support = pij / max(row_mass[i], eps)
+            col_support = pij / max(col_mass[j], eps)
+            weights.append(max(pij * np.sqrt(row_support * col_support), eps))
+        else:
+            weights.append(row_mass[i])
 
     # ------------------------------------------------------------------
     # 3) Final rigid fit on hard support only
@@ -245,12 +317,21 @@ def generalized_procrustes_analysis(
         tgt_idx = np.array([j for _, j in pairs], dtype=int)
         w = np.asarray(weights, dtype=float)
 
-        R, t, src_center, _ = _fit_pairs_rigid(
-            X[src_idx],
-            Y[tgt_idx],
-            w=w,
-            allow_reflection_=allow_reflection,
-        )
+        if robust_final_fit:
+            R, t, src_center, _ = _fit_pairs_rigid_adaptive(
+                X[src_idx],
+                Y[tgt_idx],
+                w=w,
+                allow_reflection_=allow_reflection,
+                max_iter_=robust_max_iter,
+            )
+        else:
+            R, t, src_center, _ = _fit_pairs_rigid(
+                X[src_idx],
+                Y[tgt_idx],
+                w=w,
+                allow_reflection_=allow_reflection,
+            )
     else:
         R, t, src_center = R0, t0, src_center0
 
@@ -270,7 +351,8 @@ def stack_slices_pairwise(
     slices: List[AnnData],
     pis: List[np.ndarray],
     output_params: bool = False,
-    matrix: bool = False
+    matrix: bool = False,
+    **procrustes_kwargs,
 ) -> Tuple[List[AnnData], Optional[List[float]], Optional[List[np.ndarray]]]:
     """
     Align spatial coordinates of sequential pairwise slices.
@@ -278,6 +360,9 @@ def stack_slices_pairwise(
     This function anchors all slices to the coordinate system of slices[0].
     Transformations are accumulated through the stack sequentially:
     slices[1] -> slices[0], then slices[2] -> slices[1] (now in 0's space), etc.
+    Additional keyword arguments are forwarded to
+    ``generalized_procrustes_analysis`` so callers can opt into more robust
+    display-time transforms without affecting the transport matrices.
     """
     assert len(slices) == len(pis) + 1, "'slices' should have length one more than 'pis'. Please double check."
     assert len(slices) > 1, "You should have at least 2 layers."
@@ -294,7 +379,8 @@ def stack_slices_pairwise(
             X_aligned, _ = generalized_procrustes_analysis(
                 slices[i+1].obsm['spatial'], 
                 new_coor[i], 
-                pis[i].T
+                pis[i].T,
+                **procrustes_kwargs,
             )
             new_coor.append(X_aligned)
         else:
@@ -303,7 +389,8 @@ def stack_slices_pairwise(
                 new_coor[i], 
                 pis[i].T,
                 output_params=output_params, 
-                matrix=matrix
+                matrix=matrix,
+                **procrustes_kwargs,
             )
             new_coor.append(X_aligned)
             thetas.append(theta)
@@ -327,12 +414,25 @@ def visualize_alignment(
     spatial_key: str = "spatial",
     alpha: float = 0.5,
     s: float = 1.0,
-    colors: list = None
+    colors: list = None,
+    robust_display: bool = True,
 ):
     """
-    Visualizes the 2D alignment of multiple sequential slices after Procrustes refinement.
+    Visualizes the 2D alignment of multiple sequential slices after rigid refinement.
+
+    By default, the displayed transform uses a more robust final fit than the
+    historical pipeline default. This improves visual overlays under partial
+    overlap and repeated anatomy by downweighting ambiguous correspondences
+    while leaving the underlying transport matrices unchanged.
     """
-    new_slices = stack_slices_pairwise(slices, pis)
+    procrustes_kwargs = {}
+    if robust_display:
+        procrustes_kwargs = {
+            "pair_weight_mode": "mutual",
+            "robust_final_fit": True,
+        }
+
+    new_slices = stack_slices_pairwise(slices, pis, **procrustes_kwargs)
     n_slices = len(new_slices)
 
     if colors is None:
@@ -369,7 +469,8 @@ def visualize_3d_stack(
     z_spacing: float = 10.0,
     point_size: float = 2.0,
     alpha: float = 0.5,
-    colors: list = None
+    colors: list = None,
+    robust_display: bool = True,
 ):
     """
     Renders a 3D scatter plot of sequentially aligned spatial transcriptomics slices.
@@ -381,6 +482,8 @@ def visualize_3d_stack(
         point_size: Global scatter plot point size.
         alpha: Transparency of the points.
         colors: Optional list of hex/named colors for each slice. If None, uses a colorful colormap.
+        robust_display: If True, use the robust display-time rigid refinement
+            when stacking slices for visualization.
     """
     import matplotlib.pyplot as plt
     try:
@@ -391,7 +494,18 @@ def visualize_3d_stack(
     
         # Step 2: Global geometric assembly using the Procrustes chain
     print("\n--- Assembling Global Coordinate Stack ---")
-    aligned_slices = stack_slices_pairwise(slices, pi_matrices, output_params=False)
+    procrustes_kwargs = {}
+    if robust_display:
+        procrustes_kwargs = {
+            "pair_weight_mode": "mutual",
+            "robust_final_fit": True,
+        }
+    aligned_slices = stack_slices_pairwise(
+        slices,
+        pi_matrices,
+        output_params=False,
+        **procrustes_kwargs,
+    )
 
     n_slices = len(aligned_slices)
     if n_slices < 1:
