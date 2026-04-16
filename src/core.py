@@ -93,6 +93,16 @@ def hierarchical_pairwise_align(
     dist_B = macro_section.dist_B
     initial_idx_A = macro_section.initial_idx_A
     initial_idx_B = macro_section.initial_idx_B
+    if macro_section.ambiguous:
+        print(
+            "[HOT] Warning: the initial macro seed remained ambiguous. "
+            f"Evidence ratio={macro_section.diagnostics.get('seed_evidence_ratio')}."
+        )
+        if macro_section.alternative_hypotheses:
+            print(
+                "[HOT] Stored competing macro-overlap hypotheses: "
+                f"{len(macro_section.alternative_hypotheses)}."
+            )
     
     print(f"Selected {len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B.")
 

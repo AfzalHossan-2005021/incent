@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import scipy.sparse as sp
+import warnings
 
 from dataclasses import dataclass, field
 from scipy.optimize import linear_sum_assignment
@@ -11,6 +12,16 @@ from sklearn.metrics.pairwise import cosine_distances
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
+
+
+class AmbiguousAlignmentWarning(UserWarning):
+    """
+    Raised when two or more macro-overlap seeds are nearly indistinguishable.
+
+    Exact symmetries are not identifiable from symmetric observations alone, so
+    the correct scientific behavior is to flag the ambiguity rather than hide
+    it behind arbitrary tie-breaking.
+    """
 
 
 @dataclass
@@ -31,6 +42,7 @@ class MacroSectionResult:
     initial_idx_B: np.ndarray
     seed_pairs: list[tuple[int, int]] = field(default_factory=list)
     selected_pairs: list[tuple[int, int]] = field(default_factory=list)
+    alternative_hypotheses: list[dict[str, object]] = field(default_factory=list)
     diagnostics: dict[str, object] = field(default_factory=dict)
     reason: str = ""
 
@@ -41,6 +53,10 @@ class MacroSectionResult:
             and self.idx_B.size > 0
             and len(self.selected_pairs) > 0
         )
+
+    @property
+    def ambiguous(self) -> bool:
+        return bool(self.diagnostics.get("seed_ambiguity_detected", False))
 
 
 def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X_pca", label_key="cell_type_annot", all_types=None) -> tuple:
@@ -59,7 +75,9 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
         masses: np.ndarray (C,) normalized size of each cluster
         centroids: np.ndarray (C, 2) average spatial coordinate
         mu_expr: np.ndarray (C, D) mean expression/latent vector
-        mu_struct: np.ndarray (C, T * 3) spatial distribution within the cluster itself based on 3 Fourier harmonics of the cell type localization
+        mu_struct: np.ndarray (C, K) concatenation of:
+            1. intrinsic within-cluster cell-type Fourier summaries
+            2. cluster-centered global tissue morphology descriptors
     """
     coords = adata.obsm[spatial_key]
     n_cells = coords.shape[0]
@@ -88,8 +106,8 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
     mu_expr = np.zeros((n_clusters, expr.shape[1]))
     centroids = np.zeros((n_clusters, 2))
     
-    # 3 harmonics (m=0, 1, 2) per cell type
-    mu_struct = np.zeros((n_clusters, n_types * 3))
+    # 3 harmonics (m=0, 1, 2) per cell type for the intrinsic cluster summary
+    mu_struct_local = np.zeros((n_clusters, n_types * 3))
     
     for c_i, c in enumerate(unique_labels):
         mask = (labels == c)
@@ -127,8 +145,11 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             flat = local_feat.reshape(-1)
             if flat.sum() > 0:
                 flat /= flat.sum()
-            mu_struct[c_i, :] = flat
-            
+            mu_struct_local[c_i, :] = flat
+
+    global_shape = compute_cluster_global_shape_features(coords, centroids)
+    mu_struct = np.concatenate([mu_struct_local, global_shape], axis=1)
+
     return masses, centroids, mu_expr, mu_struct
 
 
@@ -507,7 +528,64 @@ def empirical_logit_evidence(values, larger_is_better=True):
     return np.log(p) - np.log1p(-p)
 
 
-def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
+def equal_area_ring_edges(max_radius, n_rings):
+    """
+    Equal-area radial bins for global tissue-shape summaries.
+    """
+    max_radius = max(float(max_radius), 1e-12)
+    return max_radius * np.sqrt(np.linspace(0.0, 1.0, int(n_rings) + 1))
+
+
+def compute_cluster_global_shape_features(coords, centroids, n_rings=6, harmonics=(0, 1, 2)):
+    """
+    Compute a cluster-centered, full-tissue morphology descriptor.
+
+    For each cluster centroid, the descriptor summarizes the distribution of all
+    tissue cells around that centroid using equal-area radial bins and
+    low-order angular harmonic magnitudes. This acts as a global morphology cue
+    that can distinguish practically symmetric regions whenever the overall
+    tissue support or crop boundaries break the symmetry.
+
+    The descriptor is rotation- and reflection-invariant because only harmonic
+    magnitudes are retained.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    centroids = np.asarray(centroids, dtype=np.float64)
+    if coords.shape[0] == 0 or centroids.shape[0] == 0:
+        return np.zeros((centroids.shape[0], int(n_rings) * len(harmonics)), dtype=np.float64)
+
+    tissue_center = np.mean(coords, axis=0)
+    tissue_radius = np.percentile(np.linalg.norm(coords - tissue_center, axis=1), 99)
+    max_radius = max(2.0 * tissue_radius, 1e-12)
+    ring_edges = equal_area_ring_edges(max_radius, n_rings)
+
+    features = np.zeros((centroids.shape[0], int(n_rings) * len(harmonics)), dtype=np.float64)
+    for i, center in enumerate(centroids):
+        rel = coords - center
+        dist = np.linalg.norm(rel, axis=1)
+        ang = np.arctan2(rel[:, 1], rel[:, 0])
+        ring_idx = np.clip(np.digitize(dist, ring_edges[1:], right=True), 0, int(n_rings) - 1)
+
+        local = np.zeros((int(n_rings), len(harmonics)), dtype=np.float64)
+        for h_pos, m in enumerate(harmonics):
+            if m == 0:
+                mag = np.bincount(ring_idx, minlength=int(n_rings)).astype(np.float64)
+            else:
+                phase = float(m) * ang
+                real = np.bincount(ring_idx, weights=np.cos(phase), minlength=int(n_rings))
+                imag = np.bincount(ring_idx, weights=np.sin(phase), minlength=int(n_rings))
+                mag = np.hypot(real, imag)
+            local[:, h_pos] = mag
+
+        flat = local.reshape(-1)
+        if flat.sum() > 0:
+            flat /= flat.sum()
+        features[i] = flat
+
+    return features
+
+
+def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B, global_shape_A, global_shape_B):
     """
     Assemble transport-supported cluster pairs and their global evidence.
 
@@ -518,6 +596,11 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     supports them. This prevents the macro-section from freezing after one or
     two clusters simply because the coarse transport mass was split across a
     nearby symmetric alternative.
+
+    In addition to transport enrichment and local niche context, the global
+    evidence includes a cluster-centered full-tissue morphology descriptor. This
+    provides a global spatial cue that can break practical symmetries when the
+    larger tissue support is not perfectly symmetric.
     """
     log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
@@ -528,7 +611,7 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
             "num_positive_mass_pairs": 0,
             "num_enriched_pairs": 0,
         }
-        return [], np.zeros(0), {}, mi_contrib, log_enrichment, diagnostics
+        return [], np.zeros(0), np.zeros(0), {}, mi_contrib, log_enrichment, diagnostics
 
     sorted_idx = positive_mass_flat_idx[np.argsort(mi_contrib.ravel()[positive_mass_flat_idx])[::-1]]
 
@@ -536,6 +619,7 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     mi_signal = []
     enrichment_signal = []
     context_signal = []
+    global_shape_signal = []
 
     for idx in sorted_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
@@ -553,24 +637,35 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         else:
             context_signal.append(float(-jensenshannon(feat_A, feat_B)))
 
+        shape_A = global_shape_A[u]
+        shape_B = global_shape_B[v]
+        if shape_A.sum() <= 0 and shape_B.sum() <= 0:
+            global_shape_signal.append(0.0)
+        else:
+            global_shape_signal.append(float(-jensenshannon(shape_A, shape_B)))
+
     mi_signal = np.asarray(mi_signal, dtype=np.float64)
     enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
     context_signal = np.asarray(context_signal, dtype=np.float64)
+    global_shape_signal = np.asarray(global_shape_signal, dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
     enrichment_evidence = empirical_logit_evidence(enrichment_signal, larger_is_better=True)
     context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
+    shape_evidence = empirical_logit_evidence(global_shape_signal, larger_is_better=True)
 
     global_pair_evidence = {
-        pair: float(me + ee + ce)
-        for pair, me, ee, ce in zip(matches, mi_evidence, enrichment_evidence, context_evidence)
+        pair: float(me + ee + ce + se)
+        for pair, me, ee, ce, se in zip(matches, mi_evidence, enrichment_evidence, context_evidence, shape_evidence)
     }
+    global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
+        "global_shape_descriptor_dim": int(global_shape_A.shape[1]),
     }
-    return matches, mi_signal, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
+    return matches, mi_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
 
 def score_frontier_matches(
@@ -850,6 +945,7 @@ def materialize_macro_section_result(
     seed_pairs,
     selected_pairs,
     diagnostics,
+    alternative_hypotheses=None,
 ):
     """
     Convert the selected matched cluster pairs into cell indices and core distances.
@@ -890,9 +986,116 @@ def materialize_macro_section_result(
         initial_idx_B=initial_idx_B,
         seed_pairs=list(seed_pairs),
         selected_pairs=list(selected_pairs),
+        alternative_hypotheses=[] if alternative_hypotheses is None else list(alternative_hypotheses),
         diagnostics=diagnostics,
         reason="ok",
     )
+
+
+def summarize_macro_hypothesis(
+    labels_A,
+    labels_B,
+    seed_pairs,
+    selected_pairs,
+    score=None,
+    diagnostics=None,
+):
+    """
+    Summarize a macro-overlap hypothesis for downstream inspection/reporting.
+
+    The summary is intentionally lightweight: it exposes the matched cluster
+    pairs and the induced cell subsets without duplicating distance fields.
+    """
+    idx_A = np.where(np.isin(labels_A, sorted({u for u, _ in selected_pairs})))[0]
+    idx_B = np.where(np.isin(labels_B, sorted({v for _, v in selected_pairs})))[0]
+    initial_idx_A = np.where(np.isin(labels_A, sorted({u for u, _ in seed_pairs})))[0]
+    initial_idx_B = np.where(np.isin(labels_B, sorted({v for _, v in seed_pairs})))[0]
+
+    return {
+        "score": None if score is None else float(score),
+        "seed_pairs": list(seed_pairs),
+        "selected_pairs": list(selected_pairs),
+        "idx_A": idx_A,
+        "idx_B": idx_B,
+        "initial_idx_A": initial_idx_A,
+        "initial_idx_B": initial_idx_B,
+        "diagnostics": {} if diagnostics is None else dict(diagnostics),
+    }
+
+
+def solve_seed_assignment(matches, pair_scores):
+    """
+    Compute a deterministic one-to-one seed candidate set by maximum evidence matching.
+
+    This avoids arbitrary seed selection when several cluster pairs have similar
+    support. The assignment does not force every cluster to match: each source
+    cluster receives a private dummy option with zero evidence.
+    """
+    if len(matches) == 0:
+        return np.array([], dtype=int)
+
+    pair_scores = np.asarray(pair_scores, dtype=np.float64)
+    nodes_A = np.array(sorted({u for u, _ in matches}), dtype=int)
+    nodes_B = np.array(sorted({v for _, v in matches}), dtype=int)
+    row_map = {u: i for i, u in enumerate(nodes_A)}
+    col_map = {v: i for i, v in enumerate(nodes_B)}
+
+    BIG = 1e9
+    cost = np.full((len(nodes_A), len(nodes_B) + len(nodes_A)), BIG, dtype=np.float64)
+    np.fill_diagonal(cost[:, len(nodes_B):], 0.0)
+
+    match_to_index = {}
+    for idx, ((u, v), score) in enumerate(zip(matches, pair_scores)):
+        cost[row_map[u], col_map[v]] = min(cost[row_map[u], col_map[v]], -float(score))
+        match_to_index[(u, v)] = idx
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    selected = []
+    for r, c in zip(row_ind, col_ind):
+        if c < len(nodes_B) and cost[r, c] < 0:
+            pair = (int(nodes_A[r]), int(nodes_B[c]))
+            selected.append(match_to_index[pair])
+
+    return np.array(sorted(selected), dtype=int)
+
+
+def rank_seed_motifs(match_adj, match_scores, allowed_indices):
+    """
+    Enumerate admissible seed motifs in deterministic score order.
+
+    The motif preference remains triangle > edge > singleton, but motif
+    candidates are restricted to a globally consistent one-to-one assignment.
+    """
+    allowed_indices = np.array(sorted(set(int(x) for x in allowed_indices)), dtype=int)
+    if allowed_indices.size == 0:
+        return {}
+
+    allowed = set(allowed_indices.tolist())
+    ranked = {3: [], 2: [], 1: []}
+
+    for i in allowed_indices:
+        ranked[1].append((float(match_scores[i]), (int(i),)))
+
+    for i_pos, i in enumerate(allowed_indices):
+        for j in allowed_indices[i_pos + 1:]:
+            if match_adj[i, j]:
+                ranked[2].append((float(match_scores[i] + match_scores[j]), tuple(sorted((int(i), int(j))))))
+
+    for i_pos, i in enumerate(allowed_indices):
+        for j_pos in range(i_pos + 1, allowed_indices.size):
+            j = int(allowed_indices[j_pos])
+            if not match_adj[i, j]:
+                continue
+            for k in allowed_indices[j_pos + 1:]:
+                if k in allowed and match_adj[i, k] and match_adj[j, k]:
+                    ranked[3].append((
+                        float(match_scores[i] + match_scores[j] + match_scores[k]),
+                        tuple(sorted((int(i), int(j), int(k))))
+                    ))
+
+    for motif_size in ranked:
+        ranked[motif_size].sort(key=lambda item: (-item[0], item[1]))
+    return ranked
 
 
 def solve_frontier_assignment(frontier_A, frontier_B, candidate_pairs, candidate_scores):
@@ -930,54 +1133,87 @@ def solve_frontier_assignment(frontier_A, frontier_B, candidate_pairs, candidate
     return selected
 
 
-def select_initial_match_component(match_adj, match_scores):
+def select_initial_match_component(matches, match_adj, match_scores):
     """
     Select the strongest initial motif in the match graph.
 
-    Preference order:
-    1) triangle (three mutually adjacent matched pairs)
-    2) edge (two adjacent matched pairs)
-    3) singleton (single best matched pair)
+    The seed is chosen in two steps:
+    1. compute a deterministic one-to-one assignment over candidate cluster
+       pairs using their global evidence scores
+    2. within that assignment, choose the highest-scoring connected triangle,
+       else edge, else singleton
+
+    Exact or near-exact ties are reported in the returned diagnostics rather
+    than silently broken by iteration order.
     """
-    num_matches = match_adj.shape[0]
-    if num_matches == 0:
-        return np.array([], dtype=int)
+    if len(matches) == 0 or match_adj.shape[0] == 0:
+        return np.array([], dtype=int), {
+            "seed_assignment_count": 0,
+            "seed_candidate_count": 0,
+        }
 
     match_scores = np.asarray(match_scores, dtype=np.float64)
+    assigned_indices = solve_seed_assignment(matches, match_scores)
+    if assigned_indices.size == 0:
+        assigned_indices = np.arange(len(matches), dtype=int)
+        assignment_mode = "fallback_all_candidates"
+    else:
+        assignment_mode = "stable_one_to_one"
 
-    # Prefer the strongest triangle clique.
-    best_triangle = None
-    best_triangle_score = -np.inf
-    for i in range(num_matches):
-        for j in range(i + 1, num_matches):
-            if not match_adj[i, j]:
-                continue
-            for k in range(j + 1, num_matches):
-                if match_adj[i, k] and match_adj[j, k]:
-                    score = match_scores[i] + match_scores[j] + match_scores[k]
-                    if score > best_triangle_score:
-                        best_triangle_score = score
-                        best_triangle = np.array([i, j, k], dtype=int)
+    ranked = rank_seed_motifs(match_adj, match_scores, assigned_indices)
+    chosen_size = None
+    chosen_records = []
+    for motif_size in (3, 2, 1):
+        if ranked.get(motif_size):
+            chosen_size = motif_size
+            chosen_records = ranked[motif_size]
+            break
 
-    if best_triangle is not None:
-        return best_triangle
+    if chosen_size is None or not chosen_records:
+        return np.array([], dtype=int), {
+            "seed_assignment_count": int(assigned_indices.size),
+            "seed_candidate_count": 0,
+            "seed_assignment_mode": assignment_mode,
+        }
 
-    # Fall back to the strongest supported edge.
-    best_edge = None
-    best_edge_score = -np.inf
-    for i in range(num_matches):
-        for j in range(i + 1, num_matches):
-            if match_adj[i, j]:
-                score = match_scores[i] + match_scores[j]
-                if score > best_edge_score:
-                    best_edge_score = score
-                    best_edge = np.array([i, j], dtype=int)
+    best_score, best_indices = chosen_records[0]
+    second_score = chosen_records[1][0] if len(chosen_records) > 1 else -np.inf
+    second_indices = chosen_records[1][1] if len(chosen_records) > 1 else tuple()
 
-    if best_edge is not None:
-        return best_edge
+    motif_scores = np.array([score for score, _ in chosen_records], dtype=np.float64)
+    unique_scores = np.unique(motif_scores)
+    positive_gaps = np.diff(np.sort(unique_scores))
+    positive_gaps = positive_gaps[positive_gaps > 0]
+    score_resolution = float(np.min(positive_gaps)) if positive_gaps.size > 0 else 0.0
 
-    # Final fall back: single best matched pair.
-    return np.array([int(np.argmax(match_scores))], dtype=int)
+    if np.isfinite(second_score):
+        score_gap = float(best_score - second_score)
+        score_ratio = float(np.exp(score_gap))
+        ambiguity_detected = bool(
+            np.isclose(best_score, second_score, rtol=1e-6, atol=1e-8)
+            or score_gap <= max(score_resolution, 1e-12)
+        )
+    else:
+        score_gap = np.inf
+        score_ratio = np.inf
+        ambiguity_detected = False
+
+    diagnostics = {
+        "seed_assignment_count": int(assigned_indices.size),
+        "seed_candidate_count": int(len(chosen_records)),
+        "seed_assignment_mode": assignment_mode,
+        "seed_motif_size": int(chosen_size),
+        "seed_best_score": float(best_score),
+        "seed_second_score": float(second_score) if np.isfinite(second_score) else None,
+        "seed_log_evidence_gap": float(score_gap) if np.isfinite(score_gap) else None,
+        "seed_evidence_ratio": float(score_ratio) if np.isfinite(score_ratio) else None,
+        "seed_score_resolution": float(score_resolution),
+        "seed_ambiguity_detected": ambiguity_detected,
+        "seed_best_indices": list(best_indices),
+        "seed_second_indices": list(second_indices),
+        "seed_assignment_pairs": [matches[i] for i in assigned_indices.tolist()],
+    }
+    return np.array(best_indices, dtype=int), diagnostics
 
 
 def extract_continuous_macro_section(
@@ -996,10 +1232,11 @@ def extract_continuous_macro_section(
     growth heuristics. It proceeds in two stages:
 
     1. Seed selection:
-       Transport-supported cluster-pairs are ranked by mutual-information
-       contribution above a size-preserving transport null and organized into a
-       match graph. The initial anchor is the strongest triangle, then edge,
-       then singleton.
+       Transport-supported cluster-pairs are scored by transport enrichment,
+       local niche context, and a cluster-centered global morphology descriptor.
+       A deterministic one-to-one seed assignment is computed first, and the
+       initial anchor is then chosen as the strongest connected triangle, then
+       edge, then singleton within that assignment.
 
     2. Coupled frontier expansion:
        Starting from the seed motif, the method grows both slices jointly on the
@@ -1013,7 +1250,9 @@ def extract_continuous_macro_section(
     This design prevents the region from drifting into nearby symmetric
     compartments because expansion is never allowed independently on the two
     slices and every newly added pair must beat the neutral unmatched
-    alternative in a one-to-one frontier assignment.
+    alternative in a one-to-one frontier assignment. When two seed motifs are
+    exactly indistinguishable under the observed features, the method reports
+    the ambiguity rather than pretending uniqueness.
 
     Returns
     -------
@@ -1049,7 +1288,8 @@ def extract_continuous_macro_section(
     geodesic_A = compute_graph_geodesics(edge_A_norm)
     geodesic_B = compute_graph_geodesics(edge_B_norm)
 
-    # 3. Build biologically grounded cluster context descriptors.
+    # 3. Build biologically grounded cluster context descriptors and a
+    # cluster-centered global morphology descriptor.
     all_types = np.array(sorted(
         set(sliceA.obs[label_key].astype(str)) |
         set(sliceB.obs[label_key].astype(str))
@@ -1062,14 +1302,18 @@ def extract_continuous_macro_section(
     )
     context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
     context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
+    global_shape_A = compute_cluster_global_shape_features(coords_A, centroids_A)
+    global_shape_B = compute_cluster_global_shape_features(coords_B, centroids_B)
 
     # 4. Assemble candidate cluster-pairs and their global evidence.
-    matches, match_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
+    matches, match_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
         Pi_cluster,
         valid_A,
         valid_B,
         context_feat_A,
         context_feat_B,
+        global_shape_A,
+        global_shape_B,
     )
     num_matches = len(matches)
     if num_matches == 0:
@@ -1090,8 +1334,8 @@ def extract_continuous_macro_section(
     match_adj = build_match_graph(matches, adj_A, adj_B)
     diagnostics["match_graph_edges"] = int(np.sum(match_adj) // 2)
 
-    match_scores = np.asarray(match_scores, dtype=np.float64)
-    initial_match_indices = select_initial_match_component(match_adj, match_scores)
+    initial_match_indices, seed_diagnostics = select_initial_match_component(matches, match_adj, global_pair_scores)
+    diagnostics.update(seed_diagnostics)
     if initial_match_indices.size == 0:
         return empty_macro_section_result(
             N,
@@ -1107,6 +1351,20 @@ def extract_continuous_macro_section(
         f"{seed_name} with {len(seed_pairs)} matched pair(s); "
         f"pair-graph edges={diagnostics['match_graph_edges']}."
     )
+    if diagnostics.get("seed_evidence_ratio") is not None:
+        print(
+            "[HOT] Seed competition: "
+            f"log-gap={diagnostics['seed_log_evidence_gap']:.4f}, "
+            f"evidence-ratio={diagnostics['seed_evidence_ratio']:.4f}."
+        )
+    if diagnostics.get("seed_ambiguity_detected", False):
+        competing_pairs = [matches[i] for i in diagnostics.get("seed_second_indices", [])]
+        diagnostics["competing_seed_pairs"] = competing_pairs
+        warnings.warn(
+            "The macro-overlap seed is ambiguous: at least two connected seed motifs "
+            "have indistinguishable evidence under the observed features.",
+            AmbiguousAlignmentWarning,
+        )
 
     # 6. Coupled frontier expansion on the product graph of admissible cluster-pairs.
     print("[HOT] Coupled frontier expansion: accepting frontier pairs only when they improve on the unmatched null.")
@@ -1136,6 +1394,39 @@ def extract_continuous_macro_section(
         print("[HOT] Expansion remained at the seed; no frontier pair beat the unmatched alternative.")
     print(f"[HOT] Expansion stop reason: {diagnostics['stop_reason']}.")
 
+    alternative_hypotheses = []
+    if diagnostics.get("seed_ambiguity_detected", False):
+        second_indices = diagnostics.get("seed_second_indices", [])
+        if len(second_indices) > 0:
+            competing_seed_pairs = [matches[i] for i in second_indices]
+            competing_selected_pairs, competing_expansion_diagnostics = expand_macro_match_frontier(
+                seed_pairs=competing_seed_pairs,
+                matches=matches,
+                global_pair_evidence=global_pair_evidence,
+                mi_contrib=mi_contrib,
+                adj_A=adj_A,
+                adj_B=adj_B,
+                geodesic_A=geodesic_A,
+                geodesic_B=geodesic_B,
+                edge_A_norm=edge_A_norm,
+                edge_B_norm=edge_B_norm,
+                edge_scale_A=edge_scale_A,
+                edge_scale_B=edge_scale_B,
+                centroids_A=centroids_A,
+                centroids_B=centroids_B,
+            )
+            alternative_hypotheses.append(
+                summarize_macro_hypothesis(
+                    labels_A=labels_A,
+                    labels_B=labels_B,
+                    seed_pairs=competing_seed_pairs,
+                    selected_pairs=competing_selected_pairs,
+                    score=diagnostics.get("seed_second_score"),
+                    diagnostics=competing_expansion_diagnostics,
+                )
+            )
+            diagnostics["competing_hypothesis_count"] = len(alternative_hypotheses)
+
     return materialize_macro_section_result(
         labels_A=labels_A,
         labels_B=labels_B,
@@ -1144,5 +1435,6 @@ def extract_continuous_macro_section(
         seed_pairs=seed_pairs,
         selected_pairs=selected_pairs,
         diagnostics=diagnostics,
+        alternative_hypotheses=alternative_hypotheses,
     )
 
