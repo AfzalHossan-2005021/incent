@@ -2,9 +2,10 @@ import logging
 import numpy as np
 import scipy.sparse as sp
 
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
-from scipy.spatial import distance_matrix, Delaunay
+from scipy.spatial import distance_matrix, Delaunay, QhullError
 from scipy.sparse.csgraph import connected_components
 from sklearn.metrics.pairwise import cosine_distances
 from scipy.spatial.distance import jensenshannon
@@ -196,180 +197,271 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     return pi_samp
 
 
+def _encode_labels_by_unique_order(labels, expected_clusters):
+    """
+    Encodes arbitrary cluster labels into the same sorted unique order used by cluster feature extraction.
+    """
+    unique_labels = np.unique(labels)
+    if unique_labels.size != expected_clusters:
+        raise ValueError(
+            f"Expected {expected_clusters} clusters from labels, found {unique_labels.size}."
+        )
+
+    encoded = np.searchsorted(unique_labels, labels)
+    if not np.array_equal(unique_labels[encoded], labels):
+        raise ValueError("Cluster labels could not be encoded into transport-matrix order.")
+
+    return encoded
+
+
+def _compute_cluster_centroids(coords, labels, num_clusters):
+    centroids = np.zeros((num_clusters, coords.shape[1]), dtype=float)
+    valid = np.zeros(num_clusters, dtype=bool)
+
+    for cluster_id in range(num_clusters):
+        mask = labels == cluster_id
+        if np.any(mask):
+            centroids[cluster_id] = coords[mask].mean(axis=0)
+            valid[cluster_id] = True
+
+    return centroids, valid
+
+
+def _natural_spacing(points):
+    if points.shape[0] < 2:
+        return 1.0
+
+    dists, _ = cKDTree(points).query(points, k=2)
+    scale = float(np.median(dists[:, 1]))
+    if scale > 0:
+        return scale
+
+    span = float(np.ptp(points, axis=0).max())
+    return span if span > 0 else 1.0
+
+
+def _get_max_edge_len(coords):
+    if coords.shape[0] < 2:
+        return float("inf")
+
+    k = min(6, coords.shape[0])
+    dists, _ = cKDTree(coords).query(coords, k=k)
+    neighbor_dists = dists[:, -1] if dists.ndim > 1 else dists
+    return float(np.median(neighbor_dists) * 5.0)
+
+
+def _build_cluster_border_adjacency(coords, labels, num_clusters):
+    """
+    Builds a cluster adjacency graph from local cell neighborhoods.
+    Uses Delaunay edges when possible and falls back to kNN for degenerate geometries.
+    """
+    adj = np.zeros((num_clusters, num_clusters), dtype=bool)
+    np.fill_diagonal(adj, True)
+
+    if coords.shape[0] < 2:
+        return adj
+
+    max_edge_len = _get_max_edge_len(coords)
+    candidate_edges = set()
+
+    if coords.shape[0] >= 3:
+        try:
+            tri = Delaunay(coords)
+            for simplex in tri.simplices:
+                for i in range(len(simplex)):
+                    for j in range(i + 1, len(simplex)):
+                        edge = tuple(sorted((int(simplex[i]), int(simplex[j]))))
+                        candidate_edges.add(edge)
+        except QhullError:
+            pass
+
+    if not candidate_edges:
+        k = min(7, coords.shape[0])
+        _, neighbors = cKDTree(coords).query(coords, k=k)
+        neighbors = np.atleast_2d(neighbors)
+        for i in range(coords.shape[0]):
+            for j in neighbors[i, 1:]:
+                if i == j:
+                    continue
+                candidate_edges.add(tuple(sorted((int(i), int(j)))))
+
+    for i, j in candidate_edges:
+        if np.linalg.norm(coords[i] - coords[j]) >= max_edge_len:
+            continue
+
+        label_i = labels[i]
+        label_j = labels[j]
+        if label_i == label_j:
+            continue
+
+        adj[label_i, label_j] = True
+        adj[label_j, label_i] = True
+
+    return adj
+
+
 def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
     """
-    Identifies the largest co-contiguous, highly-matched section from the clustering alignment.
+    Identifies a spatially continuous macro section using a one-to-one, symmetric cluster matching.
+
+    Returns:
+        idx_A, idx_B: selected cell indices in both slices
+        dist_A, dist_B: distance-to-selected-region arrays for all cells
+        matched_pairs: (K, 2) array of selected cluster matches using Pi_cluster row/column indices
     """
     N, M = sliceA.shape[0], sliceB.shape[0]
-    
-    total_mass = np.sum(Pi_cluster)
-    if total_mass == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-        
-    coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
 
-    # 1. Compute Cluster Centroids to build Spatial Graphs
+    empty_pairs = np.empty((0, 2), dtype=int)
+    total_mass = float(np.sum(Pi_cluster))
+    if total_mass <= 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+
+    coords_A = np.asarray(sliceA.obsm[spatial_key], dtype=float)
+    coords_B = np.asarray(sliceB.obsm[spatial_key], dtype=float)
+
     num_clusters_A, num_clusters_B = Pi_cluster.shape
-    centroids_A, centroids_B = np.zeros((num_clusters_A, 2)), np.zeros((num_clusters_B, 2))
-    valid_A, valid_B = np.zeros(num_clusters_A, dtype=bool), np.zeros(num_clusters_B, dtype=bool)
+    labels_A_idx = _encode_labels_by_unique_order(labels_A, num_clusters_A)
+    labels_B_idx = _encode_labels_by_unique_order(labels_B, num_clusters_B)
 
-    for i in range(num_clusters_A):
-        mask = (labels_A == i)
-        if np.any(mask):
-            centroids_A[i] = coords_A[mask].mean(axis=0)
-            valid_A[i] = True
+    centroids_A, valid_A = _compute_cluster_centroids(coords_A, labels_A_idx, num_clusters_A)
+    centroids_B, valid_B = _compute_cluster_centroids(coords_B, labels_B_idx, num_clusters_B)
 
-    for i in range(num_clusters_B):
-        mask = (labels_B == i)
-        if np.any(mask):
-            centroids_B[i] = coords_B[mask].mean(axis=0)
-            valid_B[i] = True
+    adj_A = _build_cluster_border_adjacency(coords_A, labels_A_idx, num_clusters_A)
+    adj_B = _build_cluster_border_adjacency(coords_B, labels_B_idx, num_clusters_B)
 
-    # 2. Build Structural Adjacency Matrices for Clusters based on true spatial borders
-    # Using Delaunay triangulation filtered by maximum edge length (Alpha-shape approximation)
-    # This prevents identifying clusters as neighbors if they are separated by empty space/background gaps.
-    
-    def get_max_edge_len(coords):
-        if len(coords) < 6: return float('inf')
-        d, _ = cKDTree(coords).query(coords, k=6)
-        return np.median(d[:, -1]) * 5.0 # Max boundary edge is 5x natural local density 
-        
-    max_edge_A = get_max_edge_len(coords_A)
-    max_edge_B = get_max_edge_len(coords_B)
-    
-    adj_A = np.zeros((num_clusters_A, num_clusters_A), dtype=bool)
-    if N >= 3:
-        tri_A = Delaunay(coords_A)
-        for simplex in tri_A.simplices:
-            lab = labels_A[simplex]
-            for i in range(3):
-                for j in range(i+1, 3):
-                    if lab[i] != lab[j] and valid_A[lab[i]] and valid_A[lab[j]]:
-                        dist = np.linalg.norm(coords_A[simplex[i]] - coords_A[simplex[j]])
-                        if dist < max_edge_A:
-                            adj_A[lab[i], lab[j]] = True
-                            adj_A[lab[j], lab[i]] = True
-                        
-    adj_B = np.zeros((num_clusters_B, num_clusters_B), dtype=bool)
-    if M >= 3:
-        tri_B = Delaunay(coords_B)
-        for simplex in tri_B.simplices:
-            lab = labels_B[simplex]
-            for i in range(3):
-                for j in range(i+1, 3):
-                    if lab[i] != lab[j] and valid_B[lab[i]] and valid_B[lab[j]]:
-                        dist = np.linalg.norm(coords_B[simplex[i]] - coords_B[simplex[j]])
-                        if dist < max_edge_B:
-                            adj_B[lab[i], lab[j]] = True
-                            adj_B[lab[j], lab[i]] = True
+    valid_idx_A = np.flatnonzero(valid_A)
+    valid_idx_B = np.flatnonzero(valid_B)
+    if valid_idx_A.size == 0 or valid_idx_B.size == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
 
-    np.fill_diagonal(adj_A, True)
-    np.fill_diagonal(adj_B, True)
+    eps = 1e-12
+    row_mass = Pi_cluster.sum(axis=1, keepdims=True)
+    col_mass = Pi_cluster.sum(axis=0, keepdims=True)
+    mass_scale = float(np.max(Pi_cluster))
+    if mass_scale <= eps:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
 
-    # 3. Select ENLARGED subset of transport masses (Top 50% of total mass)
-    flat_pi = Pi_cluster.flatten()
-    sorted_idx = np.argsort(flat_pi)[::-1]
-    sorted_cumsum = np.cumsum(flat_pi[sorted_idx])
-    
-    cutoff_idx = np.searchsorted(sorted_cumsum, total_mass * 0.5) # Start with top 50% of mass; can be adjusted
-    selected_flat_idx = sorted_idx[:cutoff_idx+1]
-    
-    matches = []
-    for idx in selected_flat_idx:
-        u, v = np.unravel_index(idx, Pi_cluster.shape)
-        if valid_A[u] and valid_B[v]:
-            matches.append((u, v))
-            
-    num_matches = len(matches)
-    if num_matches == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-        
-    # 4. Enforce Structural Similarity & Continuity via Match-Graph
-    # Two matching pairs are connected ONLY if they are contiguous in BOTH spatial slices
-    match_adj = np.zeros((num_matches, num_matches), dtype=bool)
-    for i in range(num_matches):
-        u1, v1 = matches[i]
-        for j in range(i+1, num_matches):
-            u2, v2 = matches[j]
+    mass_norm = Pi_cluster / (mass_scale + eps)
+    row_conf = np.divide(
+        Pi_cluster,
+        row_mass,
+        out=np.zeros_like(Pi_cluster, dtype=float),
+        where=row_mass > eps,
+    )
+    col_conf = np.divide(
+        Pi_cluster,
+        col_mass,
+        out=np.zeros_like(Pi_cluster, dtype=float),
+        where=col_mass > eps,
+    )
+    pair_score = mass_norm * np.sqrt(row_conf * col_conf)
+
+    score_sub = pair_score[np.ix_(valid_idx_A, valid_idx_B)]
+    row_ind, col_ind = linear_sum_assignment(-score_sub)
+    assigned_pairs = np.column_stack((valid_idx_A[row_ind], valid_idx_B[col_ind]))
+    assigned_scores = score_sub[row_ind, col_ind]
+    assigned_masses = Pi_cluster[assigned_pairs[:, 0], assigned_pairs[:, 1]]
+
+    positive_mask = assigned_masses > eps
+    if np.any(positive_mask):
+        assigned_pairs = assigned_pairs[positive_mask]
+        assigned_scores = assigned_scores[positive_mask]
+        assigned_masses = assigned_masses[positive_mask]
+    elif assigned_pairs.size == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+
+    num_pairs = assigned_pairs.shape[0]
+    if num_pairs == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+
+    match_adj = np.zeros((num_pairs, num_pairs), dtype=bool)
+    np.fill_diagonal(match_adj, True)
+    for i in range(num_pairs):
+        u1, v1 = assigned_pairs[i]
+        for j in range(i + 1, num_pairs):
+            u2, v2 = assigned_pairs[j]
             if adj_A[u1, u2] and adj_B[v1, v2]:
                 match_adj[i, j] = True
                 match_adj[j, i] = True
 
-    # Find the largest Structurally Co-Contiguous Component
-    n_comp, comp_labels = connected_components(match_adj, directed=False)
-    largest = np.bincount(comp_labels).argmax()
-    largest_match_indices = np.where(comp_labels == largest)[0]
-    
-    strong_A = list(set([matches[i][0] for i in largest_match_indices]))
-    strong_B = list(set([matches[i][1] for i in largest_match_indices]))
-    
-    core_cells_A = np.where(np.isin(labels_A, strong_A))[0]
-    core_cells_B = np.where(np.isin(labels_B, strong_B))[0]
+    _, comp_labels = connected_components(match_adj, directed=False)
+    selected_pair_ids = None
+    best_signature = None
+    for comp_id in np.unique(comp_labels):
+        component_ids = np.flatnonzero(comp_labels == comp_id)
+        signature = (
+            float(np.sum(assigned_scores[component_ids])),
+            float(np.sum(assigned_masses[component_ids])),
+            int(component_ids.size),
+        )
+        if best_signature is None or signature > best_signature:
+            best_signature = signature
+            selected_pair_ids = component_ids.tolist()
 
-    if len(core_cells_A) == 0 or len(core_cells_B) == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M)
-    
-    # Compute initial barycenters of the starting core components
-    bary_A = np.mean(centroids_A[strong_A], axis=0)
-    bary_B = np.mean(centroids_B[strong_B], axis=0)
+    if not selected_pair_ids:
+        best_pair_id = int(np.argmax(assigned_scores))
+        selected_pair_ids = [best_pair_id]
 
-    # 5. Determine Target Expansion Size
-    # Target is 1/3 of the clusters of the smaller slice
-    target_count = max(1, int(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))
-    print(f"[HOT] Topological Extension: Expanding until {target_count} clusters are in the strong set.")
+    target_count = min(
+        num_pairs,
+        max(1, int(np.ceil(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))),
+    )
+    scale_A = _natural_spacing(centroids_A[valid_A])
+    scale_B = _natural_spacing(centroids_B[valid_B])
+    selected_pair_set = set(selected_pair_ids)
 
-    # 6. Cluster-level Topological Extension
-    while min(len(strong_A), len(strong_B)) < target_count:
-        # Find all topological neighbors of the current strong components
-        neighbors_A = np.where(np.any(adj_A[strong_A, :], axis=0))[0]
-        neighbors_B = np.where(np.any(adj_B[strong_B, :], axis=0))[0]
-        
-        # Exclude clusters already in the strong set
-        candidates_A = [c for c in neighbors_A if c not in strong_A and valid_A[c]]
-        candidates_B = [c for c in neighbors_B if c not in strong_B and valid_B[c]]
-        
-        if not candidates_A or not candidates_B:
+    logging.info(
+        "[HOT] Topological Extension: Expanding one-to-one cluster pairs until %d pairs are selected.",
+        target_count,
+    )
+
+    while len(selected_pair_ids) < target_count:
+        selected_A = assigned_pairs[selected_pair_ids, 0]
+        selected_B = assigned_pairs[selected_pair_ids, 1]
+        bary_A = centroids_A[selected_A].mean(axis=0)
+        bary_B = centroids_B[selected_B].mean(axis=0)
+
+        best_candidate_id = None
+        best_candidate_signature = None
+        for candidate_id in range(num_pairs):
+            if candidate_id in selected_pair_set:
+                continue
+
+            u, v = assigned_pairs[candidate_id]
+            is_contiguous = np.any(adj_A[selected_A, u] & adj_B[selected_B, v])
+            if not is_contiguous:
+                continue
+
+            dist_A = np.linalg.norm(centroids_A[u] - bary_A) / scale_A
+            dist_B = np.linalg.norm(centroids_B[v] - bary_B) / scale_B
+            compactness = 0.5 * (dist_A + dist_B)
+            candidate_signature = (
+                float(assigned_scores[candidate_id] / (1.0 + compactness)),
+                float(assigned_scores[candidate_id]),
+                float(assigned_masses[candidate_id]),
+            )
+            if best_candidate_signature is None or candidate_signature > best_candidate_signature:
+                best_candidate_signature = candidate_signature
+                best_candidate_id = candidate_id
+
+        if best_candidate_id is None:
             break
-            
-        # Find the valid matching pair that is closest to the initial barycenters
-        best_pair = None
-        best_dist = float('inf')
-        
-        # Threshold to filter out nearly-zero noise entries from FGW
-        min_mass = np.max(Pi_cluster) * 1e-4 
-        
-        for pA in candidates_A:
-            for pB in candidates_B:
-                # The pair must still have valid OT confidence to be aligned together!
-                if Pi_cluster[pA, pB] > min_mass:
-                    dist_A = np.linalg.norm(centroids_A[pA] - bary_A)
-                    dist_B = np.linalg.norm(centroids_B[pB] - bary_B)
-                    
-                    # We minimize the combined distance to the respective barycenters
-                    total_dist = dist_A + dist_B
-                    if total_dist < best_dist:
-                        best_dist = total_dist
-                        best_pair = (pA, pB)
-                    
-        # Add the best geometrically compact pair
-        if best_pair is not None:
-            strong_A.append(best_pair[0])
-            strong_B.append(best_pair[1])
-        else:
-            break
 
-    # Extract final cells based strictly on expanded cluster membership
-    idx_A = np.where(np.isin(labels_A, strong_A))[0]
-    idx_B = np.where(np.isin(labels_B, strong_B))[0]
+        selected_pair_ids.append(best_candidate_id)
+        selected_pair_set.add(best_candidate_id)
 
-    # Compute physical distances from the newly expanded core to all cells
-    core_coords_A = coords_A[idx_A]
-    core_coords_B = coords_B[idx_B]
+    matched_pairs = assigned_pairs[np.array(selected_pair_ids, dtype=int)]
+    strong_A = matched_pairs[:, 0]
+    strong_B = matched_pairs[:, 1]
 
-    tree_A = cKDTree(core_coords_A)
-    tree_B = cKDTree(core_coords_B)
-    
+    idx_A = np.flatnonzero(np.isin(labels_A_idx, strong_A))
+    idx_B = np.flatnonzero(np.isin(labels_B_idx, strong_B))
+    if idx_A.size == 0 or idx_B.size == 0:
+        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+
+    tree_A = cKDTree(coords_A[idx_A])
+    tree_B = cKDTree(coords_B[idx_B])
     dist_A, _ = tree_A.query(coords_A)
     dist_B, _ = tree_B.query(coords_B)
-    
-    return idx_A, idx_B, dist_A, dist_B
+
+    return idx_A, idx_B, dist_A, dist_B, matched_pairs
