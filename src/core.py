@@ -10,7 +10,14 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_feature_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
+from .hierarchical import (
+    extract_cluster_features,
+    compute_cluster_feature_costs,
+    compute_cluster_structural_matrix,
+    run_coarse_partial_fgw,
+    extract_continuous_macro_section,
+    encode_labels_by_unique_order,
+)
 from .visualize import visualize_clustered_slices, visualize_cluster_mapping, visualize_selected_anchors
 
 
@@ -81,6 +88,22 @@ def hierarchical_pairwise_align(
         f"{len(idx_A)}/{sliceA.shape[0]} cells from A, {len(idx_B)}/{sliceB.shape[0]} cells from B."
     )
 
+    if len(matched_pairs) == 0:
+        print("--- [HOT] No reliable macro section found. Falling back to direct cell-level alignment. ---")
+        return pairwise_align(
+            sliceA=sliceA,
+            sliceB=sliceB,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            reg_compact=reg_compact,
+            numItermax=numItermax,
+            use_gpu=use_gpu,
+            spatial_key=spatial_key,
+            label_key=label_key,
+            **kwargs
+        )
+
     if visualize_clusters:
         visualize_selected_anchors(sliceA, sliceB, idx_A, idx_B, spatial_key=spatial_key, dist_A=dist_A, dist_B=dist_B)
 
@@ -89,8 +112,10 @@ def hierarchical_pairwise_align(
     
     if len(idx_A) > 0 and len(idx_B) > 0 and len(matched_pairs) > 0:
         # Restrict labels to the matched core
-        core_labels_A = labelsA[idx_A]
-        core_labels_B = labelsB[idx_B]
+        labelsA_idx = encode_labels_by_unique_order(labelsA, Pi_cluster.shape[0])
+        labelsB_idx = encode_labels_by_unique_order(labelsB, Pi_cluster.shape[1])
+        core_labels_A = labelsA_idx[idx_A]
+        core_labels_B = labelsB_idx[idx_B]
         
         for cA, cB in matched_pairs:
             mass = Pi_cluster[cA, cB]
@@ -107,6 +132,22 @@ def hierarchical_pairwise_align(
             block_mass = mass / (len(cells_A) * len(cells_B))
             grid_A, grid_B = np.ix_(cells_A, cells_B)
             pi_full[grid_A, grid_B] += block_mass
+
+    if np.sum(pi_full) <= 0:
+        print("--- [HOT] Macro footprint has zero mass. Falling back to direct cell-level alignment. ---")
+        return pairwise_align(
+            sliceA=sliceA,
+            sliceB=sliceB,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            reg_compact=reg_compact,
+            numItermax=numItermax,
+            use_gpu=use_gpu,
+            spatial_key=spatial_key,
+            label_key=label_key,
+            **kwargs
+        )
 
     print("--- [HOT] Step 7: Global Refinement via Overlap Projection ---")
     from .visualize import stack_slices_pairwise
@@ -220,6 +261,8 @@ def hierarchical_pairwise_align(
             numItermax=numItermax,
             use_gpu=use_gpu,
             dummy_cell=True,
+            spatial_key=spatial_key,
+            label_key=label_key,
             **kwargs
         )
         
@@ -298,6 +341,8 @@ def pairwise_align(
     verbose: bool = False,
     gpu_verbose: bool = True,
     dummy_cell: bool = True,
+    spatial_key: str = "spatial",
+    label_key: str = "cell_type_annot",
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -345,7 +390,14 @@ def pairwise_align(
             raise ValueError(f"Found empty `AnnData`:\n{s}.")   
     
     # ────────────────────── Calculate spatial distances ──────────────────────
-    D_A, D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=data_type, eps=epsilon)
+    D_A, D_B = calculate_spatial_distance(
+        sliceA,
+        sliceB,
+        nx,
+        data_type=data_type,
+        spatial_key=spatial_key,
+        eps=epsilon,
+    )
     
 
     # ────────────────────── Calculate gene expression dissimilarity ──────────────────────
@@ -353,7 +405,7 @@ def pairwise_align(
 
 
     # ────────────────────── Calculate cell-type mismatch penalty ──────────────────────
-    cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB)
+    cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB, label_key=label_key)
 
 
     # Combine gene expression dissimilarity and cell-type mismatch penalty into a single cost matrix M1
@@ -377,6 +429,8 @@ def pairwise_align(
         harmonic_weights={1: 1.25, 2: 1.5},
         distance_decay="linear",
         include_self=False,
+        spatial_key=spatial_key,
+        label_key=label_key,
     )
     M2 = to_backend(js_dist_neighborhood, nx, data_type=data_type)
 
@@ -391,8 +445,8 @@ def pairwise_align(
     if dummy_cell:
         from collections import Counter
         ns, nt = sliceA.shape[0], sliceB.shape[0]
-        labels_A = sliceA.obs['cell_type_annot'].values
-        labels_B = sliceB.obs['cell_type_annot'].values
+        labels_A = sliceA.obs[label_key].values
+        labels_B = sliceB.obs[label_key].values
         counts_A = Counter(labels_A)
         counts_B = Counter(labels_B)
         all_types = set(counts_A.keys()) | set(counts_B.keys())
@@ -888,7 +942,7 @@ def calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps = 1e-
     return cosine_dist_gene_expr
 
 
-def calculate_cell_type_mismatch(sliceA, sliceB):
+def calculate_cell_type_mismatch(sliceA, sliceB, label_key="cell_type_annot"):
     """
     Calculate the cell-type mismatch penalty between two slices.
 
@@ -900,8 +954,8 @@ def calculate_cell_type_mismatch(sliceA, sliceB):
         cell_type_mismatch: Binary matrix indicating cell-type mismatches.
     """
 
-    _lab_A = np.asarray(sliceA.obs['cell_type_annot'].values)
-    _lab_B = np.asarray(sliceB.obs['cell_type_annot'].values)
+    _lab_A = np.asarray(sliceA.obs[label_key].values)
+    _lab_B = np.asarray(sliceB.obs[label_key].values)
 
     cell_type_mismatch = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
 

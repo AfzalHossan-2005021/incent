@@ -151,22 +151,26 @@ def compute_cluster_structural_matrix(centroids, w_euc=0.5, w_graph=0.5):
     C_euc = distance_matrix(centroids, centroids)
     
     if w_graph > 0:
-        # build adj matrix
         n = centroids.shape[0]
-        adj = np.zeros((n, n))
+        if n < 2:
+            return C_euc
 
-        tri = Delaunay(centroids)
-        indptr, indices = tri.vertex_neighbor_vertices
-        for i in range(n):
-            for j in indices[indptr[i]:indptr[i+1]]:
-                adj[i, j] = np.linalg.norm(centroids[i] - centroids[j])
-        
+        adj = _build_weighted_point_graph(centroids)
         C_graph = dijkstra(sp.csr_matrix(adj), directed=False)
-        # handle infinite dists
-        C_graph[np.isinf(C_graph)] = np.max(C_graph[~np.isinf(C_graph)]) * 2
+
+        finite_mask = np.isfinite(C_graph)
+        if not np.all(finite_mask):
+            off_diagonal = ~np.eye(n, dtype=bool)
+            finite_values = C_graph[finite_mask & off_diagonal]
+            if finite_values.size > 0:
+                fill_value = float(np.max(finite_values)) * 2.0
+                C_graph[~finite_mask] = fill_value
+            else:
+                C_graph = C_euc.copy()
         
         w_total = w_euc + w_graph
-        if w_total == 0: w_total = 1.0
+        if w_total == 0:
+            w_total = 1.0
         w_euc_norm = w_euc / w_total
         w_graph_norm = w_graph / w_total
             
@@ -197,7 +201,7 @@ def run_coarse_partial_fgw(M_cluster, C_A, C_B, p_A, p_B, alpha=0.5, m=None, reg
     return pi_samp
 
 
-def _encode_labels_by_unique_order(labels, expected_clusters):
+def encode_labels_by_unique_order(labels, expected_clusters):
     """
     Encodes arbitrary cluster labels into the same sorted unique order used by cluster feature extraction.
     """
@@ -214,6 +218,44 @@ def _encode_labels_by_unique_order(labels, expected_clusters):
     return encoded
 
 
+def _iter_candidate_edges(points, fallback_k=6):
+    """
+    Enumerates local neighborhood edges, preferring Delaunay and falling back to kNN on degenerate inputs.
+    """
+    num_points = points.shape[0]
+    if num_points < 2:
+        return set()
+
+    candidate_edges = set()
+    if num_points >= 3:
+        try:
+            tri = Delaunay(points)
+            for simplex in tri.simplices:
+                for i in range(len(simplex)):
+                    for j in range(i + 1, len(simplex)):
+                        candidate_edges.add(tuple(sorted((int(simplex[i]), int(simplex[j])))))
+        except QhullError:
+            pass
+
+    if candidate_edges:
+        return candidate_edges
+
+    k = min(max(2, fallback_k + 1), num_points)
+    _, neighbors = cKDTree(points).query(points, k=k)
+    neighbors = np.asarray(neighbors)
+    if neighbors.ndim == 1:
+        neighbors = neighbors[:, None]
+
+    for i in range(num_points):
+        for j in neighbors[i]:
+            j = int(j)
+            if i == j:
+                continue
+            candidate_edges.add(tuple(sorted((i, j))))
+
+    return candidate_edges
+
+
 def _compute_cluster_centroids(coords, labels, num_clusters):
     centroids = np.zeros((num_clusters, coords.shape[1]), dtype=float)
     valid = np.zeros(num_clusters, dtype=bool)
@@ -227,19 +269,6 @@ def _compute_cluster_centroids(coords, labels, num_clusters):
     return centroids, valid
 
 
-def _natural_spacing(points):
-    if points.shape[0] < 2:
-        return 1.0
-
-    dists, _ = cKDTree(points).query(points, k=2)
-    scale = float(np.median(dists[:, 1]))
-    if scale > 0:
-        return scale
-
-    span = float(np.ptp(points, axis=0).max())
-    return span if span > 0 else 1.0
-
-
 def _get_max_edge_len(coords):
     if coords.shape[0] < 2:
         return float("inf")
@@ -248,6 +277,25 @@ def _get_max_edge_len(coords):
     dists, _ = cKDTree(coords).query(coords, k=k)
     neighbor_dists = dists[:, -1] if dists.ndim > 1 else dists
     return float(np.median(neighbor_dists) * 5.0)
+
+
+def _build_weighted_point_graph(points, max_edge_len=np.inf):
+    """
+    Builds a sparse weighted graph over points using local geometric neighborhoods.
+    """
+    num_points = points.shape[0]
+    graph = np.zeros((num_points, num_points), dtype=float)
+    if num_points < 2:
+        return graph
+
+    for i, j in _iter_candidate_edges(points):
+        dist = float(np.linalg.norm(points[i] - points[j]))
+        if dist > max_edge_len:
+            continue
+        graph[i, j] = dist
+        graph[j, i] = dist
+
+    return graph
 
 
 def _build_cluster_border_adjacency(coords, labels, num_clusters):
@@ -262,30 +310,7 @@ def _build_cluster_border_adjacency(coords, labels, num_clusters):
         return adj
 
     max_edge_len = _get_max_edge_len(coords)
-    candidate_edges = set()
-
-    if coords.shape[0] >= 3:
-        try:
-            tri = Delaunay(coords)
-            for simplex in tri.simplices:
-                for i in range(len(simplex)):
-                    for j in range(i + 1, len(simplex)):
-                        edge = tuple(sorted((int(simplex[i]), int(simplex[j]))))
-                        candidate_edges.add(edge)
-        except QhullError:
-            pass
-
-    if not candidate_edges:
-        k = min(7, coords.shape[0])
-        _, neighbors = cKDTree(coords).query(coords, k=k)
-        neighbors = np.atleast_2d(neighbors)
-        for i in range(coords.shape[0]):
-            for j in neighbors[i, 1:]:
-                if i == j:
-                    continue
-                candidate_edges.add(tuple(sorted((int(i), int(j)))))
-
-    for i, j in candidate_edges:
+    for i, j in _iter_candidate_edges(coords):
         if np.linalg.norm(coords[i] - coords[j]) >= max_edge_len:
             continue
 
@@ -300,46 +325,21 @@ def _build_cluster_border_adjacency(coords, labels, num_clusters):
     return adj
 
 
-def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
-    """
-    Identifies a spatially continuous macro section using a one-to-one, symmetric cluster matching.
-
-    Returns:
-        idx_A, idx_B: selected cell indices in both slices
-        dist_A, dist_B: distance-to-selected-region arrays for all cells
-        matched_pairs: (K, 2) array of selected cluster matches using Pi_cluster row/column indices
-    """
-    N, M = sliceA.shape[0], sliceB.shape[0]
-
+def _empty_macro_section_result(num_cells_A, num_cells_B):
+    empty_idx = np.array([], dtype=int)
     empty_pairs = np.empty((0, 2), dtype=int)
-    total_mass = float(np.sum(Pi_cluster))
-    if total_mass <= 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+    return empty_idx, empty_idx.copy(), np.zeros(num_cells_A), np.zeros(num_cells_B), empty_pairs
 
-    coords_A = np.asarray(sliceA.obsm[spatial_key], dtype=float)
-    coords_B = np.asarray(sliceB.obsm[spatial_key], dtype=float)
 
-    num_clusters_A, num_clusters_B = Pi_cluster.shape
-    labels_A_idx = _encode_labels_by_unique_order(labels_A, num_clusters_A)
-    labels_B_idx = _encode_labels_by_unique_order(labels_B, num_clusters_B)
-
-    centroids_A, valid_A = _compute_cluster_centroids(coords_A, labels_A_idx, num_clusters_A)
-    centroids_B, valid_B = _compute_cluster_centroids(coords_B, labels_B_idx, num_clusters_B)
-
-    adj_A = _build_cluster_border_adjacency(coords_A, labels_A_idx, num_clusters_A)
-    adj_B = _build_cluster_border_adjacency(coords_B, labels_B_idx, num_clusters_B)
-
-    valid_idx_A = np.flatnonzero(valid_A)
-    valid_idx_B = np.flatnonzero(valid_B)
-    if valid_idx_A.size == 0 or valid_idx_B.size == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
-
-    eps = 1e-12
+def _compute_symmetric_assignment(Pi_cluster, valid_idx_A, valid_idx_B, eps=1e-12):
+    """
+    Computes a one-to-one assignment using symmetric row/column confidence and absolute mass.
+    """
     row_mass = Pi_cluster.sum(axis=1, keepdims=True)
     col_mass = Pi_cluster.sum(axis=0, keepdims=True)
     mass_scale = float(np.max(Pi_cluster))
     if mass_scale <= eps:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+        return np.empty((0, 2), dtype=int), np.array([], dtype=float), np.array([], dtype=float)
 
     mass_norm = Pi_cluster / (mass_scale + eps)
     row_conf = np.divide(
@@ -357,22 +357,25 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
     pair_score = mass_norm * np.sqrt(row_conf * col_conf)
 
     score_sub = pair_score[np.ix_(valid_idx_A, valid_idx_B)]
+    if score_sub.size == 0:
+        return np.empty((0, 2), dtype=int), np.array([], dtype=float), np.array([], dtype=float)
+
     row_ind, col_ind = linear_sum_assignment(-score_sub)
     assigned_pairs = np.column_stack((valid_idx_A[row_ind], valid_idx_B[col_ind]))
     assigned_scores = score_sub[row_ind, col_ind]
     assigned_masses = Pi_cluster[assigned_pairs[:, 0], assigned_pairs[:, 1]]
 
     positive_mask = assigned_masses > eps
-    if np.any(positive_mask):
-        assigned_pairs = assigned_pairs[positive_mask]
-        assigned_scores = assigned_scores[positive_mask]
-        assigned_masses = assigned_masses[positive_mask]
-    elif assigned_pairs.size == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+    return assigned_pairs[positive_mask], assigned_scores[positive_mask], assigned_masses[positive_mask]
 
+
+def _select_best_contiguous_component(assigned_pairs, assigned_scores, assigned_masses, adj_A, adj_B):
+    """
+    Selects the strongest co-contiguous connected component among one-to-one matched cluster pairs.
+    """
     num_pairs = assigned_pairs.shape[0]
     if num_pairs == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+        return np.empty((0, 2), dtype=int)
 
     match_adj = np.zeros((num_pairs, num_pairs), dtype=bool)
     np.fill_diagonal(match_adj, True)
@@ -385,7 +388,7 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
                 match_adj[j, i] = True
 
     _, comp_labels = connected_components(match_adj, directed=False)
-    selected_pair_ids = None
+    best_ids = None
     best_signature = None
     for comp_id in np.unique(comp_labels):
         component_ids = np.flatnonzero(comp_labels == comp_id)
@@ -396,68 +399,69 @@ def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_clus
         )
         if best_signature is None or signature > best_signature:
             best_signature = signature
-            selected_pair_ids = component_ids.tolist()
+            best_ids = component_ids
 
-    if not selected_pair_ids:
-        best_pair_id = int(np.argmax(assigned_scores))
-        selected_pair_ids = [best_pair_id]
+    if best_ids is None or best_ids.size == 0:
+        return np.empty((0, 2), dtype=int)
 
-    target_count = min(
-        num_pairs,
-        max(1, int(np.ceil(min(np.sum(valid_A), np.sum(valid_B)) / 3.0))),
+    return assigned_pairs[best_ids]
+
+
+def extract_continuous_macro_section(sliceA, sliceB, labels_A, labels_B, Pi_cluster, spatial_key='spatial'):
+    """
+    Identifies a spatially continuous macro section using a one-to-one, symmetric cluster matching.
+
+    Returns:
+        idx_A, idx_B: selected cell indices in both slices
+        dist_A, dist_B: distance-to-selected-region arrays for all cells
+        matched_pairs: (K, 2) array of selected cluster matches using Pi_cluster row/column indices
+    """
+    N, M = sliceA.shape[0], sliceB.shape[0]
+    total_mass = float(np.sum(Pi_cluster))
+    if total_mass <= 0:
+        return _empty_macro_section_result(N, M)
+
+    coords_A = np.asarray(sliceA.obsm[spatial_key], dtype=float)
+    coords_B = np.asarray(sliceB.obsm[spatial_key], dtype=float)
+
+    num_clusters_A, num_clusters_B = Pi_cluster.shape
+    labels_A_idx = encode_labels_by_unique_order(labels_A, num_clusters_A)
+    labels_B_idx = encode_labels_by_unique_order(labels_B, num_clusters_B)
+
+    centroids_A, valid_A = _compute_cluster_centroids(coords_A, labels_A_idx, num_clusters_A)
+    centroids_B, valid_B = _compute_cluster_centroids(coords_B, labels_B_idx, num_clusters_B)
+
+    adj_A = _build_cluster_border_adjacency(coords_A, labels_A_idx, num_clusters_A)
+    adj_B = _build_cluster_border_adjacency(coords_B, labels_B_idx, num_clusters_B)
+
+    valid_idx_A = np.flatnonzero(valid_A)
+    valid_idx_B = np.flatnonzero(valid_B)
+    if valid_idx_A.size == 0 or valid_idx_B.size == 0:
+        return _empty_macro_section_result(N, M)
+
+    assigned_pairs, assigned_scores, assigned_masses = _compute_symmetric_assignment(
+        Pi_cluster,
+        valid_idx_A,
+        valid_idx_B,
     )
-    scale_A = _natural_spacing(centroids_A[valid_A])
-    scale_B = _natural_spacing(centroids_B[valid_B])
-    selected_pair_set = set(selected_pair_ids)
-
-    logging.info(
-        "[HOT] Topological Extension: Expanding one-to-one cluster pairs until %d pairs are selected.",
-        target_count,
+    matched_pairs = _select_best_contiguous_component(
+        assigned_pairs,
+        assigned_scores,
+        assigned_masses,
+        adj_A,
+        adj_B,
     )
+    if matched_pairs.shape[0] == 0:
+        logging.info("[HOT] No co-contiguous one-to-one macro component was found.")
+        return _empty_macro_section_result(N, M)
 
-    while len(selected_pair_ids) < target_count:
-        selected_A = assigned_pairs[selected_pair_ids, 0]
-        selected_B = assigned_pairs[selected_pair_ids, 1]
-        bary_A = centroids_A[selected_A].mean(axis=0)
-        bary_B = centroids_B[selected_B].mean(axis=0)
-
-        best_candidate_id = None
-        best_candidate_signature = None
-        for candidate_id in range(num_pairs):
-            if candidate_id in selected_pair_set:
-                continue
-
-            u, v = assigned_pairs[candidate_id]
-            is_contiguous = np.any(adj_A[selected_A, u] & adj_B[selected_B, v])
-            if not is_contiguous:
-                continue
-
-            dist_A = np.linalg.norm(centroids_A[u] - bary_A) / scale_A
-            dist_B = np.linalg.norm(centroids_B[v] - bary_B) / scale_B
-            compactness = 0.5 * (dist_A + dist_B)
-            candidate_signature = (
-                float(assigned_scores[candidate_id] / (1.0 + compactness)),
-                float(assigned_scores[candidate_id]),
-                float(assigned_masses[candidate_id]),
-            )
-            if best_candidate_signature is None or candidate_signature > best_candidate_signature:
-                best_candidate_signature = candidate_signature
-                best_candidate_id = candidate_id
-
-        if best_candidate_id is None:
-            break
-
-        selected_pair_ids.append(best_candidate_id)
-        selected_pair_set.add(best_candidate_id)
-
-    matched_pairs = assigned_pairs[np.array(selected_pair_ids, dtype=int)]
     strong_A = matched_pairs[:, 0]
     strong_B = matched_pairs[:, 1]
 
     idx_A = np.flatnonzero(np.isin(labels_A_idx, strong_A))
     idx_B = np.flatnonzero(np.isin(labels_B_idx, strong_B))
     if idx_A.size == 0 or idx_B.size == 0:
-        return np.arange(N), np.arange(M), np.zeros(N), np.zeros(M), empty_pairs
+        return _empty_macro_section_result(N, M)
 
     tree_A = cKDTree(coords_A[idx_A])
     tree_B = cKDTree(coords_B[idx_B])
