@@ -1327,6 +1327,14 @@ def rank_seed_motifs(
     motifs are preferred because they already encode local shared topology.
     Singletons are retained only as a conservative fallback when no connected
     multi-pair seed exists.
+
+    Implementation note
+    -------------------
+    The seed graph can contain thousands of admissible pair nodes. Enumerating
+    all \binom{n}{3} triplets becomes intractable at that scale, so connected
+    3-node motifs are generated from adjacency lists instead of a dense cubic
+    scan. The resulting cost scales with the local graph degree rather than the
+    total number of candidate pairs.
     """
     num_matches = int(len(matches))
     if num_matches == 0:
@@ -1359,37 +1367,42 @@ def rank_seed_motifs(
             )
         )
 
-    for i in range(num_matches):
-        for j in range(i + 1, num_matches):
-            if not match_adj[i, j]:
-                continue
-            ranked[2].append(
-                score_seed_motif(
-                    (i, j),
-                    matches=matches,
-                    match_adj=match_adj,
-                    match_scores=match_scores,
-                    match_tiebreak_scores=match_tiebreak_scores,
-                    geodesic_A=geodesic_A,
-                    geodesic_B=geodesic_B,
-                    edge_A_norm=edge_A_norm,
-                    edge_B_norm=edge_B_norm,
-                    edge_scale_A=edge_scale_A,
-                    edge_scale_B=edge_scale_B,
-                    centroids_A=centroids_A,
-                    centroids_B=centroids_B,
-                )
+    upper_i, upper_j = np.where(np.triu(match_adj, k=1))
+    edge_pairs = list(zip(upper_i.tolist(), upper_j.tolist()))
+    for i, j in edge_pairs:
+        ranked[2].append(
+            score_seed_motif(
+                (i, j),
+                matches=matches,
+                match_adj=match_adj,
+                match_scores=match_scores,
+                match_tiebreak_scores=match_tiebreak_scores,
+                geodesic_A=geodesic_A,
+                geodesic_B=geodesic_B,
+                edge_A_norm=edge_A_norm,
+                edge_B_norm=edge_B_norm,
+                edge_scale_A=edge_scale_A,
+                edge_scale_B=edge_scale_B,
+                centroids_A=centroids_A,
+                centroids_B=centroids_B,
             )
+        )
 
-    for i in range(num_matches):
-        for j in range(i + 1, num_matches):
-            for k in range(j + 1, num_matches):
-                edge_count = int(match_adj[i, j]) + int(match_adj[i, k]) + int(match_adj[j, k])
-                if edge_count < 2:
+    neighbor_lists = [np.flatnonzero(match_adj[i]).astype(int) for i in range(num_matches)]
+    seen_triplets = set()
+    for center in range(num_matches):
+        neighbors = neighbor_lists[center]
+        if neighbors.size < 2:
+            continue
+        for pos, first in enumerate(neighbors[:-1]):
+            for second in neighbors[pos + 1:]:
+                triplet = tuple(sorted((int(center), int(first), int(second))))
+                if triplet in seen_triplets:
                     continue
+                seen_triplets.add(triplet)
                 ranked[3].append(
                     score_seed_motif(
-                        (i, j, k),
+                        triplet,
                         matches=matches,
                         match_adj=match_adj,
                         match_scores=match_scores,
@@ -1518,6 +1531,9 @@ def select_initial_match_components(
         centroids_B=centroids_B,
         match_tiebreak_scores=match_tiebreak_scores,
     )
+    ranked_count_singletons = int(len(ranked.get(1, [])))
+    ranked_count_edges = int(len(ranked.get(2, [])))
+    ranked_count_triplets = int(len(ranked.get(3, [])))
 
     multinode_records = []
     for motif_size in (3, 2):
@@ -1621,6 +1637,9 @@ def select_initial_match_components(
         "seed_trial_edge_counts": [int(record["edge_count"]) for record in chosen_records],
         "seed_search_mode": seed_search_mode,
         "seed_diversification_mode": "greedy_overlap_penalized_topk",
+        "seed_singleton_candidate_count": ranked_count_singletons,
+        "seed_edge_candidate_count": ranked_count_edges,
+        "seed_triplet_candidate_count": ranked_count_triplets,
     }
     return selected, diagnostics
 
@@ -1911,6 +1930,11 @@ def extract_continuous_macro_section(
         top_k=3,
     )
     diagnostics.update(seed_diagnostics)
+    print(
+        "[HOT] Seed search: "
+        f"{diagnostics.get('seed_edge_candidate_count', 0)} connected edge motif(s), "
+        f"{diagnostics.get('seed_triplet_candidate_count', 0)} connected 3-node motif(s)."
+    )
     if len(seed_index_trials) == 0:
         return empty_macro_section_result(
             N,
