@@ -664,10 +664,14 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     two clusters simply because the coarse transport mass was split across a
     nearby symmetric alternative.
 
-    In addition to transport enrichment and local niche context, the global
-    evidence includes a cluster-centered full-tissue morphology descriptor. This
-    provides a global spatial cue that can break practical symmetries when the
-    larger tissue support is not perfectly symmetric.
+    The primary transport-derived score is the per-pair mutual-information
+    contribution, which already combines pair specificity with matched mass.
+    Log-enrichment is retained only as a secondary tie-break so that transport
+    evidence is not double-counted additively. The remaining global evidence
+    channels come from local niche context and the cluster-centered full-tissue
+    morphology descriptor, which provides a global spatial cue that can break
+    practical symmetries when the larger tissue support is not perfectly
+    symmetric.
     """
     log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
@@ -680,7 +684,11 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         }
         return [], np.zeros(0), np.zeros(0), {}, mi_contrib, log_enrichment, diagnostics
 
-    sorted_idx = positive_mass_flat_idx[np.argsort(mi_contrib.ravel()[positive_mass_flat_idx])[::-1]]
+    positive_mi = mi_contrib.ravel()[positive_mass_flat_idx]
+    positive_enrichment = log_enrichment.ravel()[positive_mass_flat_idx]
+    sorted_idx = positive_mass_flat_idx[
+        np.lexsort((-positive_enrichment, -positive_mi))
+    ]
 
     matches = []
     mi_signal = []
@@ -717,13 +725,12 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     global_shape_signal = np.asarray(global_shape_signal, dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
-    enrichment_evidence = empirical_logit_evidence(enrichment_signal, larger_is_better=True)
     context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
     shape_evidence = empirical_logit_evidence(global_shape_signal, larger_is_better=True)
 
     global_pair_evidence = {
-        pair: float(me + ee + ce + se)
-        for pair, me, ee, ce, se in zip(matches, mi_evidence, enrichment_evidence, context_evidence, shape_evidence)
+        pair: float(me + ce + se)
+        for pair, me, ce, se in zip(matches, mi_evidence, context_evidence, shape_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
@@ -731,8 +738,9 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
         "global_shape_descriptor_dim": int(global_shape_A.shape[1]),
+        "transport_score_mode": "mi_primary_enrichment_tiebreak",
     }
-    return matches, mi_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
+    return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
 
 def score_frontier_matches(
@@ -1110,27 +1118,40 @@ def solve_seed_assignment(matches, pair_scores):
     return np.array(sorted(selected), dtype=int)
 
 
-def rank_seed_motifs(match_adj, match_scores, allowed_indices):
+def rank_seed_motifs(match_adj, match_scores, allowed_indices, match_tiebreak_scores=None):
     """
     Enumerate admissible seed motifs in deterministic score order.
 
     The motif preference remains triangle > edge > singleton, but motif
     candidates are restricted to a globally consistent one-to-one assignment.
+    Motifs are ranked primarily by their total evidence score; summed
+    log-enrichment is used only as a secondary tie-break so transport evidence
+    is not counted twice in the primary objective.
     """
     allowed_indices = np.array(sorted(set(int(x) for x in allowed_indices)), dtype=int)
     if allowed_indices.size == 0:
         return {}
 
+    match_scores = np.asarray(match_scores, dtype=np.float64)
+    if match_tiebreak_scores is None:
+        match_tiebreak_scores = np.zeros_like(match_scores, dtype=np.float64)
+    else:
+        match_tiebreak_scores = np.asarray(match_tiebreak_scores, dtype=np.float64)
+
     allowed = set(allowed_indices.tolist())
     ranked = {3: [], 2: [], 1: []}
 
     for i in allowed_indices:
-        ranked[1].append((float(match_scores[i]), (int(i),)))
+        ranked[1].append((float(match_scores[i]), float(match_tiebreak_scores[i]), (int(i),)))
 
     for i_pos, i in enumerate(allowed_indices):
         for j in allowed_indices[i_pos + 1:]:
             if match_adj[i, j]:
-                ranked[2].append((float(match_scores[i] + match_scores[j]), tuple(sorted((int(i), int(j))))))
+                ranked[2].append((
+                    float(match_scores[i] + match_scores[j]),
+                    float(match_tiebreak_scores[i] + match_tiebreak_scores[j]),
+                    tuple(sorted((int(i), int(j))))
+                ))
 
     for i_pos, i in enumerate(allowed_indices):
         for j_pos in range(i_pos + 1, allowed_indices.size):
@@ -1141,11 +1162,12 @@ def rank_seed_motifs(match_adj, match_scores, allowed_indices):
                 if k in allowed and match_adj[i, k] and match_adj[j, k]:
                     ranked[3].append((
                         float(match_scores[i] + match_scores[j] + match_scores[k]),
+                        float(match_tiebreak_scores[i] + match_tiebreak_scores[j] + match_tiebreak_scores[k]),
                         tuple(sorted((int(i), int(j), int(k))))
                     ))
 
     for motif_size in ranked:
-        ranked[motif_size].sort(key=lambda item: (-item[0], item[1]))
+        ranked[motif_size].sort(key=lambda item: (-item[0], -item[1], item[2]))
     return ranked
 
 
@@ -1184,7 +1206,7 @@ def solve_frontier_assignment(frontier_A, frontier_B, candidate_pairs, candidate
     return selected
 
 
-def select_initial_match_component(matches, match_adj, match_scores):
+def select_initial_match_component(matches, match_adj, match_scores, match_tiebreak_scores=None):
     """
     Select the strongest initial motif in the match graph.
 
@@ -1192,7 +1214,8 @@ def select_initial_match_component(matches, match_adj, match_scores):
     1. compute a deterministic one-to-one assignment over candidate cluster
        pairs using their global evidence scores
     2. within that assignment, choose the highest-scoring connected triangle,
-       else edge, else singleton
+       else edge, else singleton, using log-enrichment only as a secondary
+       tie-break among equal primary scores
 
     Exact or near-exact ties are reported in the returned diagnostics rather
     than silently broken by iteration order.
@@ -1211,7 +1234,7 @@ def select_initial_match_component(matches, match_adj, match_scores):
     else:
         assignment_mode = "stable_one_to_one"
 
-    ranked = rank_seed_motifs(match_adj, match_scores, assigned_indices)
+    ranked = rank_seed_motifs(match_adj, match_scores, assigned_indices, match_tiebreak_scores=match_tiebreak_scores)
     chosen_size = None
     chosen_records = []
     for motif_size in (3, 2, 1):
@@ -1227,11 +1250,12 @@ def select_initial_match_component(matches, match_adj, match_scores):
             "seed_assignment_mode": assignment_mode,
         }
 
-    best_score, best_indices = chosen_records[0]
+    best_score, best_tiebreak, best_indices = chosen_records[0]
     second_score = chosen_records[1][0] if len(chosen_records) > 1 else -np.inf
-    second_indices = chosen_records[1][1] if len(chosen_records) > 1 else tuple()
+    second_tiebreak = chosen_records[1][1] if len(chosen_records) > 1 else -np.inf
+    second_indices = chosen_records[1][2] if len(chosen_records) > 1 else tuple()
 
-    motif_scores = np.array([score for score, _ in chosen_records], dtype=np.float64)
+    motif_scores = np.array([score for score, _, _ in chosen_records], dtype=np.float64)
     unique_scores = np.unique(motif_scores)
     positive_gaps = np.diff(np.sort(unique_scores))
     positive_gaps = positive_gaps[positive_gaps > 0]
@@ -1255,7 +1279,9 @@ def select_initial_match_component(matches, match_adj, match_scores):
         "seed_assignment_mode": assignment_mode,
         "seed_motif_size": int(chosen_size),
         "seed_best_score": float(best_score),
+        "seed_best_tiebreak": float(best_tiebreak),
         "seed_second_score": float(second_score) if np.isfinite(second_score) else None,
+        "seed_second_tiebreak": float(second_tiebreak) if np.isfinite(second_tiebreak) else None,
         "seed_log_evidence_gap": float(score_gap) if np.isfinite(score_gap) else None,
         "seed_evidence_ratio": float(score_ratio) if np.isfinite(score_ratio) else None,
         "seed_score_resolution": float(score_resolution),
@@ -1267,15 +1293,18 @@ def select_initial_match_component(matches, match_adj, match_scores):
     return np.array(best_indices, dtype=int), diagnostics
 
 
-def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
+def select_initial_match_components(matches, match_adj, match_scores, match_tiebreak_scores=None, top_k=3):
     """
     Enumerate the top seed motifs to be expanded as competing macro hypotheses.
 
     Instead of committing immediately to a single seed, the routine returns up
     to ``top_k`` motifs ranked by total motif evidence, with larger motifs used
-    as a topology-aware tie-break. This keeps the usual preference for
-    triangle/edge/singleton support, but does not let a weak triangle suppress a
-    much stronger edge once we have decided to evaluate several seeds anyway.
+    as a topology-aware tie-break. Summed log-enrichment is used only as a
+    secondary ordering signal among equal primary scores, so transport evidence
+    is not counted twice in the main objective. This keeps the usual preference
+    for triangle/edge/singleton support, but does not let a weak triangle
+    suppress a much stronger edge once we have decided to evaluate several
+    seeds anyway.
     """
     if len(matches) == 0 or match_adj.shape[0] == 0:
         return [], {
@@ -1285,6 +1314,10 @@ def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
         }
 
     match_scores = np.asarray(match_scores, dtype=np.float64)
+    if match_tiebreak_scores is None:
+        match_tiebreak_scores = np.zeros_like(match_scores, dtype=np.float64)
+    else:
+        match_tiebreak_scores = np.asarray(match_tiebreak_scores, dtype=np.float64)
     assigned_indices = solve_seed_assignment(matches, match_scores)
     if assigned_indices.size == 0:
         assigned_indices = np.arange(len(matches), dtype=int)
@@ -1292,17 +1325,22 @@ def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
     else:
         assignment_mode = "stable_one_to_one"
 
-    ranked = rank_seed_motifs(match_adj, match_scores, assigned_indices)
+    ranked = rank_seed_motifs(
+        match_adj,
+        match_scores,
+        assigned_indices,
+        match_tiebreak_scores=match_tiebreak_scores,
+    )
     ordered_records = []
     best_size = None
     for motif_size in (3, 2, 1):
         motif_records = ranked.get(motif_size, [])
         if motif_records and best_size is None:
             best_size = motif_size
-        for score, indices in motif_records:
-            ordered_records.append((int(motif_size), float(score), tuple(indices)))
+        for score, tiebreak, indices in motif_records:
+            ordered_records.append((int(motif_size), float(score), float(tiebreak), tuple(indices)))
 
-    ordered_records.sort(key=lambda item: (-item[1], -item[0], item[2]))
+    ordered_records.sort(key=lambda item: (-item[1], -item[2], -item[0], item[3]))
 
     if not ordered_records:
         return [], {
@@ -1314,15 +1352,17 @@ def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
 
     top_k = max(int(top_k), 1)
     chosen_records = ordered_records[:top_k]
-    selected = [np.array(indices, dtype=int) for _, _, indices in chosen_records]
+    selected = [np.array(indices, dtype=int) for _, _, _, indices in chosen_records]
 
     best_score = chosen_records[0][1]
-    best_indices = chosen_records[0][2]
+    best_tiebreak = chosen_records[0][2]
+    best_indices = chosen_records[0][3]
     best_size = int(chosen_records[0][0])
     second_score = chosen_records[1][1] if len(chosen_records) > 1 else -np.inf
-    second_indices = chosen_records[1][2] if len(chosen_records) > 1 else tuple()
+    second_tiebreak = chosen_records[1][2] if len(chosen_records) > 1 else -np.inf
+    second_indices = chosen_records[1][3] if len(chosen_records) > 1 else tuple()
 
-    motif_scores = np.array([score for _, score, _ in ordered_records], dtype=np.float64)
+    motif_scores = np.array([score for _, score, _, _ in ordered_records], dtype=np.float64)
     unique_scores = np.unique(motif_scores)
     positive_gaps = np.diff(np.sort(unique_scores))
     positive_gaps = positive_gaps[positive_gaps > 0]
@@ -1347,7 +1387,9 @@ def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
         "seed_assignment_mode": assignment_mode,
         "seed_motif_size": int(best_size),
         "seed_best_score": float(best_score),
+        "seed_best_tiebreak": float(best_tiebreak),
         "seed_second_score": float(second_score) if np.isfinite(second_score) else None,
+        "seed_second_tiebreak": float(second_tiebreak) if np.isfinite(second_tiebreak) else None,
         "seed_log_evidence_gap": float(score_gap) if np.isfinite(score_gap) else None,
         "seed_evidence_ratio": float(score_ratio) if np.isfinite(score_ratio) else None,
         "seed_score_resolution": float(score_resolution),
@@ -1355,8 +1397,9 @@ def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
         "seed_best_indices": list(best_indices),
         "seed_second_indices": list(second_indices),
         "seed_assignment_pairs": [matches[i] for i in assigned_indices.tolist()],
-        "seed_trial_indices": [list(record[2]) for record in chosen_records],
+        "seed_trial_indices": [list(record[3]) for record in chosen_records],
         "seed_trial_scores": [float(record[1]) for record in chosen_records],
+        "seed_trial_tiebreaks": [float(record[2]) for record in chosen_records],
         "seed_trial_sizes": [int(record[0]) for record in chosen_records],
     }
     return selected, diagnostics
@@ -1602,7 +1645,7 @@ def extract_continuous_macro_section(
     global_shape_B = np.asarray(cluster_cache_B.global_shape, dtype=np.float64)
 
     # 4. Assemble candidate cluster-pairs and their global evidence.
-    matches, match_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
+    matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
         Pi_cluster,
         valid_A,
         valid_B,
@@ -1634,6 +1677,7 @@ def extract_continuous_macro_section(
         matches,
         match_adj,
         global_pair_scores,
+        match_tiebreak_scores=match_tiebreak_scores,
         top_k=3,
     )
     diagnostics.update(seed_diagnostics)
