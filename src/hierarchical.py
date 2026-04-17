@@ -1166,17 +1166,14 @@ def score_seed_motif(
     centroids_B,
 ):
     """
-    Score a connected seed motif as a small common subgraph.
+    Score a connected seed motif using only summed node evidence.
 
-    The seed score intentionally uses more than the sum of node evidence. A
-    trustworthy seed should consist of individually plausible matched pairs
-    whose mutual geometry is also preserved across slices. The score therefore
-    combines:
-
-    1. node evidence from the candidate-pair score
-    2. edge compatibility over motif edges in the product graph
-    3. rigid/reflection consistency of the whole motif when at least two pairs
-       are available
+    Seed selection is intentionally simpler than later expansion and final
+    hypothesis scoring. At this stage, the motif acts only as a locally
+    connected, one-to-one anchor. Its raw score is therefore the sum of the
+    per-pair global evidence values, while overlap penalties are applied only
+    when selecting multiple seed trials. Local geometry and rigid consistency
+    are reserved for the later frontier-growth and macro-hypothesis stages.
     """
     motif_indices = tuple(sorted(int(idx) for idx in motif_indices))
     if len(motif_indices) == 0:
@@ -1197,52 +1194,23 @@ def score_seed_motif(
     tiebreak = float(np.sum([match_tiebreak_scores[int(idx)] for idx in motif_indices]))
 
     motif_edges = []
-    topology_gaps = []
-    attachment_gaps = []
     for pos, i in enumerate(motif_indices):
-        u1, v1 = matches[int(i)]
         for j in motif_indices[pos + 1:]:
             if not match_adj[int(i), int(j)]:
                 continue
-            u2, v2 = matches[int(j)]
             motif_edges.append((int(i), int(j)))
-            topology_gaps.append(abs(float(geodesic_A[u1, u2] - geodesic_B[v1, v2])))
-            attachment_gaps.append(abs(float(edge_A_norm[u1, u2] - edge_B_norm[v1, v2])))
 
     if len(motif_indices) > 1 and not motif_edges:
         return None
 
-    edge_score = 0.0
-    if topology_gaps:
-        edge_score += -float(np.sum(np.log1p(np.asarray(topology_gaps, dtype=np.float64))))
-    if attachment_gaps:
-        edge_score += -float(np.sum(np.log1p(np.asarray(attachment_gaps, dtype=np.float64))))
-
-    rigid_score = 0.0
-    if len(motif_indices) >= 2:
-        weights = np.maximum(
-            np.asarray([match_scores[int(idx)] for idx in motif_indices], dtype=np.float64),
-            0.0,
-        ) + 1e-6
-        source_points = centroids_A[[matches[int(idx)][0] for idx in motif_indices]]
-        target_points = centroids_B[[matches[int(idx)][1] for idx in motif_indices]]
-        R_seed, t_seed = fit_weighted_rigid_transform(source_points, target_points, weights=weights)
-        transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
-        rigid_residuals = [
-            float(np.linalg.norm(target - (source @ R_seed.T + t_seed)) / transform_scale)
-            for source, target in zip(source_points, target_points)
-        ]
-        rigid_score = -float(np.sum(np.log1p(np.asarray(rigid_residuals, dtype=np.float64))))
-
-    total_score = float(node_score + edge_score + rigid_score)
     return {
         "size": int(len(motif_indices)),
-        "score": total_score,
+        "score": float(node_score),
         "tiebreak": tiebreak,
         "indices": motif_indices,
         "node_score": float(node_score),
-        "edge_score": float(edge_score),
-        "rigid_score": float(rigid_score),
+        "edge_score": 0.0,
+        "rigid_score": 0.0,
         "edge_count": int(len(motif_edges)),
     }
 
@@ -1322,9 +1290,10 @@ def rank_seed_motifs(
     """
     Enumerate admissible connected seed motifs in deterministic score order.
 
-    Candidate seed motifs are scored as small connected common subgraphs rather
-    than as bags of independently good node matches. Connected 2- and 3-node
-    motifs are preferred because they already encode local shared topology.
+    Connected 2- and 3-node motifs are treated as admissible local anchors, but
+    their raw seed score is simply the sum of their pair-level global evidence.
+    Connectivity and one-to-one consistency remain hard constraints; overlap
+    diversity is handled only later when selecting the top-k seed trials.
     Singletons are retained only as a conservative fallback when no connected
     multi-pair seed exists.
 
@@ -1486,12 +1455,10 @@ def select_initial_match_components(
 
     Instead of hard-filtering candidate pairs through a global assignment
     before motif search, the routine scores connected 2- and 3-node one-to-one
-    motifs directly as small common subgraphs. Each seed motif is ranked by:
+    motifs directly by summed pair-level global evidence. Each seed motif is
+    therefore judged only by:
 
-    1. summed node evidence across the matched pairs
-    2. edge compatibility on the product graph using geodesic and attachment
-       agreement
-    3. motif-level rigid/reflection consistency
+    1. summed global pair evidence across the matched pairs
 
     Log-enrichment is retained only as a secondary tie-break. Singletons are
     used only when no connected multi-pair motif exists, which keeps the seeds
@@ -1636,6 +1603,7 @@ def select_initial_match_components(
         "seed_trial_rigid_scores": [float(record["rigid_score"]) for record in chosen_records],
         "seed_trial_edge_counts": [int(record["edge_count"]) for record in chosen_records],
         "seed_search_mode": seed_search_mode,
+        "seed_scoring_mode": "sum_global_pair_evidence",
         "seed_diversification_mode": "greedy_overlap_penalized_topk",
         "seed_singleton_candidate_count": ranked_count_singletons,
         "seed_edge_candidate_count": ranked_count_edges,
@@ -1780,12 +1748,13 @@ def extract_continuous_macro_section(
        Transport-supported cluster-pairs are scored by mutual-information
        contribution, local niche context, and a cluster-centered global
        morphology descriptor. Connected 2- and 3-node seed motifs are then
-       scored directly as small one-to-one common subgraphs using both node
-       evidence and preserved local geometry. The top few seed trials are then
-       chosen by greedy score ranking with an overlap penalty so that distinct
-       local hypotheses are explored rather than trivial variants of the same
-       seed. Singletons are used only as a conservative fallback when no
-       connected multi-pair seed exists.
+       scored directly by summed pair-level global evidence, with connectivity
+       and one-to-one consistency treated as hard constraints rather than soft
+       score terms. The top few seed trials are then chosen by greedy score
+       ranking with an overlap penalty so that distinct local hypotheses are
+       explored rather than trivial variants of the same seed. Singletons are
+       used only as a conservative fallback when no connected multi-pair seed
+       exists.
 
     2. Coupled frontier expansion:
        Starting from each seed motif, the method grows both slices jointly on

@@ -76,7 +76,7 @@ def test_select_initial_match_components_falls_back_to_singletons_when_multinode
         ],
         dtype=bool,
     )
-    match_scores = np.array([0.2, 0.2], dtype=np.float64)
+    match_scores = np.array([-0.2, -0.2], dtype=np.float64)
     match_tiebreak_scores = np.array([0.1, 0.05], dtype=np.float64)
     centroids = np.array(
         [
