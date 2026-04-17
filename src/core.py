@@ -10,7 +10,13 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 
 from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
 from .clustering import cluster_cells_spatial
-from .hierarchical import extract_cluster_features, compute_cluster_feature_costs, compute_cluster_structural_matrix, run_coarse_partial_fgw, extract_continuous_macro_section
+from .hierarchical import (
+    build_slice_cluster_cache,
+    compute_cluster_feature_costs,
+    compute_cluster_structural_matrix,
+    extract_continuous_macro_section,
+    run_coarse_partial_fgw,
+)
 from .visualize import (
     visualize_clustered_slices,
     visualize_cluster_mapping,
@@ -56,8 +62,34 @@ def hierarchical_pairwise_align(
         visualize_clustered_slices(sliceA, sliceB, labelsA, labelsB, spatial_key=spatial_key)
     
     print("--- [HOT] Step 2: Extracting Cluster Features ---")
-    p_A, centroidsA, mu_exprA, mu_structA  = extract_cluster_features(sliceA, labelsA, spatial_key, use_rep, label_key, all_types=all_types)
-    p_B, centroidsB, mu_exprB, mu_structB = extract_cluster_features(sliceB, labelsB, spatial_key, use_rep, label_key, all_types=all_types)
+    cache_A = build_slice_cluster_cache(
+        sliceA,
+        labelsA,
+        spatial_key=spatial_key,
+        feature_key=use_rep,
+        label_key=label_key,
+        all_types=all_types,
+    )
+    cache_B = build_slice_cluster_cache(
+        sliceB,
+        labelsB,
+        spatial_key=spatial_key,
+        feature_key=use_rep,
+        label_key=label_key,
+        all_types=all_types,
+    )
+    p_A, centroidsA, mu_exprA, mu_structA = (
+        cache_A.masses,
+        cache_A.centroids,
+        cache_A.mu_expr,
+        cache_A.mu_struct,
+    )
+    p_B, centroidsB, mu_exprB, mu_structB = (
+        cache_B.masses,
+        cache_B.centroids,
+        cache_B.mu_expr,
+        cache_B.mu_struct,
+    )
     
     print("--- [HOT] Step 3: Compute Cluster Costs and Structures ---")
     M_cluster = compute_cluster_feature_costs(mu_exprA, mu_structA, mu_exprB, mu_structB, beta=beta)
@@ -79,7 +111,9 @@ def hierarchical_pairwise_align(
         labelsB,
         Pi_cluster,
         spatial_key=spatial_key,
-        label_key=label_key
+        label_key=label_key,
+        cluster_cache_A=cache_A,
+        cluster_cache_B=cache_B,
     )
     if not macro_section.ok:
         raise ValueError(

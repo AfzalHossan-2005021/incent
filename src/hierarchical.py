@@ -62,9 +62,136 @@ class MacroSectionResult:
         )
 
 
+@dataclass
+class SliceClusterCache:
+    """
+    Shared per-slice cluster summaries reused across hierarchical stages.
+
+    The hierarchical pipeline previously recomputed centroids and global
+    morphology descriptors inside `extract_continuous_macro_section`, even
+    though the same quantities had already been constructed for the coarse FGW
+    stage. Centralizing them in a cache keeps the definitions identical across
+    stages and makes the pipeline easier to audit.
+    """
+    labels: np.ndarray
+    masses: np.ndarray
+    centroids: np.ndarray
+    valid: np.ndarray
+    mu_expr: np.ndarray
+    mu_struct_local: np.ndarray
+    global_shape: np.ndarray
+    mu_struct: np.ndarray
+    cluster_hist: np.ndarray
+    all_types: np.ndarray
+
+
+def build_slice_cluster_cache(
+    adata,
+    labels,
+    spatial_key="spatial",
+    feature_key="X_pca",
+    label_key="cell_type_annot",
+    all_types=None,
+) -> SliceClusterCache:
+    """
+    Compute reusable cluster summaries for one slice.
+
+    The cache contains the cluster centroids, mean expression, intrinsic
+    structural summaries, global morphology descriptors, and cell-type
+    histograms needed by both the coarse FGW stage and the later macro-overlap
+    extraction stage.
+    """
+    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    n_cells = coords.shape[0]
+
+    if feature_key == "X":
+        if sp.issparse(adata.X):
+            expr = adata.X.toarray()
+        else:
+            expr = np.asarray(adata.X)
+    else:
+        expr = np.asarray(adata.obsm[feature_key])
+
+    cell_types = adata.obs[label_key].astype(str).to_numpy()
+    if all_types is None:
+        all_types = np.array(sorted(np.unique(cell_types)), dtype=str)
+    else:
+        all_types = np.array(all_types, dtype=str)
+
+    type_to_idx = {ct: i for i, ct in enumerate(all_types)}
+    unique_labels = np.unique(labels)
+    n_clusters = len(unique_labels)
+
+    masses = np.zeros(n_clusters, dtype=np.float64)
+    mu_expr = np.zeros((n_clusters, expr.shape[1]), dtype=np.float64)
+    centroids = np.zeros((n_clusters, 2), dtype=np.float64)
+    valid = np.zeros(n_clusters, dtype=bool)
+    mu_struct_local = np.zeros((n_clusters, len(all_types) * 3), dtype=np.float64)
+    cluster_hist = np.zeros((n_clusters, len(all_types)), dtype=np.float64)
+
+    for cluster_idx, cluster_id in enumerate(unique_labels):
+        mask = labels == cluster_id
+        cluster_size = int(np.sum(mask))
+        masses[cluster_idx] = cluster_size / float(max(n_cells, 1))
+        if cluster_size == 0:
+            continue
+
+        valid[cluster_idx] = True
+        mu_expr[cluster_idx] = np.mean(expr[mask], axis=0)
+        centroids[cluster_idx] = np.mean(coords[mask], axis=0)
+
+        mapped_types = np.array(
+            [type_to_idx[t] for t in cell_types[mask] if t in type_to_idx],
+            dtype=int,
+        )
+        if mapped_types.size == 0:
+            continue
+
+        counts = np.bincount(mapped_types, minlength=len(all_types)).astype(np.float64)
+        cluster_hist[cluster_idx] = counts / max(counts.sum(), 1.0)
+
+        rel_coords = coords[mask] - centroids[cluster_idx]
+        thetas = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
+        local_feat = np.zeros((len(all_types), 3), dtype=np.float64)
+        for harmonic_idx, m in enumerate((0, 1, 2)):
+            if m == 0:
+                mag = counts
+            else:
+                ang = m * thetas
+                real = np.bincount(mapped_types, weights=np.cos(ang), minlength=len(all_types))
+                imag = np.bincount(mapped_types, weights=np.sin(ang), minlength=len(all_types))
+                mag = np.hypot(real, imag)
+            local_feat[:, harmonic_idx] = mag
+
+        flat_local = local_feat.reshape(-1)
+        if flat_local.sum() > 0:
+            flat_local /= flat_local.sum()
+        mu_struct_local[cluster_idx] = flat_local
+
+    global_shape = compute_cluster_global_shape_features(coords, centroids)
+    mu_struct = np.concatenate([mu_struct_local, global_shape], axis=1)
+
+    return SliceClusterCache(
+        labels=np.asarray(labels),
+        masses=masses,
+        centroids=centroids,
+        valid=valid,
+        mu_expr=mu_expr,
+        mu_struct_local=mu_struct_local,
+        global_shape=global_shape,
+        mu_struct=mu_struct,
+        cluster_hist=cluster_hist,
+        all_types=all_types,
+    )
+
+
 def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X_pca", label_key="cell_type_annot", all_types=None) -> tuple:
     """
     Extract cluster-level features for coarse mapping.
+
+    This is a compatibility wrapper around `build_slice_cluster_cache`, which is
+    the shared implementation used by both the coarse FGW stage and the later
+    macro-overlap stage.
     
     Args:
         adata: AnnData object.
@@ -82,78 +209,15 @@ def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="
             1. intrinsic within-cluster cell-type Fourier summaries
             2. cluster-centered global tissue morphology descriptors
     """
-    coords = adata.obsm[spatial_key]
-    n_cells = coords.shape[0]
-    
-    if feature_key == "X":
-        if sp.issparse(adata.X):
-            expr = adata.X.toarray()
-        else:
-            expr = adata.X
-    else:
-        expr = adata.obsm[feature_key]
-        
-    ctypes = adata.obs[label_key].astype(str).values
-    if all_types is None:
-        unique_types = np.unique(ctypes)
-    else:
-        unique_types = np.array(all_types)
-        
-    type_map = {t: i for i, t in enumerate(unique_types)}
-    n_types = len(unique_types)
-    
-    unique_labels = np.unique(labels)
-    n_clusters = len(unique_labels)
-    
-    masses = np.zeros(n_clusters)
-    mu_expr = np.zeros((n_clusters, expr.shape[1]))
-    centroids = np.zeros((n_clusters, 2))
-    
-    # 3 harmonics (m=0, 1, 2) per cell type for the intrinsic cluster summary
-    mu_struct_local = np.zeros((n_clusters, n_types * 3))
-    
-    for c_i, c in enumerate(unique_labels):
-        mask = (labels == c)
-        c_size = np.sum(mask)
-        masses[c_i] = c_size / float(n_cells)
-        
-        if c_size > 0:
-            mu_expr[c_i, :] = np.mean(expr[mask], axis=0)
-            centroids[c_i, :] = np.mean(coords[mask], axis=0)
-            
-            c_types = ctypes[mask]
-            # Map types; ignore if they don't exist in target mapping
-            mapped_types = [type_map[t] for t in c_types if t in type_map]
-            counts = np.bincount(mapped_types, minlength=n_types).astype(np.float64)
-            
-            # --- Computed Intrinsic Cluster Fourier Context ---
-            # Evaluates cell localization RELATIVE to the macro-cluster centroid
-            rel_coords = coords[mask] - centroids[c_i]
-            thetas = np.arctan2(rel_coords[:, 1], rel_coords[:, 0])
-            
-            local_feat = np.zeros((n_types, 3))
-            c_types_idx = np.array(mapped_types)
-            
-            for h_idx, m in enumerate([0, 1, 2]):
-                if m == 0:
-                    mag = counts
-                else:
-                    ang = m * thetas
-                    real = np.bincount(c_types_idx, weights=np.cos(ang), minlength=n_types)
-                    imag = np.bincount(c_types_idx, weights=np.sin(ang), minlength=n_types)
-                    mag = np.hypot(real, imag)
-                    
-                local_feat[:, h_idx] = mag
-            
-            flat = local_feat.reshape(-1)
-            if flat.sum() > 0:
-                flat /= flat.sum()
-            mu_struct_local[c_i, :] = flat
-
-    global_shape = compute_cluster_global_shape_features(coords, centroids)
-    mu_struct = np.concatenate([mu_struct_local, global_shape], axis=1)
-
-    return masses, centroids, mu_expr, mu_struct
+    cache = build_slice_cluster_cache(
+        adata,
+        labels,
+        spatial_key=spatial_key,
+        feature_key=feature_key,
+        label_key=label_key,
+        all_types=all_types,
+    )
+    return cache.masses, cache.centroids, cache.mu_expr, cache.mu_struct
 
 
 def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, beta=0.75):
@@ -810,22 +874,6 @@ def empty_macro_section_result(n_cells_A, n_cells_B, reason, diagnostics=None):
     )
 
 
-def compute_cluster_centroids_and_validity(coords, labels, n_clusters):
-    """
-    Compute cluster centroids and a validity mask for non-empty clusters.
-    """
-    centroids = np.zeros((n_clusters, 2), dtype=np.float64)
-    valid = np.zeros(n_clusters, dtype=bool)
-
-    for cluster_id in range(n_clusters):
-        mask = labels == cluster_id
-        if np.any(mask):
-            centroids[cluster_id] = coords[mask].mean(axis=0)
-            valid[cluster_id] = True
-
-    return centroids, valid
-
-
 def build_match_graph(matches, adj_A, adj_B):
     """
     Build the product-graph adjacency over admissible matched cluster-pairs.
@@ -1436,7 +1484,9 @@ def extract_continuous_macro_section(
     labels_B,
     Pi_cluster,
     spatial_key='spatial',
-    label_key='cell_type_annot'
+    label_key='cell_type_annot',
+    cluster_cache_A=None,
+    cluster_cache_B=None,
 ):
     """
     Identify a compact, biologically consistent overlap region from the coarse alignment.
@@ -1470,6 +1520,12 @@ def extract_continuous_macro_section(
     exactly indistinguishable under the observed features, the method reports
     the ambiguity rather than pretending uniqueness.
 
+    When per-slice cluster caches are supplied, the function reuses the same
+    centroids, histograms, and global morphology descriptors already computed
+    for the coarse alignment stage. This avoids silently using two slightly
+    different definitions of the same cluster summary in different parts of the
+    pipeline.
+
     Returns
     -------
     MacroSectionResult
@@ -1490,10 +1546,42 @@ def extract_continuous_macro_section(
 
     coords_A, coords_B = sliceA.obsm[spatial_key], sliceB.obsm[spatial_key]
 
-    # 1. Compute cluster centroids and validity masks.
     num_clusters_A, num_clusters_B = Pi_cluster.shape
-    centroids_A, valid_A = compute_cluster_centroids_and_validity(coords_A, labels_A, num_clusters_A)
-    centroids_B, valid_B = compute_cluster_centroids_and_validity(coords_B, labels_B, num_clusters_B)
+    if cluster_cache_A is None:
+        feature_key_A = "X_pca" if "X_pca" in sliceA.obsm else "X"
+        cluster_cache_A = build_slice_cluster_cache(
+            sliceA,
+            labels_A,
+            spatial_key=spatial_key,
+            feature_key=feature_key_A,
+            label_key=label_key,
+        )
+    if cluster_cache_B is None:
+        feature_key_B = "X_pca" if "X_pca" in sliceB.obsm else "X"
+        cluster_cache_B = build_slice_cluster_cache(
+            sliceB,
+            labels_B,
+            spatial_key=spatial_key,
+            feature_key=feature_key_B,
+            label_key=label_key,
+            all_types=cluster_cache_A.all_types,
+        )
+
+    if cluster_cache_A.centroids.shape[0] != num_clusters_A or cluster_cache_B.centroids.shape[0] != num_clusters_B:
+        raise ValueError(
+            "Cluster cache dimensions did not match the coarse transport plan. "
+            "Make sure the cache was built from the same labels used for Pi_cluster."
+        )
+    if cluster_cache_A.cluster_hist.shape[1] != cluster_cache_B.cluster_hist.shape[1]:
+        raise ValueError(
+            "Slice cluster caches were built with incompatible cell-type vocabularies."
+        )
+
+    # 1. Reuse cluster centroids and validity masks from the shared cache.
+    centroids_A = np.asarray(cluster_cache_A.centroids, dtype=np.float64)
+    centroids_B = np.asarray(cluster_cache_B.centroids, dtype=np.float64)
+    valid_A = np.asarray(cluster_cache_A.valid, dtype=bool)
+    valid_B = np.asarray(cluster_cache_B.valid, dtype=bool)
 
     # 2. Build cluster contact graphs and intrinsic geodesic coordinates.
     adj_A, edge_A = build_cluster_contact_graph(coords_A, labels_A, valid_A)
@@ -1504,22 +1592,14 @@ def extract_continuous_macro_section(
     geodesic_A = compute_graph_geodesics(edge_A_norm)
     geodesic_B = compute_graph_geodesics(edge_B_norm)
 
-    # 3. Build biologically grounded cluster context descriptors and a
-    # cluster-centered global morphology descriptor.
-    all_types = np.array(sorted(
-        set(sliceA.obs[label_key].astype(str)) |
-        set(sliceB.obs[label_key].astype(str))
-    ), dtype=str)
-    cluster_hist_A, _ = compute_cluster_cell_type_histograms(
-        sliceA, labels_A, num_clusters_A, label_key=label_key, all_types=all_types
-    )
-    cluster_hist_B, _ = compute_cluster_cell_type_histograms(
-        sliceB, labels_B, num_clusters_B, label_key=label_key, all_types=all_types
-    )
+    # 3. Build biologically grounded cluster context descriptors and reuse the
+    # cluster-centered global morphology descriptor from the shared cache.
+    cluster_hist_A = np.asarray(cluster_cache_A.cluster_hist, dtype=np.float64)
+    cluster_hist_B = np.asarray(cluster_cache_B.cluster_hist, dtype=np.float64)
     context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
     context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
-    global_shape_A = compute_cluster_global_shape_features(coords_A, centroids_A)
-    global_shape_B = compute_cluster_global_shape_features(coords_B, centroids_B)
+    global_shape_A = np.asarray(cluster_cache_A.global_shape, dtype=np.float64)
+    global_shape_B = np.asarray(cluster_cache_B.global_shape, dtype=np.float64)
 
     # 4. Assemble candidate cluster-pairs and their global evidence.
     matches, match_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
