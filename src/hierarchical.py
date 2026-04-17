@@ -56,7 +56,10 @@ class MacroSectionResult:
 
     @property
     def ambiguous(self) -> bool:
-        return bool(self.diagnostics.get("seed_ambiguity_detected", False))
+        return bool(
+            self.diagnostics.get("seed_ambiguity_detected", False)
+            or self.diagnostics.get("macro_hypothesis_ambiguity_detected", False)
+        )
 
 
 def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X_pca", label_key="cell_type_annot", all_types=None) -> tuple:
@@ -1216,6 +1219,216 @@ def select_initial_match_component(matches, match_adj, match_scores):
     return np.array(best_indices, dtype=int), diagnostics
 
 
+def select_initial_match_components(matches, match_adj, match_scores, top_k=3):
+    """
+    Enumerate the top seed motifs to be expanded as competing macro hypotheses.
+
+    Instead of committing immediately to a single seed, the routine returns up
+    to ``top_k`` motifs ranked by total motif evidence, with larger motifs used
+    as a topology-aware tie-break. This keeps the usual preference for
+    triangle/edge/singleton support, but does not let a weak triangle suppress a
+    much stronger edge once we have decided to evaluate several seeds anyway.
+    """
+    if len(matches) == 0 or match_adj.shape[0] == 0:
+        return [], {
+            "seed_assignment_count": 0,
+            "seed_candidate_count": 0,
+            "seed_trial_count": 0,
+        }
+
+    match_scores = np.asarray(match_scores, dtype=np.float64)
+    assigned_indices = solve_seed_assignment(matches, match_scores)
+    if assigned_indices.size == 0:
+        assigned_indices = np.arange(len(matches), dtype=int)
+        assignment_mode = "fallback_all_candidates"
+    else:
+        assignment_mode = "stable_one_to_one"
+
+    ranked = rank_seed_motifs(match_adj, match_scores, assigned_indices)
+    ordered_records = []
+    best_size = None
+    for motif_size in (3, 2, 1):
+        motif_records = ranked.get(motif_size, [])
+        if motif_records and best_size is None:
+            best_size = motif_size
+        for score, indices in motif_records:
+            ordered_records.append((int(motif_size), float(score), tuple(indices)))
+
+    ordered_records.sort(key=lambda item: (-item[1], -item[0], item[2]))
+
+    if not ordered_records:
+        return [], {
+            "seed_assignment_count": int(assigned_indices.size),
+            "seed_candidate_count": 0,
+            "seed_trial_count": 0,
+            "seed_assignment_mode": assignment_mode,
+        }
+
+    top_k = max(int(top_k), 1)
+    chosen_records = ordered_records[:top_k]
+    selected = [np.array(indices, dtype=int) for _, _, indices in chosen_records]
+
+    best_score = chosen_records[0][1]
+    best_indices = chosen_records[0][2]
+    best_size = int(chosen_records[0][0])
+    second_score = chosen_records[1][1] if len(chosen_records) > 1 else -np.inf
+    second_indices = chosen_records[1][2] if len(chosen_records) > 1 else tuple()
+
+    motif_scores = np.array([score for _, score, _ in ordered_records], dtype=np.float64)
+    unique_scores = np.unique(motif_scores)
+    positive_gaps = np.diff(np.sort(unique_scores))
+    positive_gaps = positive_gaps[positive_gaps > 0]
+    score_resolution = float(np.min(positive_gaps)) if positive_gaps.size > 0 else 0.0
+
+    if np.isfinite(second_score):
+        score_gap = float(best_score - second_score)
+        score_ratio = float(np.exp(score_gap))
+        ambiguity_detected = bool(
+            np.isclose(best_score, second_score, rtol=1e-6, atol=1e-8)
+            or score_gap <= max(score_resolution, 1e-12)
+        )
+    else:
+        score_gap = np.inf
+        score_ratio = np.inf
+        ambiguity_detected = False
+
+    diagnostics = {
+        "seed_assignment_count": int(assigned_indices.size),
+        "seed_candidate_count": int(len(ordered_records)),
+        "seed_trial_count": int(len(chosen_records)),
+        "seed_assignment_mode": assignment_mode,
+        "seed_motif_size": int(best_size),
+        "seed_best_score": float(best_score),
+        "seed_second_score": float(second_score) if np.isfinite(second_score) else None,
+        "seed_log_evidence_gap": float(score_gap) if np.isfinite(score_gap) else None,
+        "seed_evidence_ratio": float(score_ratio) if np.isfinite(score_ratio) else None,
+        "seed_score_resolution": float(score_resolution),
+        "seed_ambiguity_detected": ambiguity_detected,
+        "seed_best_indices": list(best_indices),
+        "seed_second_indices": list(second_indices),
+        "seed_assignment_pairs": [matches[i] for i in assigned_indices.tolist()],
+        "seed_trial_indices": [list(record[2]) for record in chosen_records],
+        "seed_trial_scores": [float(record[1]) for record in chosen_records],
+        "seed_trial_sizes": [int(record[0]) for record in chosen_records],
+    }
+    return selected, diagnostics
+
+
+def score_macro_hypothesis(
+    selected_pairs,
+    matches,
+    match_adj,
+    global_pair_evidence,
+    mi_contrib,
+    Pi_cluster,
+    geodesic_A,
+    geodesic_B,
+    edge_A_norm,
+    edge_B_norm,
+    edge_scale_A,
+    edge_scale_B,
+    centroids_A,
+    centroids_B,
+):
+    """
+    Score a fully expanded macro-overlap hypothesis.
+
+    We do not rerun FGW as the primary selection criterion because raw FGW
+    objectives are not directly comparable across differently sized overlap
+    subsets and tend to over-favor tiny, very clean seeds. Instead, we evaluate
+    the hypothesis using the same evidence family that drove expansion:
+
+    1. node evidence from the global pair score
+    2. absolute penalties for violated geodesic and attachment geometry
+    3. an absolute rigid-consistency penalty once the hypothesis defines an orientation
+
+    This produces a size-aware score without adding extra hyperparameters: a
+    larger hypothesis wins only if it keeps contributing positive biological and
+    topological evidence.
+    """
+    if len(selected_pairs) == 0:
+        return {
+            "total_score": -np.inf,
+            "node_score": -np.inf,
+            "topology_score": -np.inf,
+            "attachment_score": -np.inf,
+            "rigid_score": -np.inf,
+            "selected_pair_count": 0,
+            "selected_edge_count": 0,
+            "selected_mi_sum": 0.0,
+            "selected_transport_mass": 0.0,
+        }
+
+    node_score = float(np.sum([global_pair_evidence[pair] for pair in selected_pairs]))
+    selected_mi_sum = float(np.sum([mi_contrib[u, v] for u, v in selected_pairs]))
+    selected_transport_mass = float(np.sum([Pi_cluster[u, v] for u, v in selected_pairs]))
+
+    match_to_index = {pair: idx for idx, pair in enumerate(matches)}
+    selected_indices = np.array(
+        [match_to_index[pair] for pair in selected_pairs if pair in match_to_index],
+        dtype=int,
+    )
+    selected_indices.sort()
+
+    topology_gaps = []
+    attachment_gaps = []
+    selected_edge_count = 0
+    for i_pos, i in enumerate(selected_indices):
+        u1, v1 = matches[int(i)]
+        for j in selected_indices[i_pos + 1:]:
+            if not match_adj[int(i), int(j)]:
+                continue
+            u2, v2 = matches[int(j)]
+            selected_edge_count += 1
+            topology_gaps.append(abs(float(geodesic_A[u1, u2] - geodesic_B[v1, v2])))
+            attachment_gaps.append(abs(float(edge_A_norm[u1, u2] - edge_B_norm[v1, v2])))
+
+    if topology_gaps:
+        topology_score = -float(np.sum(np.log1p(np.asarray(topology_gaps, dtype=np.float64))))
+    else:
+        topology_score = 0.0
+
+    if attachment_gaps:
+        attachment_score = -float(np.sum(np.log1p(np.asarray(attachment_gaps, dtype=np.float64))))
+    else:
+        attachment_score = 0.0
+
+    if len(selected_pairs) >= 2:
+        weights = np.array(
+            [max(mi_contrib[u, v], 1e-12) for u, v in selected_pairs],
+            dtype=np.float64,
+        )
+        R_sel, t_sel = fit_weighted_rigid_transform(
+            centroids_A[[u for u, _ in selected_pairs]],
+            centroids_B[[v for _, v in selected_pairs]],
+            weights=weights,
+        )
+        transform_scale = max(edge_scale_A, edge_scale_B, 1e-12)
+        rigid_residuals = [
+            float(
+                np.linalg.norm(centroids_B[v] - (centroids_A[u] @ R_sel.T + t_sel))
+                / transform_scale
+            )
+            for u, v in selected_pairs
+        ]
+        rigid_score = -float(np.sum(np.log1p(np.asarray(rigid_residuals, dtype=np.float64))))
+    else:
+        rigid_score = 0.0
+
+    total_score = float(node_score + topology_score + attachment_score + rigid_score)
+    return {
+        "total_score": total_score,
+        "node_score": node_score,
+        "topology_score": topology_score,
+        "attachment_score": attachment_score,
+        "rigid_score": rigid_score,
+        "selected_pair_count": int(len(selected_pairs)),
+        "selected_edge_count": int(selected_edge_count),
+        "selected_mi_sum": selected_mi_sum,
+        "selected_transport_mass": selected_transport_mass,
+    }
+
+
 def extract_continuous_macro_section(
     sliceA,
     sliceB,
@@ -1235,17 +1448,20 @@ def extract_continuous_macro_section(
        Transport-supported cluster-pairs are scored by transport enrichment,
        local niche context, and a cluster-centered global morphology descriptor.
        A deterministic one-to-one seed assignment is computed first, and the
-       initial anchor is then chosen as the strongest connected triangle, then
-       edge, then singleton within that assignment.
+       top few connected seed motifs are retained by total seed evidence, with
+       larger motifs used as a topology-aware tie-break. This preserves the
+       usual preference for triangle/edge/singleton support without allowing a
+       weak high-order seed to suppress a much stronger lower-order one.
 
     2. Coupled frontier expansion:
-       Starting from the seed motif, the method grows both slices jointly on the
-       product graph of admissible cluster-pairs. The expansion keeps all
+       Starting from each seed motif, the method grows both slices jointly on
+       the product graph of admissible cluster-pairs. The expansion keeps all
        positive-mass transport pairs available, but accepts frontier pairs only
        when they are jointly supported by transport/context evidence, local
        geodesic consistency, local attachment consistency, and, once
        orientation is identifiable, rigid consistency under the current
-       seed-derived transform.
+       seed-derived transform. The final macro-overlap is the expanded
+       hypothesis with the highest total node-and-edge evidence.
 
     This design prevents the region from drifting into nearby symmetric
     compartments because expansion is never allowed independently on the two
@@ -1334,9 +1550,14 @@ def extract_continuous_macro_section(
     match_adj = build_match_graph(matches, adj_A, adj_B)
     diagnostics["match_graph_edges"] = int(np.sum(match_adj) // 2)
 
-    initial_match_indices, seed_diagnostics = select_initial_match_component(matches, match_adj, global_pair_scores)
+    seed_index_trials, seed_diagnostics = select_initial_match_components(
+        matches,
+        match_adj,
+        global_pair_scores,
+        top_k=3,
+    )
     diagnostics.update(seed_diagnostics)
-    if initial_match_indices.size == 0:
+    if len(seed_index_trials) == 0:
         return empty_macro_section_result(
             N,
             M,
@@ -1344,11 +1565,9 @@ def extract_continuous_macro_section(
             diagnostics=diagnostics,
         )
 
-    seed_pairs = [matches[i] for i in initial_match_indices]
-    seed_name = {1: "singleton", 2: "edge", 3: "triangle"}.get(len(seed_pairs), f"{len(seed_pairs)}-pair")
     print(
-        "[HOT] Initial macro seed: "
-        f"{seed_name} with {len(seed_pairs)} matched pair(s); "
+        "[HOT] Initial macro seed trials: "
+        f"{len(seed_index_trials)} motif(s) will be expanded independently; "
         f"pair-graph edges={diagnostics['match_graph_edges']}."
     )
     if diagnostics.get("seed_evidence_ratio") is not None:
@@ -1366,74 +1585,162 @@ def extract_continuous_macro_section(
             AmbiguousAlignmentWarning,
         )
 
-    # 6. Coupled frontier expansion on the product graph of admissible cluster-pairs.
     print("[HOT] Coupled frontier expansion: accepting frontier pairs only when they improve on the unmatched null.")
-    selected_pairs, expansion_diagnostics = expand_macro_match_frontier(
-        seed_pairs=seed_pairs,
-        matches=matches,
-        global_pair_evidence=global_pair_evidence,
-        mi_contrib=mi_contrib,
-        adj_A=adj_A,
-        adj_B=adj_B,
-        geodesic_A=geodesic_A,
-        geodesic_B=geodesic_B,
-        edge_A_norm=edge_A_norm,
-        edge_B_norm=edge_B_norm,
-        edge_scale_A=edge_scale_A,
-        edge_scale_B=edge_scale_B,
-        centroids_A=centroids_A,
-        centroids_B=centroids_B,
+    hypothesis_records = []
+    seen_hypotheses = {}
+    for trial_rank, seed_indices in enumerate(seed_index_trials, start=1):
+        seed_pairs = [matches[i] for i in seed_indices]
+        seed_name = {1: "singleton", 2: "edge", 3: "triangle"}.get(len(seed_pairs), f"{len(seed_pairs)}-pair")
+        print(f"[HOT] Expanding seed trial {trial_rank}: {seed_name} with {len(seed_pairs)} matched pair(s).")
+
+        selected_pairs, expansion_diagnostics = expand_macro_match_frontier(
+            seed_pairs=seed_pairs,
+            matches=matches,
+            global_pair_evidence=global_pair_evidence,
+            mi_contrib=mi_contrib,
+            adj_A=adj_A,
+            adj_B=adj_B,
+            geodesic_A=geodesic_A,
+            geodesic_B=geodesic_B,
+            edge_A_norm=edge_A_norm,
+            edge_B_norm=edge_B_norm,
+            edge_scale_A=edge_scale_A,
+            edge_scale_B=edge_scale_B,
+            centroids_A=centroids_A,
+            centroids_B=centroids_B,
+        )
+        hypothesis_score = score_macro_hypothesis(
+            selected_pairs=selected_pairs,
+            matches=matches,
+            match_adj=match_adj,
+            global_pair_evidence=global_pair_evidence,
+            mi_contrib=mi_contrib,
+            Pi_cluster=Pi_cluster,
+            geodesic_A=geodesic_A,
+            geodesic_B=geodesic_B,
+            edge_A_norm=edge_A_norm,
+            edge_B_norm=edge_B_norm,
+            edge_scale_A=edge_scale_A,
+            edge_scale_B=edge_scale_B,
+            centroids_A=centroids_A,
+            centroids_B=centroids_B,
+        )
+        hypothesis_diagnostics = dict(expansion_diagnostics)
+        hypothesis_diagnostics.update({
+            "seed_trial_rank": int(trial_rank),
+            "seed_trial_indices": list(map(int, seed_indices.tolist())),
+            "seed_trial_size": int(len(seed_pairs)),
+            "hypothesis_total_score": float(hypothesis_score["total_score"]),
+            "hypothesis_node_score": float(hypothesis_score["node_score"]),
+            "hypothesis_topology_score": float(hypothesis_score["topology_score"]),
+            "hypothesis_attachment_score": float(hypothesis_score["attachment_score"]),
+            "hypothesis_rigid_score": float(hypothesis_score["rigid_score"]),
+            "hypothesis_pair_count": int(hypothesis_score["selected_pair_count"]),
+            "hypothesis_edge_count": int(hypothesis_score["selected_edge_count"]),
+            "hypothesis_mi_sum": float(hypothesis_score["selected_mi_sum"]),
+            "hypothesis_transport_mass": float(hypothesis_score["selected_transport_mass"]),
+        })
+
+        summary = summarize_macro_hypothesis(
+            labels_A=labels_A,
+            labels_B=labels_B,
+            seed_pairs=seed_pairs,
+            selected_pairs=selected_pairs,
+            score=hypothesis_score["total_score"],
+            diagnostics=hypothesis_diagnostics,
+        )
+        key = tuple(sorted(summary["selected_pairs"]))
+        existing = seen_hypotheses.get(key)
+        if existing is None:
+            seen_hypotheses[key] = summary
+        else:
+            existing_score = float(existing.get("score", -np.inf))
+            new_score = float(summary.get("score", -np.inf))
+            existing_mi = float(existing.get("diagnostics", {}).get("hypothesis_mi_sum", -np.inf))
+            new_mi = float(summary.get("diagnostics", {}).get("hypothesis_mi_sum", -np.inf))
+            if (new_score, new_mi) > (existing_score, existing_mi):
+                seen_hypotheses[key] = summary
+
+    hypothesis_records = list(seen_hypotheses.values())
+    if not hypothesis_records:
+        return empty_macro_section_result(
+            N,
+            M,
+            reason="all seed trials failed to produce a macro-overlap hypothesis",
+            diagnostics=diagnostics,
+        )
+
+    hypothesis_records.sort(
+        key=lambda record: (
+            float(record.get("score", -np.inf)),
+            float(record.get("diagnostics", {}).get("hypothesis_mi_sum", -np.inf)),
+            float(record.get("diagnostics", {}).get("hypothesis_transport_mass", -np.inf)),
+            len(record.get("selected_pairs", [])),
+        ),
+        reverse=True,
     )
-    diagnostics.update(expansion_diagnostics)
+
+    best_hypothesis = hypothesis_records[0]
+    alternative_hypotheses = hypothesis_records[1:]
+    diagnostics.update(best_hypothesis.get("diagnostics", {}))
+    diagnostics["competing_hypothesis_count"] = int(len(alternative_hypotheses))
+    diagnostics["macro_hypothesis_trial_count"] = int(len(hypothesis_records))
+    diagnostics["macro_hypothesis_scores"] = [
+        float(record.get("score", -np.inf)) for record in hypothesis_records
+    ]
+    diagnostics["selected_seed_trial_rank"] = int(
+        best_hypothesis.get("diagnostics", {}).get("seed_trial_rank", 1)
+    )
+
+    best_macro_score = float(hypothesis_records[0].get("score", -np.inf))
+    second_macro_score = float(hypothesis_records[1].get("score", -np.inf)) if len(hypothesis_records) > 1 else -np.inf
+    macro_scores = np.array([float(record.get("score", -np.inf)) for record in hypothesis_records], dtype=np.float64)
+    unique_macro_scores = np.unique(macro_scores[np.isfinite(macro_scores)])
+    positive_gaps = np.diff(np.sort(unique_macro_scores))
+    positive_gaps = positive_gaps[positive_gaps > 0]
+    macro_score_resolution = float(np.min(positive_gaps)) if positive_gaps.size > 0 else 0.0
+    if np.isfinite(second_macro_score):
+        macro_score_gap = float(best_macro_score - second_macro_score)
+        macro_score_ratio = float(np.exp(macro_score_gap))
+        macro_ambiguity_detected = bool(
+            np.isclose(best_macro_score, second_macro_score, rtol=1e-6, atol=1e-8)
+            or macro_score_gap <= max(macro_score_resolution, 1e-12)
+        )
+    else:
+        macro_score_gap = np.inf
+        macro_score_ratio = np.inf
+        macro_ambiguity_detected = False
+    diagnostics["macro_hypothesis_best_score"] = float(best_macro_score)
+    diagnostics["macro_hypothesis_second_score"] = float(second_macro_score) if np.isfinite(second_macro_score) else None
+    diagnostics["macro_hypothesis_log_gap"] = float(macro_score_gap) if np.isfinite(macro_score_gap) else None
+    diagnostics["macro_hypothesis_evidence_ratio"] = float(macro_score_ratio) if np.isfinite(macro_score_ratio) else None
+    diagnostics["macro_hypothesis_score_resolution"] = float(macro_score_resolution)
+    diagnostics["macro_hypothesis_ambiguity_detected"] = bool(macro_ambiguity_detected)
 
     if diagnostics["accepted_pairs_per_round"]:
         rounds = len(diagnostics["accepted_pairs_per_round"])
         total_new = int(sum(diagnostics["accepted_pairs_per_round"]))
-        print(f"[HOT] Expansion accepted {total_new} new pair(s) over {rounds} round(s).")
+        print(f"[HOT] Winning expansion accepted {total_new} new pair(s) over {rounds} round(s).")
     else:
-        print("[HOT] Expansion remained at the seed; no frontier pair beat the unmatched alternative.")
-    print(f"[HOT] Expansion stop reason: {diagnostics['stop_reason']}.")
-
-    alternative_hypotheses = []
-    if diagnostics.get("seed_ambiguity_detected", False):
-        second_indices = diagnostics.get("seed_second_indices", [])
-        if len(second_indices) > 0:
-            competing_seed_pairs = [matches[i] for i in second_indices]
-            competing_selected_pairs, competing_expansion_diagnostics = expand_macro_match_frontier(
-                seed_pairs=competing_seed_pairs,
-                matches=matches,
-                global_pair_evidence=global_pair_evidence,
-                mi_contrib=mi_contrib,
-                adj_A=adj_A,
-                adj_B=adj_B,
-                geodesic_A=geodesic_A,
-                geodesic_B=geodesic_B,
-                edge_A_norm=edge_A_norm,
-                edge_B_norm=edge_B_norm,
-                edge_scale_A=edge_scale_A,
-                edge_scale_B=edge_scale_B,
-                centroids_A=centroids_A,
-                centroids_B=centroids_B,
-            )
-            alternative_hypotheses.append(
-                summarize_macro_hypothesis(
-                    labels_A=labels_A,
-                    labels_B=labels_B,
-                    seed_pairs=competing_seed_pairs,
-                    selected_pairs=competing_selected_pairs,
-                    score=diagnostics.get("seed_second_score"),
-                    diagnostics=competing_expansion_diagnostics,
-                )
-            )
-            diagnostics["competing_hypothesis_count"] = len(alternative_hypotheses)
+        print("[HOT] Winning expansion remained at the seed; no frontier pair beat the unmatched alternative.")
+    print(
+        "[HOT] Winning macro hypothesis: "
+        f"trial {diagnostics['selected_seed_trial_rank']} with score {diagnostics['macro_hypothesis_best_score']:.4f}; "
+        f"stop reason={diagnostics['stop_reason']}."
+    )
+    if macro_ambiguity_detected:
+        warnings.warn(
+            "The final macro-overlap hypothesis remains ambiguous after expanding the top seed trials.",
+            AmbiguousAlignmentWarning,
+        )
 
     return materialize_macro_section_result(
         labels_A=labels_A,
         labels_B=labels_B,
         coords_A=coords_A,
         coords_B=coords_B,
-        seed_pairs=seed_pairs,
-        selected_pairs=selected_pairs,
+        seed_pairs=best_hypothesis["seed_pairs"],
+        selected_pairs=best_hypothesis["selected_pairs"],
         diagnostics=diagnostics,
         alternative_hypotheses=alternative_hypotheses,
     )
