@@ -652,9 +652,9 @@ def compute_cluster_global_shape_features(coords, centroids, n_rings=6, harmonic
     return features
 
 
-def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B, global_shape_A, global_shape_B):
+def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, context_feat_B):
     """
-    Assemble transport-supported cluster pairs and their global evidence.
+    Assemble transport-supported cluster pairs and their overall evidence.
 
     We intentionally keep all positive-mass cluster pairs rather than only
     pairs already enriched above the independence null. The enriched pairs still
@@ -667,11 +667,9 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     The primary transport-derived score is the per-pair mutual-information
     contribution, which already combines pair specificity with matched mass.
     Log-enrichment is retained only as a secondary tie-break so that transport
-    evidence is not double-counted additively. The remaining global evidence
-    channels come from local niche context and the cluster-centered full-tissue
-    morphology descriptor, which provides a global spatial cue that can break
-    practical symmetries when the larger tissue support is not perfectly
-    symmetric.
+    evidence is not double-counted additively. The remaining evidence channel
+    comes from local niche context, keeping macro-section extraction grounded in
+    transport support plus local biology/topology only.
     """
     log_enrichment = compute_pairwise_log_enrichment(Pi_cluster)
     mi_contrib = compute_pairwise_mutual_information_contribution(Pi_cluster)
@@ -694,8 +692,6 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
     mi_signal = []
     enrichment_signal = []
     context_signal = []
-    global_shape_signal = []
-
     for idx in sorted_idx:
         u, v = np.unravel_index(idx, Pi_cluster.shape)
         if not (valid_A[u] and valid_B[v]):
@@ -712,33 +708,23 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         else:
             context_signal.append(float(-jensenshannon(feat_A, feat_B)))
 
-        shape_A = global_shape_A[u]
-        shape_B = global_shape_B[v]
-        if shape_A.sum() <= 0 and shape_B.sum() <= 0:
-            global_shape_signal.append(0.0)
-        else:
-            global_shape_signal.append(float(-jensenshannon(shape_A, shape_B)))
-
     mi_signal = np.asarray(mi_signal, dtype=np.float64)
     enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
     context_signal = np.asarray(context_signal, dtype=np.float64)
-    global_shape_signal = np.asarray(global_shape_signal, dtype=np.float64)
 
     mi_evidence = empirical_logit_evidence(mi_signal, larger_is_better=True)
     context_evidence = empirical_logit_evidence(context_signal, larger_is_better=True)
-    shape_evidence = empirical_logit_evidence(global_shape_signal, larger_is_better=True)
 
     global_pair_evidence = {
-        pair: float(me + ce + se)
-        for pair, me, ce, se in zip(matches, mi_evidence, context_evidence, shape_evidence)
+        pair: float(me + ce)
+        for pair, me, ce in zip(matches, mi_evidence, context_evidence)
     }
     global_pair_scores = np.array([global_pair_evidence[pair] for pair in matches], dtype=np.float64)
 
     diagnostics = {
         "num_positive_mass_pairs": int(np.sum(Pi_cluster > 0)),
         "num_enriched_pairs": int(np.sum(log_enrichment > 0)),
-        "global_shape_descriptor_dim": int(global_shape_A.shape[1]),
-        "transport_score_mode": "mi_primary_enrichment_tiebreak",
+        "transport_score_mode": "mi_plus_context_primary_enrichment_tiebreak",
     }
     return matches, enrichment_signal, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics
 
@@ -1538,8 +1524,8 @@ def extract_continuous_macro_section(
     growth heuristics. It proceeds in two stages:
 
     1. Seed selection:
-       Transport-supported cluster-pairs are scored by transport enrichment,
-       local niche context, and a cluster-centered global morphology descriptor.
+       Transport-supported cluster-pairs are scored by transport enrichment
+       and local niche context.
        A deterministic one-to-one seed assignment is computed first, and the
        top few connected seed motifs are retained by total seed evidence, with
        larger motifs used as a topology-aware tie-break. This preserves the
@@ -1564,10 +1550,9 @@ def extract_continuous_macro_section(
     the ambiguity rather than pretending uniqueness.
 
     When per-slice cluster caches are supplied, the function reuses the same
-    centroids, histograms, and global morphology descriptors already computed
-    for the coarse alignment stage. This avoids silently using two slightly
-    different definitions of the same cluster summary in different parts of the
-    pipeline.
+    centroids and histograms already computed for the coarse alignment stage.
+    This avoids silently using two slightly different definitions of the same
+    cluster summary in different parts of the pipeline.
 
     Returns
     -------
@@ -1635,24 +1620,19 @@ def extract_continuous_macro_section(
     geodesic_A = compute_graph_geodesics(edge_A_norm)
     geodesic_B = compute_graph_geodesics(edge_B_norm)
 
-    # 3. Build biologically grounded cluster context descriptors and reuse the
-    # cluster-centered global morphology descriptor from the shared cache.
+    # 3. Build biologically grounded cluster context descriptors.
     cluster_hist_A = np.asarray(cluster_cache_A.cluster_hist, dtype=np.float64)
     cluster_hist_B = np.asarray(cluster_cache_B.cluster_hist, dtype=np.float64)
     context_feat_A = compute_cluster_context_features(cluster_hist_A, adj_A)
     context_feat_B = compute_cluster_context_features(cluster_hist_B, adj_B)
-    global_shape_A = np.asarray(cluster_cache_A.global_shape, dtype=np.float64)
-    global_shape_B = np.asarray(cluster_cache_B.global_shape, dtype=np.float64)
 
-    # 4. Assemble candidate cluster-pairs and their global evidence.
+    # 4. Assemble candidate cluster-pairs and their overall evidence.
     matches, match_tiebreak_scores, global_pair_scores, global_pair_evidence, mi_contrib, log_enrichment, diagnostics = collect_candidate_match_pairs(
         Pi_cluster,
         valid_A,
         valid_B,
         context_feat_A,
         context_feat_B,
-        global_shape_A,
-        global_shape_B,
     )
     num_matches = len(matches)
     if num_matches == 0:
