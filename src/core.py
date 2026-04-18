@@ -49,8 +49,8 @@ def hierarchical_pairwise_align(
     Returns the cell-level alignment pi.
     """
     print("--- [HOT] Step 1: Clustering Cells into Mesoregions ---")
-    labelsA = cluster_cells(sliceA, spatial_key=spatial_key, feature_key=use_rep, label_key=label_key)
-    labelsB = cluster_cells(sliceB, spatial_key=spatial_key, feature_key=use_rep, label_key=label_key)
+    labelsA = cluster_cells(sliceA, spatial_key=spatial_key, feature_key=use_rep)
+    labelsB = cluster_cells(sliceB, spatial_key=spatial_key, feature_key=use_rep)
 
     # Pre-cache global cell types for cluster structure alignment
     all_types = np.array(sorted(set(sliceA.obs[label_key].astype(str)) | set(sliceB.obs[label_key].astype(str))), dtype=str)
