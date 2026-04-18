@@ -196,7 +196,14 @@ def _ward_wss_progression(features: np.ndarray, children: np.ndarray):
     cluster_sse = np.zeros(total_nodes, dtype=np.float64)
     wss_by_k = np.full(n_samples + 1, np.nan, dtype=np.float64)
     merge_delta_by_k = np.zeros(n_samples + 1, dtype=np.float64)
+    entropy_evenness_by_k = np.zeros(n_samples + 1, dtype=np.float64)
     wss_by_k[n_samples] = 0.0
+    entropy_current = np.log(float(n_samples))
+    entropy_evenness_by_k[n_samples] = 1.0
+
+    def entropy_term(size: int) -> float:
+        p = float(size) / float(n_samples)
+        return -p * np.log(max(p, 1e-300))
 
     running_wss = 0.0
     for step, (left, right) in enumerate(children):
@@ -213,21 +220,33 @@ def _ward_wss_progression(features: np.ndarray, children: np.ndarray):
         k = n_samples - step - 1
         wss_by_k[k] = running_wss
         merge_delta_by_k[k] = delta
+        entropy_current += (
+            entropy_term(cluster_size[node])
+            - entropy_term(cluster_size[left])
+            - entropy_term(cluster_size[right])
+        )
+        if k >= 2:
+            entropy_evenness_by_k[k] = float(entropy_current / np.log(float(k)))
+        else:
+            entropy_evenness_by_k[k] = 0.0
 
     total_sum = np.sum(features, axis=0)
     total_sumsq = float(np.sum(features * features))
     total_sse = max(total_sumsq - np.dot(total_sum, total_sum) / float(n_samples), 0.0)
-    return wss_by_k, merge_delta_by_k, total_sse
+    return wss_by_k, merge_delta_by_k, entropy_evenness_by_k, total_sse
 
 
 def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarray) -> tuple[int, dict[str, float | int | None]]:
     """
     Choose the mesoregion count automatically from the full Ward dendrogram.
 
-    We maximize the Calinski-Harabasz criterion over all contiguous partitions
-    represented in the dendrogram. This is deterministic and parameter-free
-    from the user's point of view, while still favoring partitions that are
-    both compact and well separated in the biology-aware feature space.
+    We maximize a balance-aware Calinski-Harabasz criterion over all contiguous
+    partitions represented in the dendrogram. Plain Calinski-Harabasz often
+    prefers a pathological split with one tiny outlier cluster and one giant
+    remainder cluster. To avoid that failure mode deterministically, we
+    multiply the CH score by the normalized entropy of the cluster-size
+    distribution. This keeps the criterion parameter-free while discouraging
+    degenerate cuts that are not useful as mesoregions.
     """
     n_samples = int(features.shape[0])
     if n_samples <= 3:
@@ -237,7 +256,7 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
             "selected_ch_score": None,
         }
 
-    wss_by_k, merge_delta_by_k, total_sse = _ward_wss_progression(features, children)
+    wss_by_k, merge_delta_by_k, entropy_evenness_by_k, total_sse = _ward_wss_progression(features, children)
     candidate_scores = []
 
     for k in range(2, n_samples):
@@ -253,9 +272,13 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         ch_score = (between / float(max(k - 1, 1))) / within_mean
         if not np.isfinite(ch_score):
             continue
+        evenness = float(np.clip(entropy_evenness_by_k[k], 0.0, 1.0))
+        balanced_ch_score = float(ch_score * evenness)
 
         candidate_scores.append((
+            balanced_ch_score,
             float(ch_score),
+            evenness,
             float(merge_delta_by_k[k]),
             -int(k),
             int(k),
@@ -269,12 +292,14 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         }
 
     candidate_scores.sort(reverse=True)
-    _, best_delta, _, best_k = candidate_scores[0]
-    best_ch = candidate_scores[0][0]
+    _, best_ch, best_evenness, best_delta, _, best_k = candidate_scores[0]
+    best_balanced_ch = candidate_scores[0][0]
     return best_k, {
-        "cluster_count_mode": "ward_tree_calinski_harabasz",
+        "cluster_count_mode": "ward_tree_balanced_calinski_harabasz",
         "selected_cluster_count": int(best_k),
         "selected_ch_score": float(best_ch),
+        "selected_balanced_ch_score": float(best_balanced_ch),
+        "selected_size_evenness": float(best_evenness),
         "selected_merge_delta": float(best_delta),
         "candidate_cut_count": int(len(candidate_scores)),
     }
