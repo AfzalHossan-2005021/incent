@@ -267,7 +267,46 @@ def _ward_wss_progression(features: np.ndarray, children: np.ndarray):
     return wss_by_k, merge_delta_by_k, entropy_evenness_by_k, total_sse
 
 
-def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarray) -> tuple[int, dict[str, float | int | None]]:
+def _compute_cut_boundary_alignment(
+    labels: np.ndarray,
+    connectivity: sp.csr_matrix,
+    features: np.ndarray,
+) -> float:
+    """
+    Score how well a partition follows strong local biological boundaries.
+
+    The score compares edge-wise feature discontinuities across cut edges versus
+    within-cluster edges. Higher values mean the partition separates regions
+    across stronger local biological/contextual boundaries, which is desirable
+    for mesoregion clustering. This is used only as a tie-break among nearly
+    indistinguishable global cut scores.
+    """
+    connectivity = connectivity.tocoo()
+    mask = connectivity.row < connectivity.col
+    if not np.any(mask):
+        return 0.0
+
+    rows = connectivity.row[mask]
+    cols = connectivity.col[mask]
+    edge_strength = np.linalg.norm(features[rows] - features[cols], axis=1)
+    if edge_strength.size == 0:
+        return 0.0
+
+    cut_mask = labels[rows] != labels[cols]
+    if not np.any(cut_mask):
+        return 0.0
+
+    cut_mean = float(np.mean(edge_strength[cut_mask]))
+    within_mean = float(np.mean(edge_strength[~cut_mask])) if np.any(~cut_mask) else 0.0
+    scale = float(np.mean(edge_strength)) + 1e-12
+    return float((cut_mean - within_mean) / scale)
+
+
+def select_cluster_count_from_ward_tree(
+    features: np.ndarray,
+    children: np.ndarray,
+    connectivity: sp.csr_matrix | None = None,
+) -> tuple[int, dict[str, float | int | None]]:
     """
     Choose the mesoregion count automatically from the full Ward dendrogram.
 
@@ -282,7 +321,8 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
     2. multiply again by a normalized merge-persistence term, rewarding cuts
        that sit just before strong Ward merges and are therefore more stable
     3. if several cuts are empirically indistinguishable under that objective,
-       choose the finest cut among that score plateau
+       use local boundary alignment as the first tie-break and the finest cut
+       only as the final tie-break
 
     This stays parameter-free while better matching the multiscale, stable
     mesoregion story that is easier to defend in a paper.
@@ -356,8 +396,21 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         if np.isclose(record[0], best_stable_score, rtol=1e-6, atol=plateau_tol)
         or record[0] >= best_stable_score - plateau_tol
     ]
+    boundary_scores = []
+    for record in plateau_records:
+        if connectivity is None or connectivity.nnz == 0:
+            boundary_scores.append(0.0)
+            continue
+        labels = labels_from_ward_tree(children, features.shape[0], int(record[6]))
+        boundary_scores.append(_compute_cut_boundary_alignment(labels, connectivity, features))
+
+    plateau_records = [
+        record + (float(boundary_score),)
+        for record, boundary_score in zip(plateau_records, boundary_scores)
+    ]
     plateau_records.sort(
         key=lambda record: (
+            record[7],
             record[6],
             record[0],
             record[1],
@@ -368,6 +421,11 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         ),
         reverse=True,
     )
+    boundary_values = np.array([record[7] for record in plateau_records], dtype=np.float64)
+    unique_boundary_values = np.unique(boundary_values)
+    positive_boundary_gaps = np.diff(np.sort(unique_boundary_values))
+    positive_boundary_gaps = positive_boundary_gaps[positive_boundary_gaps > 0]
+    boundary_resolution = float(np.min(positive_boundary_gaps)) if positive_boundary_gaps.size > 0 else 0.0
     (
         best_stable_score,
         best_balanced_ch,
@@ -376,9 +434,16 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         best_persistence,
         best_delta,
         best_k,
+        best_boundary_alignment,
     ) = plateau_records[0]
+    boundary_plateau_tol = max(boundary_resolution, 1e-12)
+    boundary_plateau_records = [
+        record for record in plateau_records
+        if np.isclose(record[7], best_boundary_alignment, rtol=1e-6, atol=boundary_plateau_tol)
+        or record[7] >= best_boundary_alignment - boundary_plateau_tol
+    ]
     return best_k, {
-        "cluster_count_mode": "ward_tree_stable_balanced_calinski_harabasz_with_finest_plateau_tiebreak",
+        "cluster_count_mode": "ward_tree_stable_balanced_calinski_harabasz_with_boundary_and_finest_plateau_tiebreak",
         "selected_cluster_count": int(best_k),
         "selected_ch_score": float(best_ch),
         "selected_balanced_ch_score": float(best_balanced_ch),
@@ -386,9 +451,13 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         "selected_merge_persistence": float(best_persistence),
         "selected_stable_score": float(best_stable_score),
         "selected_merge_delta": float(best_delta),
+        "selected_boundary_alignment": float(best_boundary_alignment),
         "selected_score_resolution": float(score_resolution),
         "selected_plateau_count": int(len(plateau_records)),
-        "selected_by_finest_plateau_tiebreak": bool(len(plateau_records) > 1),
+        "selected_boundary_resolution": float(boundary_resolution),
+        "selected_boundary_plateau_count": int(len(boundary_plateau_records)),
+        "selected_by_boundary_tiebreak": bool(len(plateau_records) > 1 and len(np.unique(boundary_values)) > 1),
+        "selected_by_finest_plateau_tiebreak": bool(len(boundary_plateau_records) > 1),
         "candidate_cut_count": int(len(candidate_scores)),
     }
 
@@ -461,7 +530,7 @@ def _cluster_connected_component(features: np.ndarray, connectivity: sp.csr_matr
     )
     model.fit(features)
 
-    n_clusters, diagnostics = select_cluster_count_from_ward_tree(features, model.children_)
+    n_clusters, diagnostics = select_cluster_count_from_ward_tree(features, model.children_, connectivity=connectivity)
     labels = labels_from_ward_tree(model.children_, n_cells, n_clusters)
     diagnostics = dict(diagnostics)
     diagnostics["component_size"] = n_cells
