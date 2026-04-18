@@ -162,8 +162,8 @@ def _select_k_calinski_harabasz(
     mesoregions smaller than ~30 cells are too granular to be meaningful
     for the coarse FGW; mesoregions larger than ~500 cells lose local specificity.
     """
-    k_min = max(3, n_cells // 500)
-    k_max = max(k_min + 2, n_cells // 30)
+    k_min = max(3, n_cells // 200)
+    k_max = max(k_min + 2, n_cells // 50)
     k_max = min(k_max, n_cells - 1)
 
     best_k, best_ch = k_min, -1.0
@@ -355,7 +355,7 @@ def cluster_cells(
     linkage_matrix = _sklearn_tree_to_scipy_linkage(agg, n_cells)
     k_star = _select_k_calinski_harabasz(linkage_matrix, F, n_cells)
     print(f"  [BioSpatial-Ward] Automatic k* = {k_star} "
-          f"(search range [{max(3, n_cells//500)}, {max(5, n_cells//30)}])")
+          f"(search range [{max(3, n_cells//200)}, {max(5, n_cells//50)}])")
 
     labels = fcluster(linkage_matrix, k_star, criterion='maxclust') - 1
 
