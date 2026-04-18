@@ -63,7 +63,7 @@ def build_bio_spatial_graph(
     return edges, weights
 
 
-def cluster_cells_biological(
+def cluster_cells(
     adata: AnnData,
     spatial_key: str = 'spatial',
     feature_key: str = 'X_pca',
