@@ -130,19 +130,20 @@ def build_biology_oriented_features(
     """
     Build deterministic biology-aware features for mesoregion clustering.
 
-    The feature space is inspired by the core idea behind neighborhood-aware
-    spatial clustering methods: a cell should be represented both by its own
-    molecular state and by the local tissue context around it. We therefore use
-    four parameter-free blocks whenever annotations are available:
+    The feature space follows the paper-level design goal of combining a cell's
+    own molecular identity with multiscale spatial context. We therefore use
+    deterministic blocks that capture:
 
     1. own expression / latent profile
-    2. mean neighborhood expression / latent profile
-    3. own cell-type identity
-    4. neighborhood cell-type composition
+    2. first-order neighborhood expression
+    3. second-order neighborhood expression
+    4. local expression-boundary strength
+    5. neighborhood cell-type context, when annotations are available
+    6. local annotation-boundary strength and neighborhood diversity
 
-    We also append simple boundary-strength summaries to make close but
-    biologically distinct structures easier to separate when they touch or lie
-    nearby in space.
+    This is still parameter-free from the user's point of view, but it is much
+    closer to the neighborhood-aware ideas that perform well in modern spatial
+    domain methods.
     """
     if "X_pca" in adata.obsm:
         expr = _dense_matrix(adata.obsm["X_pca"])
@@ -150,23 +151,36 @@ def build_biology_oriented_features(
         expr = _dense_matrix(adata.X)
 
     transition = _row_normalize(adjacency)
+    transition2 = transition @ transition if adjacency.nnz > 0 else transition
     nbr_expr = transition @ expr if adjacency.nnz > 0 else np.zeros_like(expr)
-    expr_boundary = np.linalg.norm(expr - nbr_expr, axis=1, keepdims=True)
+    nbr2_expr = transition2 @ expr if adjacency.nnz > 0 else np.zeros_like(expr)
+    expr_boundary_1 = np.linalg.norm(expr - nbr_expr, axis=1, keepdims=True)
+    expr_boundary_2 = np.linalg.norm(nbr_expr - nbr2_expr, axis=1, keepdims=True)
 
     feature_blocks = [
         _standardize_block(expr),
         _standardize_block(nbr_expr),
-        _standardize_block(expr_boundary),
+        _standardize_block(nbr2_expr),
+        _standardize_block(expr_boundary_1),
+        _standardize_block(expr_boundary_2),
     ]
 
     if label_key in adata.obs:
         own_type = _one_hot(adata.obs[label_key].to_numpy())
         nbr_type = transition @ own_type if adjacency.nnz > 0 else np.zeros_like(own_type)
-        type_boundary = np.linalg.norm(own_type - nbr_type, axis=1, keepdims=True)
+        nbr2_type = transition2 @ own_type if adjacency.nnz > 0 else np.zeros_like(own_type)
+        type_boundary_1 = np.linalg.norm(own_type - nbr_type, axis=1, keepdims=True)
+        type_boundary_2 = np.linalg.norm(nbr_type - nbr2_type, axis=1, keepdims=True)
+        type_entropy_1 = -np.sum(nbr_type * np.log(np.clip(nbr_type, 1e-12, 1.0)), axis=1, keepdims=True)
+        type_entropy_2 = -np.sum(nbr2_type * np.log(np.clip(nbr2_type, 1e-12, 1.0)), axis=1, keepdims=True)
         feature_blocks.extend([
             _standardize_block(own_type),
             _standardize_block(nbr_type),
-            _standardize_block(type_boundary),
+            _standardize_block(nbr2_type),
+            _standardize_block(type_boundary_1),
+            _standardize_block(type_boundary_2),
+            _standardize_block(type_entropy_1),
+            _standardize_block(type_entropy_2),
         ])
 
     return np.concatenate(feature_blocks, axis=1)
@@ -240,13 +254,19 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
     """
     Choose the mesoregion count automatically from the full Ward dendrogram.
 
-    We maximize a balance-aware Calinski-Harabasz criterion over all contiguous
-    partitions represented in the dendrogram. Plain Calinski-Harabasz often
-    prefers a pathological split with one tiny outlier cluster and one giant
-    remainder cluster. To avoid that failure mode deterministically, we
-    multiply the CH score by the normalized entropy of the cluster-size
-    distribution. This keeps the criterion parameter-free while discouraging
-    degenerate cuts that are not useful as mesoregions.
+    We maximize a balance-aware and persistence-aware Calinski-Harabasz
+    criterion over all contiguous partitions represented in the dendrogram.
+    Plain Calinski-Harabasz often prefers a pathological split with one tiny
+    outlier cluster and one giant remainder cluster. To avoid that failure mode
+    deterministically, we:
+
+    1. multiply the CH score by the normalized entropy of the cluster-size
+       distribution, discouraging degenerate cuts
+    2. multiply again by a normalized merge-persistence term, rewarding cuts
+       that sit just before strong Ward merges and are therefore more stable
+
+    This stays parameter-free while better matching the multiscale, stable
+    mesoregion story that is easier to defend in a paper.
     """
     n_samples = int(features.shape[0])
     if n_samples <= 3:
@@ -257,6 +277,11 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         }
 
     wss_by_k, merge_delta_by_k, entropy_evenness_by_k, total_sse = _ward_wss_progression(features, children)
+    positive_merge_deltas = merge_delta_by_k[merge_delta_by_k > 0]
+    if positive_merge_deltas.size > 0:
+        max_log_merge = float(np.max(np.log1p(positive_merge_deltas)))
+    else:
+        max_log_merge = 0.0
     candidate_scores = []
 
     for k in range(2, n_samples):
@@ -274,11 +299,19 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
             continue
         evenness = float(np.clip(entropy_evenness_by_k[k], 0.0, 1.0))
         balanced_ch_score = float(ch_score * evenness)
+        if max_log_merge > 0.0:
+            persistence = float(np.log1p(merge_delta_by_k[k]) / max_log_merge)
+        else:
+            persistence = 1.0
+        persistence = float(np.clip(persistence, 0.0, 1.0))
+        stable_score = float(balanced_ch_score * persistence)
 
         candidate_scores.append((
+            stable_score,
             balanced_ch_score,
             float(ch_score),
             evenness,
+            persistence,
             float(merge_delta_by_k[k]),
             -int(k),
             int(k),
@@ -292,14 +325,15 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         }
 
     candidate_scores.sort(reverse=True)
-    _, best_ch, best_evenness, best_delta, _, best_k = candidate_scores[0]
-    best_balanced_ch = candidate_scores[0][0]
+    best_stable_score, best_balanced_ch, best_ch, best_evenness, best_persistence, best_delta, _, best_k = candidate_scores[0]
     return best_k, {
-        "cluster_count_mode": "ward_tree_balanced_calinski_harabasz",
+        "cluster_count_mode": "ward_tree_stable_balanced_calinski_harabasz",
         "selected_cluster_count": int(best_k),
         "selected_ch_score": float(best_ch),
         "selected_balanced_ch_score": float(best_balanced_ch),
         "selected_size_evenness": float(best_evenness),
+        "selected_merge_persistence": float(best_persistence),
+        "selected_stable_score": float(best_stable_score),
         "selected_merge_delta": float(best_delta),
         "candidate_cut_count": int(len(candidate_scores)),
     }
@@ -378,6 +412,7 @@ def _cluster_connected_component(features: np.ndarray, connectivity: sp.csr_matr
     diagnostics = dict(diagnostics)
     diagnostics["component_size"] = n_cells
     diagnostics["ward_merge_count"] = int(model.children_.shape[0])
+    diagnostics["feature_dim"] = int(features.shape[1])
     return labels, diagnostics
 
 
@@ -397,8 +432,8 @@ def cluster_cells_spatial(adata: AnnData, spatial_key: str = "spatial") -> np.nd
     1. build a parameter-free Gabriel cell-contact graph
     2. construct neighborhood-augmented biology-aware features
     3. run spatially constrained Ward agglomeration on each connected component
-    4. choose the cut automatically by maximizing the Calinski-Harabasz score
-       over the full Ward dendrogram
+    4. choose the cut automatically by maximizing a stable, balance-aware
+       Calinski-Harabasz score over the full Ward dendrogram
     """
 
     coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
@@ -417,17 +452,32 @@ def cluster_cells_spatial(adata: AnnData, spatial_key: str = "spatial") -> np.nd
     n_components, component_ids = connected_components(adjacency, directed=False, return_labels=True)
     labels = np.full(n_cells, -1, dtype=int)
     next_label = 0
+    component_diagnostics = []
 
     for component_id in range(int(n_components)):
         idx = np.where(component_ids == component_id)[0]
         if idx.size == 0:
             continue
 
-        component_labels, _ = _cluster_connected_component(
+        component_labels, diagnostics = _cluster_connected_component(
+            # Each connected tissue component is clustered independently so
+            # disconnected islands cannot be merged into one mesoregion.
             features[idx],
             adjacency[idx][:, idx].tocsr(),
         )
         labels[idx] = component_labels + next_label
         next_label += int(component_labels.max()) + 1
+        diagnostics = dict(diagnostics)
+        diagnostics["component_id"] = int(component_id)
+        component_diagnostics.append(diagnostics)
+
+    adata.uns["incent_clustering"] = {
+        "graph_mode": "gabriel",
+        "feature_mode": "multiscale_biology_context",
+        "n_components": int(n_components),
+        "n_clusters": int(len(np.unique(labels))),
+        "component_diagnostics": component_diagnostics,
+        "cluster_sizes": np.bincount(labels, minlength=int(labels.max()) + 1).astype(int).tolist(),
+    }
 
     return labels
