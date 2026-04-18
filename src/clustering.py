@@ -264,6 +264,8 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
        distribution, discouraging degenerate cuts
     2. multiply again by a normalized merge-persistence term, rewarding cuts
        that sit just before strong Ward merges and are therefore more stable
+    3. if several cuts are empirically indistinguishable under that objective,
+       choose the finest cut among that score plateau
 
     This stays parameter-free while better matching the multiscale, stable
     mesoregion story that is easier to defend in a paper.
@@ -313,7 +315,6 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
             evenness,
             persistence,
             float(merge_delta_by_k[k]),
-            -int(k),
             int(k),
         ))
 
@@ -325,9 +326,42 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         }
 
     candidate_scores.sort(reverse=True)
-    best_stable_score, best_balanced_ch, best_ch, best_evenness, best_persistence, best_delta, _, best_k = candidate_scores[0]
+
+    stable_values = np.array([record[0] for record in candidate_scores], dtype=np.float64)
+    unique_stable_values = np.unique(stable_values)
+    positive_gaps = np.diff(np.sort(unique_stable_values))
+    positive_gaps = positive_gaps[positive_gaps > 0]
+    score_resolution = float(np.min(positive_gaps)) if positive_gaps.size > 0 else 0.0
+    best_stable_score = float(candidate_scores[0][0])
+    plateau_tol = max(score_resolution, 1e-12)
+    plateau_records = [
+        record for record in candidate_scores
+        if np.isclose(record[0], best_stable_score, rtol=1e-6, atol=plateau_tol)
+        or record[0] >= best_stable_score - plateau_tol
+    ]
+    plateau_records.sort(
+        key=lambda record: (
+            record[6],
+            record[0],
+            record[1],
+            record[2],
+            record[3],
+            record[4],
+            record[5],
+        ),
+        reverse=True,
+    )
+    (
+        best_stable_score,
+        best_balanced_ch,
+        best_ch,
+        best_evenness,
+        best_persistence,
+        best_delta,
+        best_k,
+    ) = plateau_records[0]
     return best_k, {
-        "cluster_count_mode": "ward_tree_stable_balanced_calinski_harabasz",
+        "cluster_count_mode": "ward_tree_stable_balanced_calinski_harabasz_with_finest_plateau_tiebreak",
         "selected_cluster_count": int(best_k),
         "selected_ch_score": float(best_ch),
         "selected_balanced_ch_score": float(best_balanced_ch),
@@ -335,6 +369,9 @@ def select_cluster_count_from_ward_tree(features: np.ndarray, children: np.ndarr
         "selected_merge_persistence": float(best_persistence),
         "selected_stable_score": float(best_stable_score),
         "selected_merge_delta": float(best_delta),
+        "selected_score_resolution": float(score_resolution),
+        "selected_plateau_count": int(len(plateau_records)),
+        "selected_by_finest_plateau_tiebreak": bool(len(plateau_records) > 1),
         "candidate_cut_count": int(len(candidate_scores)),
     }
 
