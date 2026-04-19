@@ -451,9 +451,9 @@ def visualize_created_slice_portion(
     Visualize which portion of an original slice produced a created subslice.
 
     The created cells are identified primarily by shared ``obs_names``. When
-    the created slice contains the metadata written by
-    ``hierarchical_pairwise_self_align_random_rectangle``, the sampled
-    rectangular window is also overlaid on the original slice.
+    the created slice contains the sampling metadata written by
+    ``create_random_rectangular_portion``, the sampled rectangular window is
+    also overlaid on the original slice.
     """
     pts_original = np.asarray(original_slice.obsm[spatial_key], dtype=np.float64)
     pts_created = np.asarray(created_slice.obsm[spatial_key], dtype=np.float64)

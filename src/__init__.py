@@ -1,7 +1,7 @@
 from .core import (
     pairwise_align,
     hierarchical_pairwise_align,
-    hierarchical_pairwise_self_align_random_rectangle,
+    create_random_rectangular_portion,
     align_multiple_slices
 )
 
@@ -19,7 +19,7 @@ from .visualize import (
 __all__ = [
     'pairwise_align',
     'hierarchical_pairwise_align',
-    'hierarchical_pairwise_self_align_random_rectangle',
+    'create_random_rectangular_portion',
     'align_multiple_slices',
     'calculate_performance_metrics',
     'calculate_forward_reverse_compactness',

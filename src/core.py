@@ -306,7 +306,7 @@ def hierarchical_pairwise_align(
         return pi_full
 
 
-def _create_random_rectangular_portion(
+def create_random_rectangular_portion(
     adata: AnnData,
     random_seed: int,
     portion_percentage: float,
@@ -403,63 +403,6 @@ def _create_random_rectangular_portion(
         "window_aspect_ratio": float(best_window["aspect_ratio"]),
     }
     return portion
-
-
-def hierarchical_pairwise_self_align_random_rectangle(
-    sliceA: AnnData,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    random_seed: int,
-    portion_percentage: float,
-    reg_compact: float = 0.001,
-    numItermax: int = 100000,
-    use_gpu: bool = True,
-    resolution: float = 1.0,
-    spatial_key: str = "spatial",
-    use_rep: Optional[str] = "X_pca",
-    label_key: str = "cell_type_annot",
-    w_graph: float = 0.5,
-    visualize_clusters: bool = True,
-    **kwargs
-) -> Tuple[object, ...]:
-    """
-    Test hierarchical alignment against a random rectangular portion of one slice.
-
-    This mirrors ``hierarchical_pairwise_align`` but takes a single slice plus a
-    random seed and crop percentage. It creates a random rectangular spatial
-    crop using a randomly oriented window, aligns the full slice to that crop,
-    and returns a tuple that begins with ``(created_slice, random_seed, ...)``
-    followed by the original output(s) of ``hierarchical_pairwise_align``.
-    """
-    created_slice = _create_random_rectangular_portion(
-        adata=sliceA,
-        random_seed=random_seed,
-        portion_percentage=portion_percentage,
-        spatial_key=spatial_key,
-    )
-
-    alignment_result = hierarchical_pairwise_align(
-        sliceA=sliceA,
-        sliceB=created_slice,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        reg_compact=reg_compact,
-        numItermax=numItermax,
-        use_gpu=use_gpu,
-        resolution=resolution,
-        spatial_key=spatial_key,
-        use_rep=use_rep,
-        label_key=label_key,
-        w_graph=w_graph,
-        visualize_clusters=visualize_clusters,
-        **kwargs,
-    )
-
-    if isinstance(alignment_result, tuple):
-        return (created_slice, int(random_seed), *alignment_result)
-    return created_slice, int(random_seed), alignment_result
 
 
 def align_multiple_slices(
