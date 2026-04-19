@@ -739,8 +739,6 @@ def score_frontier_matches(
     adj_B,
     geodesic_A,
     geodesic_B,
-    edge_A_norm,
-    edge_B_norm,
     centroids_A,
     centroids_B,
     mi_contrib,
@@ -753,8 +751,7 @@ def score_frontier_matches(
     1. global pair evidence from transport enrichment and niche context
     2. support from already selected neighboring pairs
     3. local geodesic agreement using only those supporting neighbors
-    4. local edge-length agreement to those supporting neighbors
-    5. rigid consistency, but only once at least two selected pairs define an
+    4. rigid consistency, but only once at least two selected pairs define an
        orientation-aware transform
     """
     if not frontier_A or not frontier_B or not selected_pairs:
@@ -778,7 +775,6 @@ def score_frontier_matches(
     frontier_pairs = []
     support_strengths = []
     topology_gaps = []
-    attachment_gaps = []
     rigid_residuals = []
 
     for u in sorted(frontier_A):
@@ -804,9 +800,6 @@ def score_frontier_matches(
             topology_gap = float(np.median(np.abs(
                 geodesic_A[u, support_us] - geodesic_B[v, support_vs]
             )))
-            attachment_gap = float(np.median(np.abs(
-                edge_A_norm[u, support_us] - edge_B_norm[v, support_vs]
-            )))
 
             if use_rigid:
                 rigid_prediction = centroids_A[u] @ R_seed.T + t_seed
@@ -819,7 +812,6 @@ def score_frontier_matches(
             frontier_pairs.append((u, v))
             support_strengths.append(support_strength)
             topology_gaps.append(topology_gap)
-            attachment_gaps.append(attachment_gap)
             rigid_residuals.append(rigid_residual)
 
     if not frontier_pairs:
@@ -827,21 +819,19 @@ def score_frontier_matches(
 
     support_evidence = empirical_logit_evidence(support_strengths, larger_is_better=True)
     topology_evidence = empirical_logit_evidence(topology_gaps, larger_is_better=False)
-    attachment_evidence = empirical_logit_evidence(attachment_gaps, larger_is_better=False)
     if use_rigid:
         rigid_evidence = empirical_logit_evidence(rigid_residuals, larger_is_better=False)
     else:
         rigid_evidence = np.zeros(len(frontier_pairs), dtype=np.float64)
 
     frontier_scores = []
-    for pair, se, te, ae, re in zip(
+    for pair, se, te, re in zip(
         frontier_pairs,
         support_evidence,
         topology_evidence,
-        attachment_evidence,
         rigid_evidence,
     ):
-        frontier_scores.append(global_pair_evidence[pair] + float(se + te + ae + re))
+        frontier_scores.append(global_pair_evidence[pair] + float(se + te + re))
 
     return frontier_pairs, frontier_scores
 
@@ -900,8 +890,6 @@ def expand_macro_match_frontier(
     adj_B,
     geodesic_A,
     geodesic_B,
-    edge_A_norm,
-    edge_B_norm,
     edge_scale_A,
     edge_scale_B,
     centroids_A,
@@ -955,8 +943,6 @@ def expand_macro_match_frontier(
             adj_B=adj_B,
             geodesic_A=geodesic_A,
             geodesic_B=geodesic_B,
-            edge_A_norm=edge_A_norm,
-            edge_B_norm=edge_B_norm,
             centroids_A=centroids_A,
             centroids_B=centroids_B,
             mi_contrib=mi_contrib,
@@ -1413,11 +1399,13 @@ def score_macro_hypothesis(
     We do not rerun FGW as the primary selection criterion because raw FGW
     objectives are not directly comparable across differently sized overlap
     subsets and tend to over-favor tiny, very clean seeds. Instead, we evaluate
-    the hypothesis using the same evidence family that drove expansion:
+    the hypothesis using the expansion evidence plus an absolute attachment
+    penalty over the selected matched edges:
 
     1. node evidence from the global pair score
-    2. absolute penalties for violated geodesic and attachment geometry
-    3. an absolute rigid-consistency penalty once the hypothesis defines an orientation
+    2. absolute penalties for violated geodesic geometry
+    3. absolute penalties for violated attachment geometry
+    4. an absolute rigid-consistency penalty once the hypothesis defines an orientation
 
     This produces a size-aware score without adding extra hyperparameters: a
     larger hypothesis wins only if it keeps contributing positive biological and
@@ -1537,8 +1525,8 @@ def extract_continuous_macro_section(
        the product graph of admissible cluster-pairs. The expansion keeps all
        positive-mass transport pairs available, but accepts frontier pairs only
        when they are jointly supported by transport/context evidence, local
-       geodesic consistency, local attachment consistency, and, once
-       orientation is identifiable, rigid consistency under the current
+       geodesic consistency, and, once orientation is identifiable, rigid
+       consistency under the current
        seed-derived transform. The final macro-overlap is the expanded
        hypothesis with the highest total node-and-edge evidence.
 
@@ -1706,8 +1694,6 @@ def extract_continuous_macro_section(
             adj_B=adj_B,
             geodesic_A=geodesic_A,
             geodesic_B=geodesic_B,
-            edge_A_norm=edge_A_norm,
-            edge_B_norm=edge_B_norm,
             edge_scale_A=edge_scale_A,
             edge_scale_B=edge_scale_B,
             centroids_A=centroids_A,
