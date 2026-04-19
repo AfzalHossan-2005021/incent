@@ -737,8 +737,6 @@ def score_frontier_matches(
     global_pair_evidence,
     adj_A,
     adj_B,
-    geodesic_A,
-    geodesic_B,
     edge_A_norm,
     edge_B_norm,
     centroids_A,
@@ -752,9 +750,8 @@ def score_frontier_matches(
     The score combines:
     1. global pair evidence from transport enrichment and niche context
     2. support from already selected neighboring pairs
-    3. local geodesic agreement using only those supporting neighbors
-    4. local edge-length agreement to those supporting neighbors
-    5. rigid consistency, but only once at least two selected pairs define an
+    3. local edge-length agreement to those supporting neighbors
+    4. rigid consistency, but only once at least two selected pairs define an
        orientation-aware transform
     """
     if not frontier_A or not frontier_B or not selected_pairs:
@@ -777,7 +774,6 @@ def score_frontier_matches(
 
     frontier_pairs = []
     support_strengths = []
-    topology_gaps = []
     attachment_gaps = []
     rigid_residuals = []
 
@@ -801,9 +797,6 @@ def score_frontier_matches(
                 max(global_pair_evidence[(su, sv)], 0.0)
                 for su, sv in support_pairs
             ]))
-            topology_gap = float(np.median(np.abs(
-                geodesic_A[u, support_us] - geodesic_B[v, support_vs]
-            )))
             attachment_gap = float(np.median(np.abs(
                 edge_A_norm[u, support_us] - edge_B_norm[v, support_vs]
             )))
@@ -818,7 +811,6 @@ def score_frontier_matches(
 
             frontier_pairs.append((u, v))
             support_strengths.append(support_strength)
-            topology_gaps.append(topology_gap)
             attachment_gaps.append(attachment_gap)
             rigid_residuals.append(rigid_residual)
 
@@ -826,7 +818,6 @@ def score_frontier_matches(
         return [], []
 
     support_evidence = empirical_logit_evidence(support_strengths, larger_is_better=True)
-    topology_evidence = empirical_logit_evidence(topology_gaps, larger_is_better=False)
     attachment_evidence = empirical_logit_evidence(attachment_gaps, larger_is_better=False)
     if use_rigid:
         rigid_evidence = empirical_logit_evidence(rigid_residuals, larger_is_better=False)
@@ -834,14 +825,13 @@ def score_frontier_matches(
         rigid_evidence = np.zeros(len(frontier_pairs), dtype=np.float64)
 
     frontier_scores = []
-    for pair, se, te, ae, re in zip(
+    for pair, se, ae, re in zip(
         frontier_pairs,
         support_evidence,
-        topology_evidence,
         attachment_evidence,
         rigid_evidence,
     ):
-        frontier_scores.append(global_pair_evidence[pair] + float(se + te + ae + re))
+        frontier_scores.append(global_pair_evidence[pair] + float(se + ae + re))
 
     return frontier_pairs, frontier_scores
 
@@ -898,8 +888,6 @@ def expand_macro_match_frontier(
     mi_contrib,
     adj_A,
     adj_B,
-    geodesic_A,
-    geodesic_B,
     edge_A_norm,
     edge_B_norm,
     edge_scale_A,
@@ -912,8 +900,9 @@ def expand_macro_match_frontier(
 
     The expansion remains intentionally conservative: a frontier pair is added
     only when it is contiguous in both tissues and beats the private unmatched
-    alternative in the assignment problem. This yields a natural stopping rule
-    with no target-size hyperparameter.
+    alternative in the assignment problem under transport/context, local
+    attachment, and rigid-consistency evidence. This yields a natural stopping
+    rule with no target-size hyperparameter.
     """
     selected_pairs = list(seed_pairs)
     selected_A = {u for u, _ in seed_pairs}
@@ -953,8 +942,6 @@ def expand_macro_match_frontier(
             global_pair_evidence=global_pair_evidence,
             adj_A=adj_A,
             adj_B=adj_B,
-            geodesic_A=geodesic_A,
-            geodesic_B=geodesic_B,
             edge_A_norm=edge_A_norm,
             edge_B_norm=edge_B_norm,
             centroids_A=centroids_A,
@@ -1537,10 +1524,10 @@ def extract_continuous_macro_section(
        the product graph of admissible cluster-pairs. The expansion keeps all
        positive-mass transport pairs available, but accepts frontier pairs only
        when they are jointly supported by transport/context evidence, local
-       geodesic consistency, local attachment consistency, and, once
-       orientation is identifiable, rigid consistency under the current
-       seed-derived transform. The final macro-overlap is the expanded
-       hypothesis with the highest total node-and-edge evidence.
+       attachment consistency, and, once orientation is identifiable, rigid
+       consistency under the current seed-derived transform. The final
+       macro-overlap is the expanded hypothesis with the highest total
+       node-and-edge evidence.
 
     This design prevents the region from drifting into nearby symmetric
     compartments because expansion is never allowed independently on the two
@@ -1704,8 +1691,6 @@ def extract_continuous_macro_section(
             mi_contrib=mi_contrib,
             adj_A=adj_A,
             adj_B=adj_B,
-            geodesic_A=geodesic_A,
-            geodesic_B=geodesic_B,
             edge_A_norm=edge_A_norm,
             edge_B_norm=edge_B_norm,
             edge_scale_A=edge_scale_A,
