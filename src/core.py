@@ -306,6 +306,162 @@ def hierarchical_pairwise_align(
         return pi_full
 
 
+def _create_random_rectangular_portion(
+    adata: AnnData,
+    random_seed: int,
+    portion_percentage: float,
+    spatial_key: str = "spatial",
+    max_attempts: int = 64,
+) -> AnnData:
+    """
+    Sample a non-empty rectangular spatial crop from a slice.
+
+    The crop comes from a randomly oriented rectangular window with a random
+    aspect ratio. Its area is chosen to approximately match
+    ``portion_percentage`` of the slice bounding box, and the sampled window
+    whose cell count is closest to the requested fraction is retained.
+    """
+    if not (0.0 < float(portion_percentage) < 100.0):
+        raise ValueError("portion_percentage must be strictly between 0 and 100.")
+
+    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError(f"`adata.obsm[{spatial_key!r}]` must contain 2D coordinates.")
+
+    n_cells = int(adata.n_obs)
+    if n_cells < 4:
+        raise ValueError("At least 4 cells are required to build a rectangular self-alignment test slice.")
+
+    frac = float(portion_percentage) / 100.0
+    target_count = int(np.clip(np.round(frac * n_cells), 1, n_cells - 1))
+    min_cells = min(max(4, min(10, target_count)), n_cells - 1)
+
+    mins = coords[:, :2].min(axis=0)
+    maxs = coords[:, :2].max(axis=0)
+    spans = np.maximum(maxs - mins, 1e-12)
+    bbox_area = float(np.prod(spans))
+    target_area = max(bbox_area * frac, 1e-12)
+
+    rng = np.random.default_rng(random_seed)
+    best_mask = None
+    best_score = None
+    best_window = None
+
+    for area_scale in (1.0, 0.85, 1.15, 0.7, 1.3, 0.55, 1.5):
+        for _ in range(max_attempts):
+            aspect_ratio = float(np.exp(rng.uniform(np.log(0.5), np.log(2.0))))
+            rect_area = max(target_area * float(area_scale), 1e-12)
+            rect_width = np.sqrt(rect_area * aspect_ratio)
+            rect_height = np.sqrt(rect_area / aspect_ratio)
+
+            center = coords[rng.integers(0, n_cells), :2].astype(np.float64, copy=True)
+            angle = float(rng.uniform(0.0, np.pi))
+            cos_a = np.cos(angle)
+            sin_a = np.sin(angle)
+            rotation = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
+
+            centered = coords[:, :2] - center
+            local = centered @ rotation
+            half_width = rect_width / 2.0
+            half_height = rect_height / 2.0
+            mask = (
+                (np.abs(local[:, 0]) <= half_width)
+                & (np.abs(local[:, 1]) <= half_height)
+            )
+            count = int(mask.sum())
+            if count < min_cells or count >= n_cells:
+                continue
+
+            score = (abs(count - target_count), -count)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_mask = mask.copy()
+                best_window = {
+                    "center": center.copy(),
+                    "angle_radians": angle,
+                    "width": float(rect_width),
+                    "height": float(rect_height),
+                    "aspect_ratio": aspect_ratio,
+                }
+
+    if best_mask is None:
+        raise ValueError(
+            "Could not sample a valid rectangular portion from the slice. "
+            "Try a larger portion_percentage."
+        )
+
+    portion_indices = np.flatnonzero(best_mask)
+    portion = adata[portion_indices].copy()
+    portion.uns["self_alignment_test"] = {
+        "random_seed": int(random_seed),
+        "portion_percentage": float(portion_percentage),
+        "selected_cell_count": int(portion.n_obs),
+        "window_center": best_window["center"].tolist(),
+        "window_angle_radians": float(best_window["angle_radians"]),
+        "window_width": float(best_window["width"]),
+        "window_height": float(best_window["height"]),
+        "window_aspect_ratio": float(best_window["aspect_ratio"]),
+    }
+    return portion
+
+
+def hierarchical_pairwise_self_align_random_rectangle(
+    sliceA: AnnData,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    random_seed: int,
+    portion_percentage: float,
+    reg_compact: float = 0.001,
+    numItermax: int = 100000,
+    use_gpu: bool = True,
+    resolution: float = 1.0,
+    spatial_key: str = "spatial",
+    use_rep: Optional[str] = "X_pca",
+    label_key: str = "cell_type_annot",
+    w_graph: float = 0.5,
+    visualize_clusters: bool = True,
+    **kwargs
+) -> Tuple[object, ...]:
+    """
+    Test hierarchical alignment against a random rectangular portion of one slice.
+
+    This mirrors ``hierarchical_pairwise_align`` but takes a single slice plus a
+    random seed and crop percentage. It creates a random rectangular spatial
+    crop using a randomly oriented window, aligns the full slice to that crop,
+    and returns a tuple that begins with ``(created_slice, random_seed, ...)``
+    followed by the original output(s) of ``hierarchical_pairwise_align``.
+    """
+    created_slice = _create_random_rectangular_portion(
+        adata=sliceA,
+        random_seed=random_seed,
+        portion_percentage=portion_percentage,
+        spatial_key=spatial_key,
+    )
+
+    alignment_result = hierarchical_pairwise_align(
+        sliceA=sliceA,
+        sliceB=created_slice,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        reg_compact=reg_compact,
+        numItermax=numItermax,
+        use_gpu=use_gpu,
+        resolution=resolution,
+        spatial_key=spatial_key,
+        use_rep=use_rep,
+        label_key=label_key,
+        w_graph=w_graph,
+        visualize_clusters=visualize_clusters,
+        **kwargs,
+    )
+
+    if isinstance(alignment_result, tuple):
+        return (created_slice, int(random_seed), *alignment_result)
+    return created_slice, int(random_seed), alignment_result
+
+
 def align_multiple_slices(
     slices: list[AnnData],
     spatial_key: str = "spatial",
