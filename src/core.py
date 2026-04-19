@@ -466,7 +466,7 @@ def pairwise_align(
     use_gpu: bool = False,
     data_type = np.float32,
     epsilon: float = 1e-6,
-    verbose: bool = False,
+    verbose: bool = True,
     gpu_verbose: bool = True,
     dummy_cell: bool = True,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
