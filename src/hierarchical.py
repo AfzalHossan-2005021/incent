@@ -1382,17 +1382,14 @@ def score_macro_hypothesis(
     We do not rerun FGW as the primary selection criterion because raw FGW
     objectives are not directly comparable across differently sized overlap
     subsets and tend to over-favor tiny, very clean seeds. Instead, we evaluate
-    the hypothesis using the expansion evidence plus an absolute attachment
-    penalty over the selected matched edges:
+    the hypothesis using only:
 
     1. node evidence from the global pair score
-    2. absolute penalties for violated geodesic geometry
-    3. absolute penalties for violated attachment geometry
-    4. an absolute rigid-consistency penalty once the hypothesis defines an orientation
+    2. an absolute rigid-consistency penalty once the hypothesis defines an orientation
 
     This produces a size-aware score without adding extra hyperparameters: a
-    larger hypothesis wins only if it keeps contributing positive biological and
-    topological evidence.
+    larger hypothesis wins only if it keeps contributing positive biological
+    evidence without breaking rigid consistency.
     """
     if len(selected_pairs) == 0:
         return {
@@ -1418,28 +1415,15 @@ def score_macro_hypothesis(
     )
     selected_indices.sort()
 
-    topology_gaps = []
-    attachment_gaps = []
     selected_edge_count = 0
     for i_pos, i in enumerate(selected_indices):
-        u1, v1 = matches[int(i)]
         for j in selected_indices[i_pos + 1:]:
             if not match_adj[int(i), int(j)]:
                 continue
-            u2, v2 = matches[int(j)]
             selected_edge_count += 1
-            topology_gaps.append(abs(float(geodesic_A[u1, u2] - geodesic_B[v1, v2])))
-            attachment_gaps.append(abs(float(edge_A_norm[u1, u2] - edge_B_norm[v1, v2])))
 
-    if topology_gaps:
-        topology_score = -float(np.sum(np.log1p(np.asarray(topology_gaps, dtype=np.float64))))
-    else:
-        topology_score = 0.0
-
-    if attachment_gaps:
-        attachment_score = -float(np.sum(np.log1p(np.asarray(attachment_gaps, dtype=np.float64))))
-    else:
-        attachment_score = 0.0
+    topology_score = 0.0
+    attachment_score = 0.0
 
     if len(selected_pairs) >= 2:
         weights = np.array(
@@ -1463,7 +1447,7 @@ def score_macro_hypothesis(
     else:
         rigid_score = 0.0
 
-    total_score = float(node_score + topology_score + attachment_score + rigid_score)
+    total_score = float(node_score + rigid_score)
     return {
         "total_score": total_score,
         "node_score": node_score,
