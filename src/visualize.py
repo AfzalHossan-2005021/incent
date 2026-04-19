@@ -6,6 +6,7 @@ from typing import List, Tuple, Optional
 from scipy.optimize import linear_sum_assignment
 from sklearn.neighbors import NearestNeighbors
 from matplotlib.collections import LineCollection
+from matplotlib.patches import Polygon
 
 
 def generalized_procrustes_analysis(
@@ -431,6 +432,119 @@ def visualize_3d_stack(
     if n_slices <= 10:
         ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
         
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_created_slice_portion(
+    original_slice: AnnData,
+    created_slice: AnnData,
+    spatial_key: str = "spatial",
+    original_color: str = "lightgray",
+    portion_color: str = "crimson",
+    point_size: float = 4.0,
+    alpha_all: float = 0.35,
+    alpha_portion: float = 0.9,
+    show_window: bool = True,
+):
+    """
+    Visualize which portion of an original slice produced a created subslice.
+
+    The created cells are identified primarily by shared ``obs_names``. When
+    the created slice contains the metadata written by
+    ``hierarchical_pairwise_self_align_random_rectangle``, the sampled
+    rectangular window is also overlaid on the original slice.
+    """
+    pts_original = np.asarray(original_slice.obsm[spatial_key], dtype=np.float64)
+    pts_created = np.asarray(created_slice.obsm[spatial_key], dtype=np.float64)
+
+    if pts_original.ndim != 2 or pts_original.shape[1] < 2:
+        raise ValueError(f"`original_slice.obsm[{spatial_key!r}]` must contain 2D coordinates.")
+    if pts_created.ndim != 2 or pts_created.shape[1] < 2:
+        raise ValueError(f"`created_slice.obsm[{spatial_key!r}]` must contain 2D coordinates.")
+
+    original_names = np.asarray(original_slice.obs_names.astype(str))
+    created_names = set(created_slice.obs_names.astype(str))
+
+    if created_names:
+        portion_mask = np.array([name in created_names for name in original_names], dtype=bool)
+    else:
+        portion_mask = np.zeros(original_slice.n_obs, dtype=bool)
+
+    if not np.any(portion_mask):
+        raise ValueError(
+            "Could not identify created cells inside the original slice from obs_names."
+        )
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    ax1.scatter(
+        pts_original[:, 0],
+        pts_original[:, 1],
+        c=original_color,
+        s=point_size,
+        alpha=alpha_all,
+        label="Original Slice",
+    )
+    ax1.scatter(
+        pts_original[portion_mask, 0],
+        pts_original[portion_mask, 1],
+        c=portion_color,
+        s=point_size,
+        alpha=alpha_portion,
+        label="Created Portion",
+    )
+
+    metadata = created_slice.uns.get("self_alignment_test", {})
+    if show_window and metadata:
+        center = metadata.get("window_center")
+        angle = metadata.get("window_angle_radians")
+        width = metadata.get("window_width")
+        height = metadata.get("window_height")
+        if center is not None and angle is not None and width is not None and height is not None:
+            center = np.asarray(center, dtype=np.float64)
+            half_w = float(width) / 2.0
+            half_h = float(height) / 2.0
+            corners = np.array(
+                [
+                    [-half_w, -half_h],
+                    [half_w, -half_h],
+                    [half_w, half_h],
+                    [-half_w, half_h],
+                ],
+                dtype=np.float64,
+            )
+            cos_a = np.cos(float(angle))
+            sin_a = np.sin(float(angle))
+            rotation = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
+            rotated_corners = corners @ rotation + center
+            patch = Polygon(
+                rotated_corners,
+                closed=True,
+                fill=False,
+                edgecolor="black",
+                linewidth=1.5,
+                linestyle="--",
+                label="Sampling Window",
+            )
+            ax1.add_patch(patch)
+
+    ax1.set_title("Original Slice with Created Portion")
+    ax1.axis("equal")
+    ax1.legend()
+
+    ax2.scatter(
+        pts_created[:, 0],
+        pts_created[:, 1],
+        c=portion_color,
+        s=point_size,
+        alpha=alpha_portion,
+        label="Created Slice",
+    )
+    ax2.set_title("Created Slice")
+    ax2.axis("equal")
+    ax2.legend()
+
     plt.tight_layout()
     plt.show()
 
