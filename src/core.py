@@ -40,7 +40,8 @@ def hierarchical_pairwise_align(
     label_key: str = "cell_type_annot",
     w_graph: float = 0.5,
     visualize_clusters: bool = True,
-    dummy_cell: bool = True,
+    dummy_cell: bool = False,
+    verbose: bool = False,
     **kwargs
 ):
     """
@@ -292,6 +293,7 @@ def hierarchical_pairwise_align(
             numItermax=numItermax,
             use_gpu=use_gpu,
             dummy_cell=dummy_cell,
+            verbose=verbose,
             **kwargs
         )
         

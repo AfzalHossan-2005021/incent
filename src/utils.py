@@ -71,7 +71,7 @@ def to_backend(x, nx, data_type=None, reference=None):
     return x_nx
 
 
-def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, reg_compact=1.0, armijo=True, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-6, tol_abs=1e-6, verbose=False, **kwargs):
+def fused_gromov_wasserstein_incent(M, C1, C2, p, q, G_init = None, alpha = 0.1, reg_compact=1.0, armijo=True, log=False, numItermax=6000, numItermaxEmd=100000, tol_rel=1e-9, tol_abs=1e-9, verbose=False, **kwargs):
     """
     This method is written by Anup Bhowmik, CSE, BUET
 
@@ -188,10 +188,12 @@ def kl_divergence_corresponding_backend(X, Y):
 
     nx = ot.backend.get_backend(X,Y)
 
-    X = X/nx.sum(X,axis=1, keepdims=True)
-    Y = Y/nx.sum(Y,axis=1, keepdims=True)
-    log_X = nx.log(X)
-    log_Y = nx.log(Y)
+    epsilon = 1e-12
+
+    X = X/(nx.sum(X,axis=1, keepdims=True) + epsilon)
+    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + epsilon)
+    log_X = nx.log(X + epsilon)
+    log_Y = nx.log(Y + epsilon)
     X_log_X = nx.einsum('ij,ij->i',X,log_X)
     X_log_X = nx.reshape(X_log_X,(1,X_log_X.shape[0]))
 
@@ -220,12 +222,14 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
 
     nx = ot.backend.get_backend(X,Y)        # np or torch depending upon gpu availability
     X = nx.concatenate([X] * Y.shape[0], axis=0) # broadcast X
-    X = X/nx.sum(X,axis=1, keepdims=True)   # normalize
-    Y = Y/nx.sum(Y,axis=1, keepdims=True)   # normalize
+    X = X/(nx.sum(X,axis=1, keepdims=True) + 1e-12)   # normalize
+    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + 1e-12)   # normalize
     M = (X + Y) / 2.0
     kl_X_M = kl_divergence_corresponding_backend(X, M)
     kl_Y_M = kl_divergence_corresponding_backend(Y, M)
-    js_dist = nx.sqrt((kl_X_M + kl_Y_M) / 2.0).T[0]
+    # Clip small negative values due to floating point error before sqrt
+    js_sq = (kl_X_M + kl_Y_M) / 2.0
+    js_dist = nx.sqrt(nx.maximum(js_sq, 0.0)).T[0]
     return js_dist
 
 
@@ -250,8 +254,8 @@ def jensenshannon_divergence_backend(X, Y):
 
     nx = ot.backend.get_backend(X,Y)        
     
-    X = X/nx.sum(X,axis=1, keepdims=True)
-    Y = Y/nx.sum(Y,axis=1, keepdims=True)
+    X = X/(nx.sum(X,axis=1, keepdims=True) + 1e-12)
+    Y = Y/(nx.sum(Y,axis=1, keepdims=True) + 1e-12)
 
     n = X.shape[0]
     m = Y.shape[0]
