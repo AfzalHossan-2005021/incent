@@ -12,11 +12,15 @@ from sklearn.metrics.pairwise import cosine_distances
 import warnings
 
 def safe_jensenshannon(p, q):
-    from scipy.spatial.distance import jensenshannon
-    # Add a tiny epsilon to avoid floating point underflows that produce negative values inside scipy's sqrt
-    p_safe = np.asarray(p, dtype=np.float64) + 1e-12
-    q_safe = np.asarray(q, dtype=np.float64) + 1e-12
-    return jensenshannon(p_safe, q_safe)
+    from scipy.special import rel_entr
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(p.sum(), 1e-12)
+    q = q / max(q.sum(), 1e-12)
+    m = (p + q) / 2.0
+    # Compute relative entropy and clip negative float underflows before sqrt
+    js_sq = np.sum(rel_entr(p, m) + rel_entr(q, m)) / 2.0
+    return np.sqrt(max(js_sq, 0.0))
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
 
@@ -589,12 +593,19 @@ def empirical_logit_evidence(values, larger_is_better=True):
 
     Scores are ranked empirically and mapped to log-odds. This places unrelated
     evidence channels on a common scale without introducing hand-tuned weights.
-    Values above the empirical median receive positive evidence, values below it
-    receive negative evidence, and tied/isolated cases remain near zero.
     """
     values = np.asarray(values, dtype=np.float64)
     if values.size == 0:
         return np.zeros(0, dtype=np.float64)
+
+    # Protect against any rogue NaNs that might have slipped through
+    nan_mask = np.isnan(values)
+    if np.any(nan_mask):
+        values = values.copy()
+        if np.all(nan_mask):
+            return np.zeros(values.size, dtype=np.float64)
+        filtered = values[~nan_mask]
+        values[nan_mask] = np.min(filtered) if larger_is_better else np.max(filtered)
 
     working = values if larger_is_better else -values
     ranks = rankdata(working, method="average")
