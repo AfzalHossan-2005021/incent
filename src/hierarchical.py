@@ -9,7 +9,14 @@ from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import distance_matrix, Delaunay
 from sklearn.metrics.pairwise import cosine_distances
-from scipy.spatial.distance import jensenshannon
+import warnings
+
+def safe_jensenshannon(p, q):
+    from scipy.spatial.distance import jensenshannon
+    # Add a tiny epsilon to avoid floating point underflows that produce negative values inside scipy's sqrt
+    p_safe = np.asarray(p, dtype=np.float64) + 1e-12
+    q_safe = np.asarray(q, dtype=np.float64) + 1e-12
+    return jensenshannon(p_safe, q_safe)
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
 
@@ -246,7 +253,7 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     for i in range(mu_struct_A.shape[0]):
         for j in range(mu_struct_B.shape[0]):
             # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
-            M_struct[i, j] = jensenshannon(mu_struct_A[i], mu_struct_B[j])
+            M_struct[i, j] = safe_jensenshannon(mu_struct_A[i], mu_struct_B[j])
 
     
     M_cluster = (1.0 - beta) * M_expr + beta * M_struct
@@ -706,7 +713,7 @@ def collect_candidate_match_pairs(Pi_cluster, valid_A, valid_B, context_feat_A, 
         if feat_A.sum() <= 0 and feat_B.sum() <= 0:
             context_signal.append(0.0)
         else:
-            context_signal.append(float(-jensenshannon(feat_A, feat_B)))
+            context_signal.append(float(-safe_jensenshannon(feat_A, feat_B)))
 
     mi_signal = np.asarray(mi_signal, dtype=np.float64)
     enrichment_signal = np.asarray(enrichment_signal, dtype=np.float64)
