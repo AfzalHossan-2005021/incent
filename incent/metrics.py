@@ -1,8 +1,12 @@
 import numpy as np
 import torch
 
+from .core import (
+    calculate_cell_type_mismatch,
+    calculate_gene_expression_cosine_distance,
+    calculate_neighborhood_dissimilarity,
+)
 from .utils import select_backend
-from .core import calculate_neighborhood_dissimilarity, calculate_gene_expression_cosine_distance, calculate_cell_type_mismatch
 
 
 def calculate_neighborhood_similarity(js_dist_neighborhood, pi):
@@ -36,7 +40,7 @@ def cell_type_matching(cell_type_mismatch, pi_mat):
     M_match = 1 - cell_type_mismatch
     expected_matches = np.sum(M_match * pi_mat)
     total_mass = np.sum(pi_mat)
-    
+
     if total_mass > 0:
         return (expected_matches / total_mass)
     return 0.0
@@ -59,7 +63,7 @@ def calculate_gene_expression_similarity(cosine_dist_gene_expr, pi):
     return np.sum(cosine_dist_gene_expr * pi)
 
 
-def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=None, cosine_dist_gene_expr=None, 
+def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=None, cosine_dist_gene_expr=None,
                                cell_type_mismatch=None, sliceA=None, sliceB=None, use_rep=None, radius=100.0, use_gpu=True):
     """
     Calculate all similarity metrics for alignment quality assessment.
@@ -91,20 +95,20 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
     # Use uniform distribution if init_pi not provided
     if init_pi is None:
         init_pi = np.ones(final_pi.shape) / (final_pi.shape[0] * final_pi.shape[1])
-    
+
     # Calculate js_dist_neighborhood if not provided
     if js_dist_neighborhood is None:
         if sliceA is None or sliceB is None:
             raise ValueError("sliceA and sliceB must be provided to calculate js_dist_neighborhood")
-        
+
         # Calculate neighborhood dissimilarity using the provided slices and radius
         use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
         js_dist_neighborhood = calculate_neighborhood_dissimilarity(sliceA, sliceB, radius, nx=nx, data_type=np.float32, eps=1e-6)
-        
+
         # Convert to numpy if necessary
         if isinstance(js_dist_neighborhood, torch.Tensor):
             js_dist_neighborhood = js_dist_neighborhood.detach().cpu().numpy()
-    
+
     # Calculate cosine_dist_gene_expr if not provided
     if cosine_dist_gene_expr is None:
         if sliceA is None or sliceB is None:
@@ -118,15 +122,15 @@ def calculate_performance_metrics(final_pi, init_pi=None, js_dist_neighborhood=N
         cell_type_mismatch = calculate_cell_type_mismatch(sliceA, sliceB)
 
     results = {}
-    
+
     # Calculate neighborhood similarities
     results['initial_obj_neighbor'] = calculate_neighborhood_similarity(js_dist_neighborhood, init_pi)
     results['final_obj_neighbor'] = calculate_neighborhood_similarity(js_dist_neighborhood, final_pi)
-    
+
     # Calculate gene expression similarities
     results['initial_obj_gene'] = calculate_gene_expression_similarity(cosine_dist_gene_expr, init_pi)
     results['final_obj_gene'] = calculate_gene_expression_similarity(cosine_dist_gene_expr, final_pi)
-    
+
     # Calculate cell-type matching percentages
     results['initial_cell_type_match'] = cell_type_matching(cell_type_mismatch, init_pi)
     results['final_cell_type_match'] = cell_type_matching(cell_type_mismatch, final_pi)
@@ -167,7 +171,7 @@ def calculate_forward_reverse_compactness(pi_mat, sliceA, sliceB):
     pi_mat = np.asarray(pi_mat)
     Xs = np.asarray(sliceA.obsm['spatial'])
     Xt = np.asarray(sliceB.obsm['spatial'])
-    
+
     # Epsilon for numerical stability
     eps = 1e-12
 
@@ -175,7 +179,7 @@ def calculate_forward_reverse_compactness(pi_mat, sliceA, sliceB):
     pi_row_sums = pi_mat.sum(axis=1)
     pi_row_sums_safe = np.maximum(pi_row_sums, eps)
     pi_row_normalized = pi_mat / pi_row_sums_safe[:, None]
-    
+
     bary_t = pi_row_normalized @ Xt  # Source barycenters in Target space (N x 2)
     # Variance = E[||x||^2] - ||E[x]||^2
     var_fwd_E_x2 = pi_row_normalized @ np.sum(Xt ** 2, axis=1)
@@ -189,7 +193,7 @@ def calculate_forward_reverse_compactness(pi_mat, sliceA, sliceB):
     pi_col_sums = pi_mat.sum(axis=0)
     pi_col_sums_safe = np.maximum(pi_col_sums, eps)
     pi_col_normalized = pi_mat / pi_col_sums_safe[None, :]
-    
+
     bary_s = pi_col_normalized.T @ Xs  # Target barycenters in Source space (M x 2)
     var_rev_E_x2 = pi_col_normalized.T @ np.sum(Xs ** 2, axis=1)
     var_rev_Ex_2 = np.sum(bary_s ** 2, axis=1)

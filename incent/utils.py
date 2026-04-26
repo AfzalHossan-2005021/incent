@@ -1,12 +1,10 @@
-import ot
-import torch
-
 import numpy as np
+import ot
 import scipy.sparse as sp
-from tqdm import tqdm
-
-from ot.optim import line_search_armijo, cg
+import torch
 from ot.gromov import solve_gromov_linesearch
+from ot.optim import cg, line_search_armijo
+from tqdm import tqdm
 
 
 def select_backend(use_gpu=False, gpu_verbose=True):
@@ -268,19 +266,19 @@ def jensenshannon_divergence_backend(X, Y):
 
     assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
 
-    nx = ot.backend.get_backend(X,Y)        
-    
+    nx = ot.backend.get_backend(X,Y)
+
     X = X/nx.sum(X,axis=1, keepdims=True)
     Y = Y/nx.sum(Y,axis=1, keepdims=True)
 
     n = X.shape[0]
     m = Y.shape[0]
-    
+
     js_dist = nx.zeros((n, m))
 
     for i in tqdm(range(n)):
         js_dist[i, :] = jensenshannon_distance_1_vs_many_backend(X[i:i+1], Y)
-        
+
     print("Finished calculating cost matrix")
     # print(nx.unique(nx.isnan(js_dist)))
 

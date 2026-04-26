@@ -1,17 +1,23 @@
-import ot
 import heapq
-import torch
-import numpy as np
-
-from anndata import AnnData
 from collections import Counter
+from typing import Any
+
+import numpy as np
+import ot
+from anndata import AnnData
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
-from typing import Optional, Tuple, Union, Dict, Any, List
 from scipy.spatial.distance import cdist
-from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
+from sklearn.metrics.pairwise import cosine_distances, euclidean_distances
 
-from .utils import select_backend, fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, to_backend
+from .utils import (
+    extract_data_matrix,
+    fused_gromov_wasserstein_incent,
+    jensenshannon_divergence_backend,
+    select_backend,
+    to_backend,
+    to_dense_array,
+)
 
 
 def pairwise_align(
@@ -22,8 +28,8 @@ def pairwise_align(
     gamma: float,
     reg_compact: float = 0.001,
     armijo: bool = True,
-    radius: Optional[float] = None,
-    use_rep: Optional[str] = None,
+    radius: float | None = None,
+    use_rep: str | None = None,
     G_init = None,
     a_distribution = None,
     b_distribution = None,
@@ -95,19 +101,19 @@ def pairwise_align(
         matching metrics; that helper replaces the previous ``return_obj``
         flag.
     """
-    
+
     # Determine if gpu or cpu is being used
     use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=gpu_verbose)
-    
-    
+
+
     # check if slices are valid
     for s in [sliceA, sliceB]:
         if not len(s):
-            raise ValueError(f"Found empty `AnnData`:\n{s}.")   
-    
+            raise ValueError(f"Found empty `AnnData`:\n{s}.")
+
     # ────────────────────── Calculate spatial distances ──────────────────────
     D_A, D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=data_type, eps=epsilon)
-    
+
 
     # ────────────────────── Calculate gene expression dissimilarity ──────────────────────
     cosine_dist_gene_expr = calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps=epsilon)
@@ -182,7 +188,7 @@ def pairwise_align(
             D_B_temp = nx.concatenate([D_B, zeros_col], axis=1)
             zeros_row = nx.zeros((1, _nt_aug), type_as=D_B)
             D_B = nx.concatenate([D_B_temp, zeros_row], axis=0)
-        
+
         # ---- Augment M1: add dummy row/col only where needed ----
         if _has_dummy_tgt:
             mean_col = nx.mean(M1, axis=1)
@@ -230,7 +236,7 @@ def pairwise_align(
         if unbalanced:
             raise ValueError("Custom a_distribution is not supported with unbalanced=True.")
         a = nx.from_numpy(a_distribution)
-        
+
     if b_distribution is None:
         if unbalanced:
             if _has_dummy_tgt:
@@ -248,8 +254,8 @@ def pairwise_align(
 
     a = to_backend(a, nx, data_type=data_type)
     b = to_backend(b, nx, data_type=data_type)
-    
-    
+
+
     # Run OT
     if G_init is not None:
         if unbalanced and (_has_dummy_src or _has_dummy_tgt):
@@ -258,7 +264,7 @@ def pairwise_align(
             _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=data_type)
             _gi_aug[:ns, :nt] = _gi
             G_init = to_backend(_gi_aug, nx, data_type=data_type)
-    
+
     pi = fused_gromov_wasserstein_incent(M1 + gamma * M2, D_A, D_B, a, b, G_init = G_init, alpha= alpha, reg_compact=reg_compact, armijo=armijo, numItermax=numItermax, verbose=verbose, **kwargs)
     pi = nx.to_numpy(pi)
 
@@ -589,7 +595,7 @@ def calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, spatial
     Returns:
     D_A, D_B: Pairwise spatial distance matrices.
     """
-    
+
     print("Calculating spatial distance between cells in slice A and slice B")
 
     coordinates_A = np.asarray(sliceA.obsm[spatial_key], dtype=np.float64)
@@ -626,9 +632,9 @@ def calculate_gene_expression_cosine_distance(sliceA, sliceB, use_rep, eps = 1e-
     Returns:
     cosine_dist_gene_expr: Cosine distance matrix between gene expression profiles of slice A and slice B.
     """
-    
+
     print("Calculating cosine distance between gene expression profiles of slice A and slice B")
-    
+
     # Extract and prepare data matrices for cosine distance calculation
     A_X = extract_data_matrix(sliceA, use_rep)
     B_X = extract_data_matrix(sliceB, use_rep)
@@ -836,7 +842,7 @@ def _pairwise_js_distance(P: np.ndarray, Q: np.ndarray, eps: float = 1e-12) -> n
     return js
 
 
-def _extract_embedding_matrix(adata: AnnData, use_rep: Optional[str] = None) -> np.ndarray:
+def _extract_embedding_matrix(adata: AnnData, use_rep: str | None = None) -> np.ndarray:
     X = extract_data_matrix(adata, use_rep)
     if hasattr(X, 'toarray'):
         return np.asarray(X.toarray(), dtype=np.float64)
@@ -875,7 +881,7 @@ def _farthest_point_seeds(coords: np.ndarray, n_seeds: int) -> np.ndarray:
     return np.asarray(seeds, dtype=np.int32)
 
 
-def _build_spatial_knn_graph(coords: np.ndarray, k_neighbors: int = 10) -> Tuple[List[List[int]], List[List[float]], List[Tuple[int, int, float]]]:
+def _build_spatial_knn_graph(coords: np.ndarray, k_neighbors: int = 10) -> tuple[list[list[int]], list[list[float]], list[tuple[int, int, float]]]:
     n = coords.shape[0]
     if n == 0:
         return [], [], []
@@ -914,11 +920,11 @@ def _build_spatial_knn_graph(coords: np.ndarray, k_neighbors: int = 10) -> Tuple
 
 def _build_supercell_features(
     adata: AnnData,
-    use_rep: Optional[str] = None,
+    use_rep: str | None = None,
     spatial_key: str = 'spatial',
     label_key: str = 'cell_type_annot',
     density_k: int = 6,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
     labels = adata.obs[label_key].astype(str).to_numpy()
     density = _compute_local_density(adata, k=density_k, spatial_key=spatial_key)
@@ -951,8 +957,8 @@ def _build_supercell_features(
 def _balanced_region_growing_labels(
     coords: np.ndarray,
     node_features: np.ndarray,
-    neighbors: List[List[int]],
-    edge_weights: List[List[float]],
+    neighbors: list[list[int]],
+    edge_weights: list[list[float]],
     n_clusters: int,
     feature_weight: float = 0.25,
 ) -> np.ndarray:
@@ -1031,15 +1037,15 @@ def _compute_cluster_statistics(
     adata: AnnData,
     cluster_labels: np.ndarray,
     coords: np.ndarray,
-    cell_graph_edges: List[Tuple[int, int, float]],
+    cell_graph_edges: list[tuple[int, int, float]],
     density: np.ndarray,
     neighborhood_features: np.ndarray,
     cell_types_union: np.ndarray,
-    use_rep: Optional[str] = None,
+    use_rep: str | None = None,
     spatial_key: str = 'spatial',
     label_key: str = 'cell_type_annot',
     graph_structure_weight: float = 0.65,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     n_clusters = int(cluster_labels.max()) + 1
     embedding = _extract_embedding_matrix(adata, use_rep)
     labels = adata.obs[label_key].astype(str).to_numpy()
@@ -1110,8 +1116,8 @@ def _compute_cluster_statistics(
 
 
 def _compute_cluster_feature_cost(
-    stats_A: Dict[str, Any],
-    stats_B: Dict[str, Any],
+    stats_A: dict[str, Any],
+    stats_B: dict[str, Any],
     beta: float,
     gamma: float,
     density_weight: float = 0.2,
@@ -1137,17 +1143,17 @@ def _compute_numpy_cell_costs(
     sliceB: AnnData,
     beta: float,
     gamma: float,
-    radius: Optional[float] = None,
-    use_rep: Optional[str] = None,
+    radius: float | None = None,
+    use_rep: str | None = None,
     epsilon: float = 1e-6,
     spatial_key: str = 'spatial',
     label_key: str = 'cell_type_annot',
     use_gpu: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:    
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     use_gpu, nx = select_backend(use_gpu=use_gpu, gpu_verbose=False)
-    
+
     D_A, D_B = calculate_spatial_distance(sliceA, sliceB, nx, data_type=np.float32, eps=epsilon)
-    
+
     scale = max(estimate_characteristic_spacing(sliceA, spatial_key=spatial_key), estimate_characteristic_spacing(sliceB, spatial_key=spatial_key), epsilon)
     D_A = D_A / scale
     D_B = D_B / scale
@@ -1175,7 +1181,7 @@ def _compute_numpy_cell_costs(
         spatial_key=spatial_key,
         label_key=label_key,
     )
-    
+
     if hasattr(nbr_cost, 'cpu'):
         nbr_cost = nx.to_numpy(nbr_cost)
     elif hasattr(nbr_cost, 'numpy'):
@@ -1184,13 +1190,13 @@ def _compute_numpy_cell_costs(
     M = (1.0 - beta) * _normalize_cost_matrix(expr_cost) + beta * _normalize_cost_matrix(type_cost)
     M += gamma * _normalize_cost_matrix(nbr_cost)
     M = _normalize_cost_matrix(M)
-    
+
     # Offload back to CPU to prevent massive VRAM leaks inside hierarchical details
     if hasattr(D_A, 'cpu'):
         D_A = nx.to_numpy(D_A)
     if hasattr(D_B, 'cpu'):
         D_B = nx.to_numpy(D_B)
-        
+
     return D_A, D_B, M
 
 
@@ -1210,7 +1216,7 @@ def _sinkhorn_project_kernel(K: np.ndarray, a: np.ndarray, b: np.ndarray, n_iter
         KTu = nx.dot(K.T, u)
         KTu = nx.maximum(KTu, eps)
         v = b / KTu
-    
+
     res = (u[:, None] * K) * v[None, :]
     return res
 
@@ -1285,10 +1291,10 @@ def hierarchical_pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    radius: Optional[float] = None,
-    use_rep: Optional[str] = None,
+    radius: float | None = None,
+    use_rep: str | None = None,
     target_cluster_size: int = 96,
-    n_clusters: Optional[int] = None,
+    n_clusters: int | None = None,
     clustering_k_neighbors: int = 12,
     clustering_feature_weight: float = 0.25,
     graph_structure_weight: float = 0.65,
@@ -1296,7 +1302,7 @@ def hierarchical_pairwise_align(
     coarse_alpha: float = 0.6,
     coarse_max_iter: int = 1000,
     coarse_max_iter_ot: int = 2000,
-    fine_alpha: Optional[float] = None,
+    fine_alpha: float | None = None,
     fine_max_iter: int = 100,
     fine_max_iter_ot: int = 300,
     init_topk_clusters: int = 2,
@@ -1312,7 +1318,7 @@ def hierarchical_pairwise_align(
     return_details: bool = False,
     use_gpu: bool = True,
     **kwargs,
-) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], Dict[str, Any]]]:
+) -> NDArray[np.floating] | tuple[NDArray[np.floating], dict[str, Any]]:
     """
     Hierarchical coarse-to-fine alignment using contiguous supercells and unbalanced FGW
     at both the cluster and cell levels.
@@ -1389,13 +1395,13 @@ def hierarchical_pairwise_align(
         # Check deficit relative to the other slice to add dummy
         _has_dummy_src = False
         _has_dummy_tgt = False
-        
+
         _w_dummy_src = max(0, stats_B['sizes'].sum() - stats_A['sizes'].sum())
         _w_dummy_tgt = max(0, stats_A['sizes'].sum() - stats_B['sizes'].sum())
-        
+
         _has_dummy_src = _w_dummy_src > 0
         _has_dummy_tgt = _w_dummy_tgt > 0
-        
+
         _budget = max(stats_A['sizes'].sum(), stats_B['sizes'].sum())
 
         ns_c, nt_c = len(p), len(q)
@@ -1405,13 +1411,13 @@ def hierarchical_pairwise_align(
         # Augment structures
         struct_A = stats_A['structure'].copy()
         struct_B = stats_B['structure'].copy()
-        
+
         if _has_dummy_src:
             zeros_col = np.zeros((ns_c, 1), dtype=np.float64)
             struct_A = np.concatenate([struct_A, zeros_col], axis=1)
             zeros_row = np.zeros((1, _ns_c_aug), dtype=np.float64)
             struct_A = np.concatenate([struct_A, zeros_row], axis=0)
-            
+
         if _has_dummy_tgt:
             zeros_col = np.zeros((nt_c, 1), dtype=np.float64)
             struct_B = np.concatenate([struct_B, zeros_col], axis=1)
@@ -1433,14 +1439,14 @@ def hierarchical_pairwise_align(
             p = np.concatenate([stats_A['sizes'] / _budget, [_w_dummy_src / _budget]])
         else:
             p = stats_A['sizes'] / _budget
-            
+
         if _has_dummy_tgt:
             q = np.concatenate([stats_B['sizes'] / _budget, [_w_dummy_tgt / _budget]])
         else:
             q = stats_B['sizes'] / _budget
 
         init_coarse = np.outer(p, q)
-        
+
         coarse_out = fused_gromov_wasserstein_incent(
             M=M_coarse,
             C1=struct_A,
@@ -1461,7 +1467,7 @@ def hierarchical_pairwise_align(
         else:
             coarse_plan_full = coarse_out
             coarse_log = None
-            
+
         # Strip dummy rows/cols added
         if _has_dummy_src and _has_dummy_tgt:
             coarse_plan = coarse_plan_full[:ns_c, :nt_c]
@@ -1471,7 +1477,7 @@ def hierarchical_pairwise_align(
             coarse_plan = coarse_plan_full[:, :nt_c]
         else:
             coarse_plan = coarse_plan_full
-            
+
     else:
         coarse_out = fused_gromov_wasserstein_incent(
             M=M_coarse,
