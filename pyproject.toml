@@ -52,6 +52,13 @@ docs = [
     "myst-parser>=2",
     "furo>=2024.1",
 ]
+bench = [
+    "scanpy>=1.10",
+    "pandas>=2.0",
+    "paste-bio>=1.4",
+    "paste2>=1.0",
+    "moscot>=0.5",
+]
 
 [project.urls]
 Homepage = "https://github.com/AfzalHossan-2005021/INCENT"
@@ -90,3 +97,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B"]
+# Jupytext-paired notebooks and scripts intentionally use notebook idioms
+# (cell-local imports, semicolon-chained matplotlib calls, top-level
+# expressions for cell display).
+"notebooks/*.py" = ["B018", "E402", "E702", "F401"]
+"notebooks/*.ipynb" = ["B018", "E402", "E702", "F401"]
+"scripts/*.py" = ["B018", "E402", "E702", "F401"]
