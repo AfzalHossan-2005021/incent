@@ -4,12 +4,12 @@ Alignment of Single-Cell Spatial Transcriptomics Data.
 """
 
 from .core import (
-    pairwise_align,
     hierarchical_pairwise_align,
+    pairwise_align,
 )
 from .metrics import (
-    calculate_performance_metrics,
     calculate_forward_reverse_compactness,
+    calculate_performance_metrics,
 )
 from .visualize import (
     visualize_alignment,

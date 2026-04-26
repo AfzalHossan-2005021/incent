@@ -78,8 +78,14 @@ target-version = "py310"
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = [
     "E501",  # line length handled by formatter
+    "E701",  # one-line if-statements are common in this code
+    "E731",  # the codebase uses module-level lambdas as small helpers
     "E741",  # POT uses ambiguous l/I/O variable names
+    "B007",  # research-style enumerate loops sometimes drop the index
     "B008",  # default arg call (numpy dtype objects)
+    "B905",  # strict= on zip() not enforced (tracked separately)
+    "W291",  # trailing whitespace tolerated until a one-shot reformat lands
+    "W293",  # blank-line whitespace tolerated until a one-shot reformat lands
 ]
 
 [tool.ruff.lint.per-file-ignores]
