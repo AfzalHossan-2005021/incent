@@ -11,38 +11,52 @@ from ot.gromov import solve_gromov_linesearch
 
 def select_backend(use_gpu=False, gpu_verbose=True):
     """
-    Selects the appropriate backend (numpy or torch) based on GPU availability and user preference.
+    Select the appropriate backend (NumPy or PyTorch) based on GPU availability
+    and user preference.
 
     Args:
-        use_gpu: Whether to use GPU if available.
-        gpu_verbose: Whether to print GPU information when selected.
+        use_gpu: If True, attempt to use the PyTorch CUDA backend.
+        gpu_verbose: If True, print a message describing the chosen backend.
+
     Returns:
-        The selected backend module (numpy or torch).
+        Tuple ``(use_gpu, nx)`` where ``use_gpu`` reflects whether GPU was
+        actually selected and ``nx`` is a POT backend instance (always
+        non-None).
     """
-    nx = None
-    if use_gpu:
+    if use_gpu and torch.cuda.is_available():
+        if gpu_verbose:
+            print("Using GPU with PyTorch backend.")
+        return True, ot.backend.TorchBackend()
+
+    if use_gpu and not torch.cuda.is_available():
+        if gpu_verbose:
+            print("CUDA is not available on your system. Reverting to CPU with NumPy backend.")
+        return False, ot.backend.NumpyBackend()
+
+    # use_gpu is False
+    if gpu_verbose:
         if torch.cuda.is_available():
-            nx = ot.backend.TorchBackend()
-            if gpu_verbose:
-                print("Using gpu with Pytorch backend.")
+            print("Tip: CUDA is available on your system. Enable GPU support with use_gpu=True.")
         else:
-            use_gpu = False
-            nx = ot.backend.NumpyBackend()
-            if gpu_verbose:
-                print("CUDA is not available on your system. Reverting to CPU with Numpy backend.")
-    else:
-        if torch.cuda.is_available() and gpu_verbose:
-            print("Tip: CUDA is available on your system. You can enable GPU support by setting use_gpu=True.")
-        else:
-            nx = ot.backend.NumpyBackend()
-            if gpu_verbose:
-                print("Using cpu with Numpy backend.")
-    return use_gpu, nx
+            print("Using CPU with NumPy backend.")
+    return False, ot.backend.NumpyBackend()
 
 
-def to_backend(x, nx, data_type=None, reference=None):
+def to_backend(x, nx, data_type=None, reference=None, device=None):
     """
-    Centralized function to manage CPU-GPU movement and type consistency.
+    Centralized helper to move arrays/tensors onto the requested POT backend
+    while keeping device and dtype consistent.
+
+    Resolution order for placement on Torch backends:
+      1. ``reference`` (if given) — match the device of the reference tensor
+         using POT's ``type_as`` semantics. This is the recommended path.
+      2. Explicit ``device`` argument (e.g. ``"cpu"``, ``"cuda"``,
+         ``"cuda:1"``).
+      3. Default to ``cuda`` when CUDA is available.
+
+    Passing a ``reference`` tensor takes precedence over both explicit
+    ``device`` and the implicit CUDA default, so callers can always force a
+    specific device by supplying any tensor already on it.
     """
     # Force to numpy safely
     if hasattr(x, 'cpu'):
@@ -51,22 +65,23 @@ def to_backend(x, nx, data_type=None, reference=None):
         x = x.numpy()
     elif hasattr(x, "todense"):
         x = x.todense()
-    
+
     # Optional typing to numpy type
     if data_type is not None:
         x = np.asarray(x, dtype=data_type)
     else:
         x = np.asarray(x)
-        
+
     x_nx = nx.from_numpy(x)
 
-    # Use reference tensor to match device/type if provided
-    # Otherwise set up PyTorch CUDA if backend is Torch and CUDA is available
-    if reference is not None: # Use POT type_as logic
+    if reference is not None:
+        # Match device + dtype of reference using POT's type_as logic.
         x_nx = nx.zeros(x_nx.shape, type_as=reference) + x_nx
     elif nx.__class__.__name__ == 'TorchBackend':
         import torch
-        if torch.cuda.is_available():
+        if device is not None:
+            x_nx = x_nx.to(device)
+        elif torch.cuda.is_available():
             x_nx = x_nx.cuda()
 
     return x_nx
@@ -202,7 +217,8 @@ def kl_divergence_corresponding_backend(X, Y):
     X_log_Y = nx.reshape(X_log_Y,(1,X_log_Y.shape[0]))
 
     D = X_log_X.T - X_log_Y.T
-    return nx.to_numpy(D) if hasattr(nx, 'to_numpy') else np.asarray(D)
+    # Stay on the active backend; the caller decides when to materialize numpy.
+    return D
 
 
 def jensenshannon_distance_1_vs_many_backend(X, Y):
@@ -222,13 +238,13 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
     assert X.shape[0] == 1
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    nx = ot.backend.get_backend(X,Y)        # np or torch depending upon gpu availability
-    X = nx.concatenate([X] * Y.shape[0], axis=0) # broadcast X
-    X = X/nx.sum(X,axis=1, keepdims=True)   # normalize
-    Y = Y/nx.sum(Y,axis=1, keepdims=True)   # normalize
+    nx = ot.backend.get_backend(X, Y)        # np or torch depending upon gpu availability
+    X = nx.concatenate([X] * Y.shape[0], axis=0)  # broadcast X
+    X = X / nx.sum(X, axis=1, keepdims=True)      # normalize
+    Y = Y / nx.sum(Y, axis=1, keepdims=True)      # normalize
     M = (X + Y) / 2.0
-    kl_X_M = torch.from_numpy(kl_divergence_corresponding_backend(X, M))
-    kl_Y_M = torch.from_numpy(kl_divergence_corresponding_backend(Y, M))
+    kl_X_M = kl_divergence_corresponding_backend(X, M)
+    kl_Y_M = kl_divergence_corresponding_backend(Y, M)
     js_dist = nx.sqrt((kl_X_M + kl_Y_M) / 2.0).T[0]
     return js_dist
 
@@ -268,13 +284,10 @@ def jensenshannon_divergence_backend(X, Y):
     print("Finished calculating cost matrix")
     # print(nx.unique(nx.isnan(js_dist)))
 
-    if torch.cuda.is_available():
-        try:
-            return js_dist.numpy()
-        except:
-            return js_dist
-    else:
-        return js_dist
+    # Return on the active backend; downstream callers will route through
+    # ``to_backend`` or ``nx.to_numpy`` as needed. Avoids CPU/GPU device
+    # mixing that the previous ``.numpy()`` round-trip introduced.
+    return js_dist
 
 
 def pairwise_msd(A, B):

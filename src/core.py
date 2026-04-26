@@ -34,41 +34,66 @@ def pairwise_align(
     verbose: bool = False,
     gpu_verbose: bool = True,
     unbalanced: bool = True,
-    **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
+    **kwargs) -> NDArray[np.floating]:
     """
+    Compute the INCENT optimal-transport alignment between two single-cell
+    spatial transcriptomics slices.
 
-    This method is written by Anup Bhowmik, CSE, BUET
+    This solves a fused Gromov-Wasserstein (FGW) problem in which the linear
+    cost combines gene-expression dissimilarity and cell-type mismatch, the
+    quadratic cost combines pairwise spatial distances, and the joint
+    objective is augmented with a multiscale rotation-invariant neighborhood
+    descriptor cost ``M2`` and (optionally) a "Form A" spatial-compactness
+    regularizer.
 
-    Calculates and returns optimal alignment of two slices of single cell MERFISH data. 
-    
     Args:
-        sliceA: Slice A to align.
-        sliceB: Slice B to align.
-        alpha:  weight for spatial distance
-        gamma: weight for gene expression distance (JSD)
-        beta: weight for cell type one hot encoding
-        radius: radius for cellular neighborhood
+        sliceA: Source slice (``AnnData``). Requires ``obsm['spatial']`` and
+            ``obs['cell_type_annot']``.
+        sliceB: Target slice (``AnnData``). Same requirements as ``sliceA``.
+        alpha: Mixing weight on the GW (spatial-structure) term in
+            ``[0, 1]``. ``alpha=0`` reduces to a pure linear OT in the
+            feature cost ``M1 + gamma * M2``; ``alpha=1`` to a pure GW
+            problem.
+        beta: Mixing weight on the cell-type-mismatch term inside ``M1``.
+            ``M1 = (1 - beta) * cosine_distance(X_A, X_B) + beta * 1[label_A != label_B]``.
+        gamma: Weight on the multiscale neighborhood cost ``M2`` added to
+            ``M1`` when forming the linear cost.
+        reg_compact: Coefficient of the spatial-compactness regularizer
+            applied inside :func:`fused_gromov_wasserstein_incent`. Set to
+            ``0`` to disable.
+        armijo: If True, use Armijo line-search inside conditional gradient.
+        radius: Optional fixed radius for the neighborhood descriptor; when
+            ``None``, multiscale radii are estimated from local spacing.
+        use_rep: If ``None``, gene-expression distance is computed from
+            ``slice.X``; otherwise from ``slice.obsm[use_rep]``.
+        G_init: Optional initial transport plan ``(n_A, n_B)``. Defaults to
+            the outer product of the marginals.
+        a_distribution: Optional source marginal. Defaults to uniform when
+            ``unbalanced=False``; not supported when ``unbalanced=True``.
+        b_distribution: Optional target marginal. Same constraints as
+            ``a_distribution``.
+        numItermax: Maximum number of conditional-gradient iterations.
+        use_gpu: If True and CUDA is available, use the PyTorch backend.
+        data_type: Backend tensor dtype. Default ``np.float32``.
+        epsilon: Numerical-stability constant added in distance/cosine
+            computations.
+        verbose: If True, FGW-OT prints inner-loop diagnostics.
+        gpu_verbose: If True, print backend selection messages.
+        unbalanced: If True, augment the marginals with a label-aware
+            "dummy" cell on whichever side has fewer cells (per-type budget),
+            which absorbs unmatched mass.
+        **kwargs: Forwarded to :func:`fused_gromov_wasserstein_incent`
+            (e.g. ``numItermaxEmd``, ``tol_rel``, ``tol_abs``).
 
-        dissimilarity: Expression dissimilarity measure: ``'kl'`` or ``'euclidean'``.
-        use_rep: If ``None``, uses ``slice.X`` to calculate dissimilarity between spots, otherwise uses the representation given by ``slice.obsm[use_rep]``.
-        G_init (array-like, optional): Initial mapping to be used in FGW-OT, otherwise default is uniform mapping.
-        a_distribution (array-like, optional): Distribution of sliceA spots, otherwise default is uniform.
-        b_distribution (array-like, optional): Distribution of sliceB spots, otherwise default is uniform.
-        numItermax: Max number of iterations during FGW-OT.
-        norm: If ``True``, scales spatial distances such that neighboring spots are at distance 1. Otherwise, spatial distances remain unchanged.
-        backend: Type of backend to run calculations. For list of backends available on system: ``ot.backend.get_backend_list()``.
-        data_type: Data type for backend tensors. Default is float32.
-        return_obj: If ``True``, additionally returns objective function output of FGW-OT and cell-type matching metrics.
-        verbose: If ``True``, FGW-OT is verbose.
-        gpu_verbose: If ``True``, print whether gpu is being used to user.
-   
     Returns:
-        - Alignment of spots (pi).
+        ``pi`` of shape ``(n_A, n_B)``: the soft transport plan from cells
+        of ``sliceA`` to cells of ``sliceB``.
 
-        If ``return_obj = True``, additionally returns:
-        
-        - initial_obj_neighbor, initial_obj_gene, final_obj_neighbor, final_obj_gene: Objective metrics
-        - initial_cell_type_match, final_cell_type_match: Cell-type matching percentages 
+    Notes:
+        Use :func:`incent.calculate_performance_metrics` after this call to
+        obtain initial/final neighborhood, gene-expression, and cell-type
+        matching metrics; that helper replaces the previous ``return_obj``
+        flag.
     """
     
     # Determine if gpu or cpu is being used
