@@ -9,6 +9,7 @@ __pycache__/
 # Notebook-driven dataset caches
 notebooks/data/
 data/dlpfc/
+benchmarks/data/
 *.h5ad
 
 # Local development artefacts

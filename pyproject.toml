@@ -52,6 +52,13 @@ docs = [
     "myst-parser>=2",
     "furo>=2024.1",
 ]
+bench = [
+    "scanpy>=1.10",
+    "pandas>=2.0",
+    "paste-bio>=1.4",
+    "paste2>=1.0",
+    "moscot>=0.5",
+]
 
 [project.urls]
 Homepage = "https://github.com/AfzalHossan-2005021/INCENT"
