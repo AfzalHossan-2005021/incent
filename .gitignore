@@ -6,6 +6,18 @@ __pycache__/
 # C extensions
 *.so
 
+# Notebook-driven dataset caches
+notebooks/data/
+data/dlpfc/
+*.h5ad
+
+# Local development artefacts
+docs/_build/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
 # Distribution / packaging
 .Python
 build/

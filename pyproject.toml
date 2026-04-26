@@ -90,3 +90,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B"]
+# Jupytext-paired notebooks and scripts intentionally use notebook idioms
+# (cell-local imports, semicolon-chained matplotlib calls, top-level
+# expressions for cell display).
+"notebooks/*.py" = ["B018", "E402", "E702", "F401"]
+"notebooks/*.ipynb" = ["B018", "E402", "E702", "F401"]
+"scripts/*.py" = ["B018", "E402", "E702", "F401"]
