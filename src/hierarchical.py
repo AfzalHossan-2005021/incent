@@ -9,18 +9,7 @@ from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import distance_matrix, Delaunay
 from sklearn.metrics.pairwise import cosine_distances
-import warnings
-
-def safe_jensenshannon(p, q):
-    from scipy.special import rel_entr
-    p = np.asarray(p, dtype=np.float64)
-    q = np.asarray(q, dtype=np.float64)
-    p = p / max(p.sum(), 1e-12)
-    q = q / max(q.sum(), 1e-12)
-    m = (p + q) / 2.0
-    # Compute relative entropy and clip negative float underflows before sqrt
-    js_sq = np.sum(rel_entr(p, m) + rel_entr(q, m)) / 2.0
-    return np.sqrt(max(js_sq, 0.0))
+from scipy.special import rel_entr
 from scipy.stats import rankdata
 from ot.gromov import fused_unbalanced_gromov_wasserstein
 
@@ -90,10 +79,20 @@ class SliceClusterCache:
     valid: np.ndarray
     mu_expr: np.ndarray
     mu_struct_local: np.ndarray
-    global_shape: np.ndarray
-    mu_struct: np.ndarray
+    mu_struct_neighborhood: np.ndarray
     cluster_hist: np.ndarray
     all_types: np.ndarray
+
+
+def safe_jensenshannon(p, q):
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(p.sum(), 1e-12)
+    q = q / max(q.sum(), 1e-12)
+    m = (p + q) / 2.0
+    # Compute relative entropy and clip negative float underflows before sqrt
+    js_sq = np.sum(rel_entr(p, m) + rel_entr(q, m)) / 2.0
+    return np.sqrt(max(js_sq, 0.0))
 
 
 def build_slice_cluster_cache(
@@ -179,8 +178,8 @@ def build_slice_cluster_cache(
             flat_local /= flat_local.sum()
         mu_struct_local[cluster_idx] = flat_local
 
-    global_shape = compute_cluster_global_shape_features(coords, centroids)
-    mu_struct = np.concatenate([mu_struct_local, global_shape], axis=1)
+    adjacency, _ = build_cluster_contact_graph(coords, labels, valid)
+    mu_struct_neighborhood = compute_cluster_context_features(mu_struct_local, adjacency)
 
     return SliceClusterCache(
         labels=np.asarray(labels),
@@ -189,59 +188,25 @@ def build_slice_cluster_cache(
         valid=valid,
         mu_expr=mu_expr,
         mu_struct_local=mu_struct_local,
-        global_shape=global_shape,
-        mu_struct=mu_struct,
+        mu_struct_neighborhood=mu_struct_neighborhood,
         cluster_hist=cluster_hist,
         all_types=all_types,
     )
 
 
-def extract_cluster_features(adata, labels, spatial_key="spatial", feature_key="X_pca", label_key="cell_type_annot", all_types=None) -> tuple:
-    """
-    Extract cluster-level features for coarse mapping.
-
-    This is a compatibility wrapper around `build_slice_cluster_cache`, which is
-    the shared implementation used by both the coarse FGW stage and the later
-    macro-overlap stage.
-    
-    Args:
-        adata: AnnData object.
-        labels: np.ndarray of cluster labels for each cell.
-        spatial_key: key in obsm for coords.
-        feature_key: 'X' for adata.X, else obsm key for latent features.
-        label_key: key in obs for cell type annotations.
-        all_types: global list of cell types.
-        
-    Returns:
-        masses: np.ndarray (C,) normalized size of each cluster
-        centroids: np.ndarray (C, 2) average spatial coordinate
-        mu_expr: np.ndarray (C, D) mean expression/latent vector
-        mu_struct: np.ndarray (C, K) concatenation of:
-            1. intrinsic within-cluster cell-type Fourier summaries
-            2. cluster-centered global tissue morphology descriptors
-    """
-    cache = build_slice_cluster_cache(
-        adata,
-        labels,
-        spatial_key=spatial_key,
-        feature_key=feature_key,
-        label_key=label_key,
-        all_types=all_types,
-    )
-    return cache.masses, cache.centroids, cache.mu_expr, cache.mu_struct
-
-
-def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B, beta=0.75):
+def compute_cluster_feature_costs(mu_expr_A, mu_struct_local_A, mu_struct_neighborhood_A, mu_expr_B, mu_struct_local_B, mu_struct_neighborhood_B, beta=0.75, gamma=0.5):
     """
     Compute inter-cluster cost matrix M_cluster between two slices.
     
     Args:
         mu_expr_A: np.ndarray (C_A, D) mean expression for slice A
-        mu_struct_A: np.ndarray (C_A, K) invariant structural features for slice A
+        mu_struct_local_A: np.ndarray (C_A, K) local structural features for slice A
+        mu_struct_neighborhood_A: np.ndarray (C_A, L) neighborhood structural features for slice A
         mu_expr_B: np.ndarray (C_B, D) mean expression for slice B
-        mu_struct_B: np.ndarray (C_B, K) invariant structural features for slice B
+        mu_struct_local_B: np.ndarray (C_B, K) local structural features for slice B
+        mu_struct_neighborhood_B: np.ndarray (C_B, L) neighborhood structural features for slice B
         beta: weight for structural distance (expression distance is 1 - beta)
-        
+        gamma: weight for neighborhood structural distance (expression distance is 1 - gamma)
     Returns:
         M_cluster: np.ndarray (C_A, C_B) cost matrix
     """
@@ -253,15 +218,17 @@ def compute_cluster_feature_costs(mu_expr_A, mu_struct_A, mu_expr_B, mu_struct_B
     M_expr = cosine_distances(mu_expr_A, mu_expr_B)
             
     # Jensen-Shannon for nonnegative invariant structural descriptors
-    M_struct = np.zeros((mu_struct_A.shape[0], mu_struct_B.shape[0]))
-    for i in range(mu_struct_A.shape[0]):
-        for j in range(mu_struct_B.shape[0]):
-            # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
-            M_struct[i, j] = safe_jensenshannon(mu_struct_A[i], mu_struct_B[j])
-
+    M_struct_local = np.zeros((mu_struct_local_A.shape[0], mu_struct_local_B.shape[0]))
+    M_struct_neighborhood = np.zeros((mu_struct_neighborhood_A.shape[0], mu_struct_neighborhood_B.shape[0]))
     
-    M_cluster = (1.0 - beta) * M_expr + beta * M_struct
-        
+    for i in range(mu_struct_local_A.shape[0]):
+        for j in range(mu_struct_local_B.shape[0]):
+            # The descriptors are normalized nonnegative summaries over cell-type-specific structure.
+            M_struct_local[i, j] = safe_jensenshannon(mu_struct_local_A[i], mu_struct_local_B[j])
+            M_struct_neighborhood[i, j] = safe_jensenshannon(mu_struct_neighborhood_A[i], mu_struct_neighborhood_B[j])
+    
+    M_cluster = (1.0 - beta - gamma) * M_expr + beta * M_struct_local + gamma * M_struct_neighborhood
+
     return M_cluster
 
 
@@ -1177,93 +1144,6 @@ def solve_frontier_assignment(frontier_A, frontier_B, candidate_pairs, candidate
         if c < len(frontier_B) and cost[r, c] < 0:
             selected.append((int(frontier_A[r]), int(frontier_B[c])))
     return selected
-
-
-def select_initial_match_component(matches, match_adj, match_scores, match_tiebreak_scores=None):
-    """
-    Select the strongest initial motif in the match graph.
-
-    The seed is chosen in two steps:
-    1. compute a deterministic one-to-one assignment over candidate cluster
-       pairs using their global evidence scores
-    2. within that assignment, choose the highest-scoring connected triangle,
-       else edge, else singleton, using log-enrichment only as a secondary
-       tie-break among equal primary scores
-
-    Exact or near-exact ties are reported in the returned diagnostics rather
-    than silently broken by iteration order.
-    """
-    if len(matches) == 0 or match_adj.shape[0] == 0:
-        return np.array([], dtype=int), {
-            "seed_assignment_count": 0,
-            "seed_candidate_count": 0,
-        }
-
-    match_scores = np.asarray(match_scores, dtype=np.float64)
-    assigned_indices = solve_seed_assignment(matches, match_scores)
-    if assigned_indices.size == 0:
-        assigned_indices = np.arange(len(matches), dtype=int)
-        assignment_mode = "fallback_all_candidates"
-    else:
-        assignment_mode = "stable_one_to_one"
-
-    ranked = rank_seed_motifs(match_adj, match_scores, assigned_indices, match_tiebreak_scores=match_tiebreak_scores)
-    chosen_size = None
-    chosen_records = []
-    for motif_size in (3, 2, 1):
-        if ranked.get(motif_size):
-            chosen_size = motif_size
-            chosen_records = ranked[motif_size]
-            break
-
-    if chosen_size is None or not chosen_records:
-        return np.array([], dtype=int), {
-            "seed_assignment_count": int(assigned_indices.size),
-            "seed_candidate_count": 0,
-            "seed_assignment_mode": assignment_mode,
-        }
-
-    best_score, best_tiebreak, best_indices = chosen_records[0]
-    second_score = chosen_records[1][0] if len(chosen_records) > 1 else -np.inf
-    second_tiebreak = chosen_records[1][1] if len(chosen_records) > 1 else -np.inf
-    second_indices = chosen_records[1][2] if len(chosen_records) > 1 else tuple()
-
-    motif_scores = np.array([score for score, _, _ in chosen_records], dtype=np.float64)
-    unique_scores = np.unique(motif_scores)
-    positive_gaps = np.diff(np.sort(unique_scores))
-    positive_gaps = positive_gaps[positive_gaps > 0]
-    score_resolution = float(np.min(positive_gaps)) if positive_gaps.size > 0 else 0.0
-
-    if np.isfinite(second_score):
-        score_gap = float(best_score - second_score)
-        score_ratio = float(np.exp(score_gap))
-        ambiguity_detected = bool(
-            np.isclose(best_score, second_score, rtol=1e-6, atol=1e-8)
-            or score_gap <= max(score_resolution, 1e-12)
-        )
-    else:
-        score_gap = np.inf
-        score_ratio = np.inf
-        ambiguity_detected = False
-
-    diagnostics = {
-        "seed_assignment_count": int(assigned_indices.size),
-        "seed_candidate_count": int(len(chosen_records)),
-        "seed_assignment_mode": assignment_mode,
-        "seed_motif_size": int(chosen_size),
-        "seed_best_score": float(best_score),
-        "seed_best_tiebreak": float(best_tiebreak),
-        "seed_second_score": float(second_score) if np.isfinite(second_score) else None,
-        "seed_second_tiebreak": float(second_tiebreak) if np.isfinite(second_tiebreak) else None,
-        "seed_log_evidence_gap": float(score_gap) if np.isfinite(score_gap) else None,
-        "seed_evidence_ratio": float(score_ratio) if np.isfinite(score_ratio) else None,
-        "seed_score_resolution": float(score_resolution),
-        "seed_ambiguity_detected": ambiguity_detected,
-        "seed_best_indices": list(best_indices),
-        "seed_second_indices": list(second_indices),
-        "seed_assignment_pairs": [matches[i] for i in assigned_indices.tolist()],
-    }
-    return np.array(best_indices, dtype=int), diagnostics
 
 
 def select_initial_match_components(matches, match_adj, match_scores, match_tiebreak_scores=None, top_k=3):
