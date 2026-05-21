@@ -65,7 +65,7 @@ def cluster_cells_spatial(
     row = np.array([e[0] for e in edges] + [e[1] for e in edges])
     col = np.array([e[1] for e in edges] + [e[0] for e in edges])
     data = np.ones(len(row))
-    connectivity = sp.coo_matrix((data, (row, col)), shape=(n_cells, n_cells))
+    connectivity = sp.coo_matrix((data, (row, col)), shape=(n_cells, n_cells)).tocsr()
     
     # 2. Extract and Smooth Biological Features (Neighborhood Aware)
     if feature_key in adata.obsm:
