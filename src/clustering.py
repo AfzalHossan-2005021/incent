@@ -90,60 +90,28 @@ def cluster_cells_spatial(
     D_inv = sp.diags(1.0 / degree)
     X_niche = D_inv.dot(adj_with_self).dot(X_base)
     
-    # 3. Global Biological Niches Clustering
-    # We want clusters of size approx `target_size`. 
-    target_size = 200.0 / resolution
-    # Let's not overestimate the initial biological clusters too much; we just want to separate major biological domains.
-    n_global_clusters = max(2, int((n_cells / target_size) / 2))
+    # 3. Create Joint Spatial-Biological Embedding
+    # Normalize features to give balanced weighting to spatial and biological variance
+    std_coords = np.std(coords, axis=0).mean()
+    coords_scaled = (coords / std_coords) if std_coords > 0 else coords
     
-    global_agg = AgglomerativeClustering(
-        n_clusters=n_global_clusters,
-        linkage='ward'  # Pure biological clustering, no geographic constraints yet
+    std_niche = np.std(X_niche, axis=0).mean()
+    X_niche_scaled = (X_niche / std_niche) if std_niche > 0 else X_niche
+    
+    # Combine spatial position and biological identity
+    X_joint = np.hstack([coords_scaled, X_niche_scaled])
+    
+    # 4. Spatially-Constrained Joint Clustering
+    # Scale number of clusters based on total cells and resolution identically to original setup
+    target_cluster_size = 200.0 / resolution
+    n_clusters_target = max(2, int(n_cells / target_cluster_size))
+    
+    agg = AgglomerativeClustering(
+        n_clusters=n_clusters_target,
+        linkage='ward',
+        connectivity=connectivity
     )
-    global_labels = global_agg.fit_predict(X_niche)
-    
-    # 4. Spatially-Constrained Sub-Clustering
-    final_labels = np.zeros(n_cells, dtype=int)
-    current_cluster_id = 0
-    
-    from scipy.sparse.csgraph import connected_components
-    
-    for g_id in np.unique(global_labels):
-        idx = np.where(global_labels == g_id)[0]
-        sub_conn = connectivity[idx, :][:, idx]
-        
-        # Explicitly divide into physically contiguous graph components
-        n_comps, comp_labels = connected_components(sub_conn, directed=False)
-        
-        for comp_id in range(n_comps):
-            comp_idx = np.where(comp_labels == comp_id)[0]
-            global_comp_idx = idx[comp_idx]
-            n_comp_local = len(comp_idx)
-            
-            # Determine the mathematically ideal number of sub-clusters to maintain target supercell size
-            num_subclusters = max(1, int(np.round(n_comp_local / target_size)))
-            
-            # If the physically contiguous component is sufficiently small, keep it intact
-            if num_subclusters == 1:
-                final_labels[global_comp_idx] = current_cluster_id
-                current_cluster_id += 1
-                continue
-                
-            # If large, break it down geometrically into `num_subclusters`
-            comp_conn = sub_conn[comp_idx, :][:, comp_idx]
-            
-            local_agg = AgglomerativeClustering(
-                n_clusters=num_subclusters,
-                linkage='ward',
-                connectivity=comp_conn
-            )
-            
-            local_labels = local_agg.fit_predict(coords[global_comp_idx])
-            
-            # Remap localized indices to the global supercell array
-            for l_id in np.unique(local_labels):
-                final_labels[global_comp_idx[local_labels == l_id]] = current_cluster_id
-                current_cluster_id += 1
+    labels = agg.fit_predict(X_joint)
 
-    return final_labels
+    return labels
 
