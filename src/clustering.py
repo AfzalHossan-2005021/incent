@@ -91,8 +91,10 @@ def cluster_cells_spatial(
     X_niche = D_inv.dot(adj_with_self).dot(X_base)
     
     # 3. Global Biological Niches Clustering
-    # Scale initial global clusters based on total cells prioritizing large functional domains
-    n_global_clusters = max(2, int((n_cells / (max_cells_per_subcluster * 2.0)) * resolution))
+    # We want clusters of size approx `target_size`. 
+    target_size = 200.0 / resolution
+    # Let's not overestimate the initial biological clusters too much; we just want to separate major biological domains.
+    n_global_clusters = max(2, int((n_cells / target_size) / 2))
     
     global_agg = AgglomerativeClustering(
         n_clusters=n_global_clusters,
@@ -118,18 +120,20 @@ def cluster_cells_spatial(
             global_comp_idx = idx[comp_idx]
             n_comp_local = len(comp_idx)
             
-            # If the physically contiguous component is small, keep it intact
-            if n_comp_local <= max_cells_per_subcluster:
+            # Determine the mathematically ideal number of sub-clusters to maintain target supercell size
+            num_subclusters = max(1, int(np.round(n_comp_local / target_size)))
+            
+            # If the physically contiguous component is sufficiently small, keep it intact
+            if num_subclusters == 1:
                 final_labels[global_comp_idx] = current_cluster_id
                 current_cluster_id += 1
                 continue
                 
-            # If large, break it down geometrically
-            n_local_clusters = max(2, int((n_comp_local / max_cells_per_subcluster) * resolution))
+            # If large, break it down geometrically into `num_subclusters`
             comp_conn = sub_conn[comp_idx, :][:, comp_idx]
             
             local_agg = AgglomerativeClustering(
-                n_clusters=n_local_clusters,
+                n_clusters=num_subclusters,
                 linkage='ward',
                 connectivity=comp_conn
             )
