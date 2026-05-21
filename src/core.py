@@ -532,7 +532,7 @@ def pairwise_align(
 
 
     # Combine gene expression dissimilarity and cell-type mismatch penalty into a single cost matrix M1
-    M1_combined = (1 - beta) * cosine_dist_gene_expr + beta * cell_type_mismatch
+    M1_combined = (1 - beta - gamma) * cosine_dist_gene_expr + beta * cell_type_mismatch
     M1 = to_backend(M1_combined, nx, data_type=data_type)
 
 
